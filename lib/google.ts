@@ -10,10 +10,19 @@ const SCOPES = [
   'https://www.googleapis.com/auth/spreadsheets',
 ].join(' ')
 
+function envValue(...keys: string[]) {
+  for (const key of keys) {
+    const value = process.env[key]
+    if (typeof value === 'string' && value.trim()) return value.trim().replace(/^["']|["']$/g, '')
+  }
+}
+
 function googleClient() {
-  const clientId = process.env.AUTH_GOOGLE_ID ?? process.env.GOOGLE_CLIENT_ID
-  const clientSecret = process.env.AUTH_GOOGLE_SECRET ?? process.env.GOOGLE_CLIENT_SECRET
-  if (!clientId || !clientSecret) throw new Error('Google OAuth is not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.')
+  const clientId = envValue('GOOGLE_CLIENT_ID', 'AUTH_GOOGLE_ID')
+  const clientSecret = envValue('GOOGLE_CLIENT_SECRET', 'AUTH_GOOGLE_SECRET')
+  if (!clientId || !clientSecret) {
+    throw new Error('Google OAuth is not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET on the host (Vercel → Settings → Environment Variables), then redeploy.')
+  }
   return { clientId, clientSecret }
 }
 
