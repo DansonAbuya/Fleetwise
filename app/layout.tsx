@@ -1,0 +1,50 @@
+import { Analytics } from '@vercel/analytics/next'
+import type { Metadata, Viewport } from 'next'
+import { IBM_Plex_Mono, Plus_Jakarta_Sans } from 'next/font/google'
+import './globals.css'
+
+const sans = Plus_Jakarta_Sans({
+  subsets: ['latin'],
+  variable: '--font-sans',
+  display: 'swap',
+})
+
+const mono = IBM_Plex_Mono({
+  subsets: ['latin'],
+  weight: ['500', '600'],
+  variable: '--font-mono',
+  display: 'swap',
+})
+
+export const metadata: Metadata = {
+  title: 'Fleetwise | Fleet document control',
+  description: 'A focused operations console for fleet document processing, matching, and audit control.',
+  applicationName: 'Fleetwise',
+  icons: {
+    icon: [
+      { url: '/icon.svg', type: 'image/svg+xml' },
+      { url: '/favicon.ico', sizes: '32x32' },
+    ],
+    apple: '/icon.svg',
+  },
+}
+
+export const viewport: Viewport = {
+  colorScheme: 'light',
+  themeColor: '#00246B',
+}
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode
+}>) {
+  return (
+    <html lang="en" className={`${sans.variable} ${mono.variable}`}>
+      <body className="antialiased">
+        {children}
+        {process.env.NODE_ENV === 'production' && <Analytics />}
+      </body>
+    </html>
+  )
+}
