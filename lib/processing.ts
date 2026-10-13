@@ -1,6 +1,7 @@
 import { compactPlate } from '@/lib/plates'
 import type { DocType } from '@/lib/types'
 
+export type ProcessFocus = 'all' | 'photos' | 'certificates' | 'repair'
 export type ProcessStage = 'queued' | 'opening' | 'reading' | 'renaming' | 'matching' | 'matched' | 'unmatched' | 'error'
 
 export type ProcessItem = {
@@ -28,6 +29,8 @@ export type ProcessJob = {
   remaining: number
   lastRenamed: number
   advancing: boolean
+  focus?: ProcessFocus
+  cancelled?: boolean
   items: ProcessItem[]
   error?: string
   currentId?: string
@@ -50,8 +53,49 @@ function emptyJob(): ProcessJob {
     remaining: 0,
     lastRenamed: 0,
     advancing: false,
+    focus: undefined,
+    cancelled: false,
     items: [],
   }
+}
+
+let cancelRequested = false
+let generation = 0
+
+export function processGeneration() {
+  return generation
+}
+
+export function isProcessCancelled() {
+  return cancelRequested
+}
+
+export function isStaleProcess(startedAt: number) {
+  return cancelRequested || startedAt !== generation
+}
+
+export function requestProcessStop(message = 'Stopped. Choose photos, insurance, or match repair to start the next job.') {
+  cancelRequested = true
+  generation += 1
+  recount()
+  job = {
+    ...job,
+    running: false,
+    advancing: false,
+    remaining: 0,
+    cancelled: true,
+    finishedAt: now(),
+    error: message,
+    currentId: undefined,
+  }
+}
+
+export function processFocusLabel(focus?: ProcessFocus) {
+  if (focus === 'photos') return 'Photos'
+  if (focus === 'certificates') return 'Insurance'
+  if (focus === 'repair') return 'Wrong matches'
+  if (focus === 'all') return 'All files'
+  return 'Processing'
 }
 
 function now() {
@@ -67,6 +111,13 @@ function recount() {
   job.matched = job.items.filter((item) => item.stage === 'matched').length
   job.failed = job.items.filter((item) => item.stage === 'error' || item.stage === 'unmatched').length
   job.currentId = job.items.find((item) => !TERMINAL.includes(item.stage))?.fileId
+}
+
+export function fileMatchesFocus(file: { type: DocType }, focus: ProcessFocus) {
+  if (focus === 'all') return true
+  if (focus === 'photos') return file.type === 'photo'
+  if (focus === 'certificates') return file.type === 'certificate'
+  return file.type === 'photo' || file.type === 'certificate'
 }
 
 export function getProcessJob(): ProcessJob {
@@ -91,11 +142,13 @@ function asQueued(file: { id: string; name: string; type: DocType; mimeType?: st
   }
 }
 
-export function beginProcessJob(watching: string, files: Array<{ id: string; name: string; type: DocType; mimeType?: string }>) {
+export function beginProcessJob(watching: string, files: Array<{ id: string; name: string; type: DocType; mimeType?: string }>, focus: ProcessFocus = 'all') {
   if (job.running) return false
+  cancelRequested = false
+  generation += 1
   const incoming = files.map(asQueued)
   const continueMs = job.finishedAt ? Date.now() - Date.parse(job.finishedAt) : Number.POSITIVE_INFINITY
-  const continuing = Boolean(job.items.length && job.finishedAt && continueMs < 5 * 60_000)
+  const continuing = Boolean(!job.cancelled && job.focus === focus && job.items.length && job.finishedAt && continueMs < 5 * 60_000)
   if (continuing) {
     const seen = new Set(job.items.map((item) => item.fileId))
     const added = incoming.filter((item) => !seen.has(item.fileId))
@@ -110,6 +163,8 @@ export function beginProcessJob(watching: string, files: Array<{ id: string; nam
       batch: (job.batch || 1) + 1,
       remaining: 0,
       attempted: job.attempted + added.length,
+      focus,
+      cancelled: false,
       items,
       currentId: added[0]?.fileId || items.find((item) => item.stage === 'queued')?.fileId,
     }
@@ -128,6 +183,8 @@ export function beginProcessJob(watching: string, files: Array<{ id: string; nam
     batch: 1,
     remaining: 0,
     lastRenamed: 0,
+    focus,
+    cancelled: false,
     items: incoming.slice(0, MAX_ITEMS),
     currentId: incoming[0]?.fileId,
   }
@@ -176,7 +233,7 @@ export function markProcessMatches(matched: string[] = [], missing: string[] = [
 
 export function endProcessJob(error?: string, extras?: { remaining?: number; renamed?: number }) {
   recount()
-  const remaining = extras?.remaining || 0
+  const remaining = job.cancelled ? 0 : extras?.remaining || 0
   job = {
     ...job,
     running: false,
@@ -184,7 +241,7 @@ export function endProcessJob(error?: string, extras?: { remaining?: number; ren
     remaining,
     lastRenamed: extras?.renamed ?? job.lastRenamed,
     finishedAt: now(),
-    error,
+    error: job.cancelled ? job.error : error,
     currentId: undefined,
   }
 }

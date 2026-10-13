@@ -8,7 +8,7 @@ import { SHEET_MODULES, stockDocumentsModule, syncSheetModules } from '@/lib/mod
 import { readStockRegisterSnapshot } from '@/lib/modules/stock-documents'
 import type { SheetCells, SheetSyncMode } from '@/lib/modules/types'
 import { compactPlate, listRegistrationNumbers, plateFromCertificateText, plateFromText } from '@/lib/plates'
-import { beginProcessJob, endProcessJob, getProcessJob, isProcessRunning, markProcessMatches, touchProcessItem } from '@/lib/processing'
+import { beginProcessJob, endProcessJob, fileMatchesFocus, getProcessJob, isProcessCancelled, isProcessRunning, isStaleProcess, markProcessMatches, processGeneration, requestProcessStop, touchProcessItem, type ProcessFocus } from '@/lib/processing'
 import { requireSession } from '@/lib/session'
 import { EMPTY_STATS, filterVehicles, fleetStats, slimVehicle, type VehicleQuery } from '@/lib/vehicles'
 import type { DocType, FleetConfig, FleetSnapshot, InboxItem, TypedFile, VehicleRecord } from '@/lib/types'
@@ -22,9 +22,11 @@ const ocrTried = new Map<string, number>()
 const ocrConfirmed = new Map<string, { plate: string; at: number }>()
 
 async function mapPool<T>(items: T[], limit: number, fn: (item: T) => Promise<void>) {
+  const generation = processGeneration()
   let next = 0
   async function worker() {
     while (true) {
+      if (isStaleProcess(generation) || isProcessCancelled()) return
       const index = next++
       if (index >= items.length) return
       await fn(items[index])
@@ -134,7 +136,7 @@ export async function exportVehicleRegister(input: VehicleQuery = {}) {
   return rows.map((row) => row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(',')).join('\n')
 }
 
-export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = false): Promise<FleetSnapshot> {
+export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = false, focus?: ProcessFocus | 'off'): Promise<FleetSnapshot> {
   const session = await requireSession()
   let config = await loadConfig()
   if (!config) {
@@ -146,20 +148,28 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
       config = await saveConfig({ ...config, spreadsheetId: workbook.id, spreadsheetName: workbook.name })
     }
   }
+  const live = getProcessJob()
+  const requested = focus && focus !== 'off' ? focus : undefined
+  const jobFocus: ProcessFocus | undefined = requested || (!live.cancelled && (live.running || live.advancing) ? live.focus : undefined)
+  const skipOcr = focus === 'off' || (!requested && (isProcessCancelled() || live.cancelled || !jobFocus))
   const preview = config.spreadsheetId ? await readStockRegisterSnapshot(config) : { vehicles: [], unmatched: [], plates: new Set<string>(), cells: new Map() as SheetCells, error: undefined as string | undefined }
-  let ingest = { watching: '', attempted: 0, renamed: 0, error: undefined as string | undefined, renamedFiles: [] as TypedFile[], started: false }
+  let ingest = { watching: '', attempted: 0, renamed: 0, remaining: 0, more: false, error: undefined as string | undefined, renamedFiles: [] as TypedFile[], started: false, focus: jobFocus }
   let files: TypedFile[] = []
   try {
     const listed = await scanFolders(config, preview.plates, preview.cells)
-    ingest = await ingestIncoming(config, session.name, mode, listed.files, preview.plates)
+    ingest = skipOcr
+      ? { watching: '', attempted: 0, renamed: 0, remaining: 0, more: false, error: undefined, renamedFiles: [] as TypedFile[], started: false, focus: undefined }
+      : await ingestIncoming(config, session.name, mode, listed.files, preview.plates, jobFocus || 'all')
     files = mergeTypedFiles(listed.files, ingest.renamedFiles)
   } catch (err) {
-    ingest = { watching: '', attempted: 0, renamed: 0, error: err instanceof Error ? err.message : 'Drive scan failed', renamedFiles: [], started: ingest.started }
-    if (ingest.started && isProcessRunning()) endProcessJob(ingest.error, { remaining: ingest.remaining || 0, renamed: ingest.renamed })
+    ingest = { watching: '', attempted: 0, renamed: 0, remaining: 0, more: false, error: err instanceof Error ? err.message : 'Drive scan failed', renamedFiles: [], started: ingest.started, focus: jobFocus }
+    const ingestGen = processGeneration()
+    if (ingest.started && isProcessRunning() && !isStaleProcess(ingestGen)) endProcessJob(ingest.error, { remaining: ingest.remaining || 0, renamed: ingest.renamed })
   }
+  const ingestGen = processGeneration()
   const continuing = Boolean(ingest.more)
   const sheet = await syncSheetIndex(config, continuing ? 'match' : mode, files)
-  if ((ingest.started || closeLive) && isProcessRunning()) {
+  if ((ingest.started || closeLive) && isProcessRunning() && !isStaleProcess(ingestGen)) {
     markProcessMatches(sheet.matched, sheet.missing)
     endProcessJob(ingest.error || sheet.error, { remaining: ingest.remaining || 0, renamed: ingest.renamed })
   }
@@ -186,8 +196,9 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
     sheetsError: sheet.error || preview.error,
     ingest: {
       ...ingest,
-      more: Boolean(ingest.more || sheet.more),
-      remaining: ingest.remaining || 0,
+      more: Boolean(!isProcessCancelled() && ingest.more),
+      remaining: isProcessCancelled() ? 0 : ingest.remaining || 0,
+      focus: ingest.focus || jobFocus,
       notice: sheetMatchNotice(sheet.matched, ingest.renamedFiles),
       error: ingest.error || (sheet.missing.length
         ? `These files were renamed in Drive, but STOCK DOCUMENTS has no Registration Number for ${listRegistrationNumbers(sheet.missing)}. Add that plate on the sheet, then scan again.`
@@ -376,6 +387,17 @@ export async function getProcessingJob() {
   return getProcessJob()
 }
 
+export async function runProcessing(focus: ProcessFocus = 'all') {
+  await requireSession()
+  return loadFleet('full', false, focus)
+}
+
+export async function stopProcessing() {
+  await requireSession()
+  requestProcessStop()
+  return getProcessJob()
+}
+
 export async function ocrUnmatchedPhotos(fileId?: string) {
   const session = await requireSession()
   const config = await requireConfig()
@@ -395,7 +417,7 @@ export async function ocrUnmatchedPhotos(fileId?: string) {
   if (isProcessRunning()) {
     throw new Error('A processing run is already live. Open Processing to watch it.')
   }
-  beginProcessJob('Unmatched', candidates)
+  beginProcessJob('Unmatched', candidates, 'repair')
   for (const file of candidates) markOcrTried(file.id)
   let renamed = 0
   try {
@@ -416,7 +438,8 @@ export async function ocrUnmatchedPhotos(fileId?: string) {
   }
   await appendAudit(config, session.name, `OCR read plates on ${renamed} of ${candidates.length} photos`)
   await touchSync(config)
-  const next = await loadFleet('auto', true)
+  if (isProcessRunning()) endProcessJob(undefined, { remaining: remainingAfter, renamed })
+  const next = await loadFleet('auto', true, remainingAfter > 0 ? 'repair' : 'off')
   const more = remainingAfter > 0 || Boolean(next.ingest?.more)
   if (next.ingest) next.ingest.more = more
   if (renamed === 0 && !more) throw new Error(unreadPlateMessage(candidates, 'Unmatched'))
@@ -497,25 +520,42 @@ async function ocrAndRename(config: FleetConfig, user: string, file: TypedFile, 
   return { renamed: 1, text: ocr.text, name, plate, file: { ...file, ...updated, name, plate, type: file.type } }
 }
 
-async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 'full' = 'auto', files?: TypedFile[], sheetPlates?: Set<string>) {
-  const watching = [config.photosName || 'photos', config.certificatesName || 'certificates', config.logbooksName || 'logbooks'].join(', ')
-  const listed = files || (await scanFolders(config)).files
-  const toNormalize = listed.filter((file) => plateFromTypedName(file.name, file.type) && !hasCanonicalName(file) && !isOcrImage(file.mimeType, file.name))
-  const pending = listed.filter((file) => {
-    const named = namedPlateOf(file)
-    if (nameMatchesDocument(file)) return false
+function watchingLabel(config: FleetConfig, focus: ProcessFocus) {
+  if (focus === 'photos') return config.photosName || 'photos'
+  if (focus === 'certificates') return config.certificatesName || 'certificates'
+  if (focus === 'repair') return 'wrong matches'
+  return [config.photosName || 'photos', config.certificatesName || 'certificates', config.logbooksName || 'logbooks'].join(', ')
+}
+
+function pendingForFocus(file: TypedFile, focus: ProcessFocus, sheetPlates?: Set<string>) {
+  if (!fileMatchesFocus(file, focus)) return false
+  const named = namedPlateOf(file)
+  if (focus === 'repair') {
     if (ocrTriedRecently(file.id)) return false
-    const onSheet = Boolean(named && sheetPlates?.has(compactPlate(named)))
-    if (onSheet && file.type !== 'photo' && file.type !== 'certificate') return false
-    return Boolean(named || isOcrImage(file.mimeType, file.name))
-  }).sort((a, b) => {
+    if (!named && !isOcrImage(file.mimeType, file.name)) return false
+    if (!named) return true
+    if (!sheetPlates?.has(compactPlate(named))) return true
+    return !nameMatchesDocument(file)
+  }
+  if (nameMatchesDocument(file)) return false
+  if (ocrTriedRecently(file.id)) return false
+  const onSheet = Boolean(named && sheetPlates?.has(compactPlate(named)))
+  if (onSheet && file.type !== 'photo' && file.type !== 'certificate') return false
+  return Boolean(named || isOcrImage(file.mimeType, file.name))
+}
+
+async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 'full' = 'auto', files?: TypedFile[], sheetPlates?: Set<string>, focus: ProcessFocus = 'all') {
+  const watching = watchingLabel(config, focus)
+  const listed = files || (await scanFolders(config)).files
+  const toNormalize = listed.filter((file) => fileMatchesFocus(file, focus) && plateFromTypedName(file.name, file.type) && !hasCanonicalName(file) && !isOcrImage(file.mimeType, file.name))
+  const pending = listed.filter((file) => pendingForFocus(file, focus, sheetPlates)).sort((a, b) => {
     const aNamed = namedPlateOf(a)
     const bNamed = namedPlateOf(b)
     const aOnSheet = Boolean(aNamed && sheetPlates?.has(compactPlate(aNamed)))
     const bOnSheet = Boolean(bNamed && sheetPlates?.has(compactPlate(bNamed)))
     return Number(aOnSheet) - Number(bOnSheet)
   })
-  const newestCertificate = mode === 'full'
+  const newestCertificate = mode === 'full' && (focus === 'all' || focus === 'certificates')
     ? listed
       .filter((file) => file.type === 'certificate' && isOcrImage(file.mimeType, file.name) && !nameMatchesDocument(file) && !ocrTriedRecently(file.id))
       .sort((a, b) => (b.modifiedTime || '').localeCompare(a.modifiedTime || ''))
@@ -532,19 +572,22 @@ async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 
       more: false,
       renamedFiles: [] as TypedFile[],
       started: false,
+      focus,
       error: 'Photos or insurance files are waiting, but local OCR is not ready. Restart the Next.js server after installing tesseract.js.',
     }
   }
   const candidates = [...toNormalize, ...(ocrConfigured() ? ocrCandidates : [])]
   if (candidates.length && isProcessRunning()) {
-    return { watching, attempted: 0, renamed: 0, remaining: pending.length, more: pending.length > 0, renamedFiles: [] as TypedFile[], started: false }
+    return { watching, attempted: 0, renamed: 0, remaining: pending.length, more: pending.length > 0, renamedFiles: [] as TypedFile[], started: false, focus }
   }
-  if (candidates.length) beginProcessJob(watching, candidates)
+  if (candidates.length) beginProcessJob(watching, candidates, focus)
   for (const file of ocrCandidates) markOcrTried(file.id)
   let renamed = 0
   let error: string | undefined
   const renamedFiles: TypedFile[] = []
+  const generation = processGeneration()
   await mapPool(candidates, OCR_CONCURRENCY, async (file) => {
+    if (isStaleProcess(generation)) return
     try {
       const result = await ocrAndRename(config, user, file, { verify: Boolean(namedPlateOf(file)) })
       renamed += result.renamed
@@ -563,8 +606,9 @@ async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 
     if (!named || sheetPlates?.has(compactPlate(named))) return false
     return true
   })
-  if (recheck.length) {
+  if (recheck.length && !isStaleProcess(generation)) {
     await mapPool(recheck, OCR_CONCURRENCY, async (file) => {
+      if (isStaleProcess(generation)) return
       try {
         const named = namedPlateOf(file)
         touchProcessItem(file.id, { stage: 'reading', detail: `Rechecking unmatched ${named} against the document`, plate: named, name: file.name, type: file.type, mimeType: file.mimeType })
@@ -585,7 +629,8 @@ async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 
   if (ocrConfigured() && ocrCandidates.length && renamed === 0 && !error) {
     error = unreadPlateMessage(ocrCandidates, watching)
   }
-  return { watching, attempted: candidates.length, renamed, remaining: remainingAfter, more: remainingAfter > 0, error, renamedFiles, started: candidates.length > 0 }
+  const stopped = isStaleProcess(generation) || isProcessCancelled()
+  return { watching, attempted: candidates.length, renamed, remaining: stopped ? 0 : remainingAfter, more: !stopped && remainingAfter > 0, error: stopped ? undefined : error, renamedFiles, started: candidates.length > 0, focus }
 }
 
 function mergeTypedFiles(files: TypedFile[], updates: TypedFile[]) {

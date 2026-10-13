@@ -356,6 +356,14 @@ td strong, .muted-cell { display: block; }
 .process-hero .button.primary { background: var(--mint); color: var(--navy); box-shadow: none; }
 .process-hero .button.primary:hover { background: #e4eefe; }
 .process-hero .button.secondary { background: transparent; border-color: rgba(255,255,255,.2); color: var(--ivory); }
+.process-tasks { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 18px 0 4px; }
+.process-task { text-align: left; border: 1px solid rgba(255,255,255,.16); background: rgba(255,255,255,.06); color: var(--ivory); border-radius: 12px; padding: 12px 13px; cursor: pointer; }
+.process-task strong, .process-task span, .process-task em { display: block; }
+.process-task span { color: rgba(250, 249, 246, .72); font-size: 12px; line-height: 1.4; margin-top: 4px; font-weight: 400; }
+.process-task em { margin-top: 8px; font-style: normal; font-size: 11px; font-weight: 700; color: var(--mint); display: inline-flex; align-items: center; gap: 5px; }
+.process-task.active { border-color: var(--mint); background: rgba(196, 218, 248, .16); }
+.process-task:disabled { opacity: .55; cursor: not-allowed; }
+@media (max-width: 720px) { .process-tasks { grid-template-columns: 1fr; } }
 .process-hero .big-progress span { width: 0; transition: width .35s ease; }
 .live-pill { display: inline-flex; align-items: center; gap: 7px; border-radius: 999px; padding: 7px 11px; font-size: 11px; font-weight: 700; color: var(--navy); background: var(--mint-soft); border: 1px solid #c9dceb; }
 .process-board { display: flex; flex-direction: column; gap: 12px; padding: 0 21px 18px; }

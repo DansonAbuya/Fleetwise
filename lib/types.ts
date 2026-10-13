@@ -106,6 +106,7 @@ export type FleetSnapshot = {
     renamed: number
     remaining?: number
     more?: boolean
+    focus?: 'all' | 'photos' | 'certificates' | 'repair'
     error?: string
     notice?: string
   }
