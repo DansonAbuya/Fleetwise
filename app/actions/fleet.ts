@@ -409,7 +409,7 @@ export async function ocrUnmatchedPhotos(fileId?: string) {
   const target = fileId ? files.find((file) => file.id === fileId) || unmatched.find((file) => file.id === fileId) : undefined
   if (fileId) forgetFile(fileId)
   const readable = unmatched.filter((file) => isOcrImage(file.mimeType, file.name) || plateFromText(file.name))
-  const waiting = fileId ? (target ? [target] : []) : readable.filter((file) => !nameMatchesDocument(file) && !wasTriedRecently(file.id))
+  const waiting = fileId ? (target ? [target] : []) : readable.filter((file) => !hasCanonicalName(file) && !nameMatchesDocument(file) && !wasTriedRecently(file.id))
   const remainingAfter = Math.max(0, waiting.length - OCR_BATCH)
   const candidates = waiting.slice(0, OCR_BATCH)
   if (!candidates.length) {
@@ -455,6 +455,12 @@ async function ocrAndRename(config: FleetConfig, user: string, file: TypedFile, 
   const named = typedPlate || plateFromText(file.name)
   const readable = isOcrImage(file.mimeType, file.name)
   const usesRegistrationField = file.type === 'certificate' || file.type === 'logbook'
+  if (hasCanonicalName(file) && !options.verify) {
+    const plate = typedPlate || named
+    const name = file.name
+    touchProcessItem(file.id, { stage: 'matching', detail: `Already named ${name}`, plate, name, type: file.type, mimeType: file.mimeType })
+    return { renamed: 0, text: '', name, plate, file: { ...file, name, plate, type: file.type } }
+  }
   if (typedPlate && !readable && !usesRegistrationField) {
     const name = suggestedName(typedPlate, file.type, file.name)
     touchProcessItem(file.id, { stage: 'renaming', detail: `Filename already has ${typedPlate}`, plate: typedPlate, name: file.name, type: file.type, mimeType: file.mimeType })
@@ -536,10 +542,10 @@ function watchingLabel(config: FleetConfig, focus: ProcessFocus) {
 
 function pendingForFocus(file: TypedFile, focus: ProcessFocus, sheetPlates?: Set<string>) {
   if (!fileMatchesFocus(file, focus)) return false
+  if (focus !== 'repair' && hasCanonicalName(file)) return false
   const named = namedPlateOf(file)
   const readable = isOcrImage(file.mimeType, file.name)
   if (file.type === 'certificate') {
-    if (hasCanonicalName(file) && nameMatchesDocument(file)) return false
     return readable || /\.pdf$/i.test(file.name) || (file.mimeType || '').includes('pdf') || (file.mimeType || '').startsWith('application/vnd.google-apps.')
   }
   if (wasTriedRecently(file.id) || nameMatchesDocument(file)) return false
@@ -549,11 +555,12 @@ function pendingForFocus(file: TypedFile, focus: ProcessFocus, sheetPlates?: Set
   return true
 }
 
-function orderForResume(files: TypedFile[]) {
+function orderForResume(files: TypedFile[], focus: ProcessFocus) {
   const lastId = lastAction().fileId
   const unnamed = files
     .filter((file) => !hasCanonicalName(file))
     .sort((a, b) => (b.modifiedTime || '').localeCompare(a.modifiedTime || '') || a.id.localeCompare(b.id) || a.name.localeCompare(b.name))
+  if (focus !== 'repair') return unnamed
   const named = files
     .filter((file) => hasCanonicalName(file))
     .sort((a, b) => (a.modifiedTime || '').localeCompare(b.modifiedTime || '') || a.id.localeCompare(b.id) || a.name.localeCompare(b.name))
@@ -567,15 +574,9 @@ async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 
   const watching = watchingLabel(config, focus)
   const listed = files || (await scanFolders(config)).files
   const toNormalize = listed.filter((file) => fileMatchesFocus(file, focus) && plateFromTypedName(file.name, file.type) && !hasCanonicalName(file) && !isOcrImage(file.mimeType, file.name))
-  const pending = orderForResume(listed.filter((file) => pendingForFocus(file, focus, sheetPlates)))
-  const newestCertificate = mode === 'full' && (focus === 'all' || focus === 'certificates')
-    ? listed
-      .filter((file) => file.type === 'certificate' && isOcrImage(file.mimeType, file.name) && !nameMatchesDocument(file) && !wasTriedRecently(file.id))
-      .sort((a, b) => (b.modifiedTime || '').localeCompare(a.modifiedTime || ''))
-      .find((file) => !pending.some((item) => item.id === file.id))
-    : undefined
+  const pending = orderForResume(listed.filter((file) => pendingForFocus(file, focus, sheetPlates)), focus)
   const remainingAfter = Math.max(0, pending.length - OCR_BATCH)
-  const ocrCandidates = [...pending, ...(newestCertificate ? [newestCertificate] : [])].slice(0, OCR_BATCH)
+  const ocrCandidates = pending.slice(0, OCR_BATCH)
   if (!ocrConfigured() && ocrCandidates.length && !toNormalize.length) {
     return {
       watching,
@@ -602,7 +603,7 @@ async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 
   await mapPool(candidates, concurrency, async (file) => {
     if (isStaleProcess(generation)) return
     try {
-      const result = await ocrAndRename(config, user, file, { verify: Boolean(namedPlateOf(file)) })
+      const result = await ocrAndRename(config, user, file, { verify: focus === 'repair' && Boolean(namedPlateOf(file)) })
       renamed += result.renamed
       if (result.file) renamedFiles.push(result.file)
       if (result.error && !error) error = result.error
@@ -624,12 +625,12 @@ async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 
     }
   })
   const processedIds = new Set(candidates.map((file) => file.id))
-  const recheck = mergeTypedFiles(listed, renamedFiles).filter((file) => {
-    if (!processedIds.has(file.id) || !isOcrImage(file.mimeType, file.name)) return false
+  const recheck = focus === 'repair' ? mergeTypedFiles(listed, renamedFiles).filter((file) => {
+    if (!processedIds.has(file.id) || !isOcrImage(file.mimeType, file.name) || hasCanonicalName(file)) return false
     const named = namedPlateOf(file)
     if (!named || sheetPlates?.has(compactPlate(named))) return false
     return true
-  })
+  }) : []
   if (recheck.length && !isStaleProcess(generation)) {
     await mapPool(recheck, OCR_CONCURRENCY, async (file) => {
       if (isStaleProcess(generation)) return

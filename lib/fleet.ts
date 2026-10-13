@@ -247,7 +247,9 @@ export function plateFromTypedName(name: string, type: DocType) {
 }
 
 export function hasCanonicalName(file: { name: string; type: DocType }) {
-  const plate = plateFromTypedName(file.name, file.type) || plateFromText(file.name)
-  return Boolean(plate && file.name === suggestedName(plate, file.type, file.name))
+  const plate = plateFromTypedName(file.name, file.type)
+  if (!plate) return false
+  const expected = suggestedName(plate, file.type, file.name)
+  return file.name === expected || documentBaseName(file.name) === expected
 }
 
