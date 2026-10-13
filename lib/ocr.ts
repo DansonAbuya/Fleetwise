@@ -111,15 +111,20 @@ function ocrCommandError(err: unknown, pdf: boolean) {
 
 async function readTextWithTesseract(bytes: Buffer, mimeType?: string, filename?: string, kind = 'photo') {
   const pdf = kind === 'pdf' || isPdfFile(bytes, mimeType, filename)
-  try {
-    return await extractPlateText(bytes, kind)
-  } catch (err) {
-    if (isServerlessHost()) throw new Error(ocrCommandError(err, pdf))
+  const readKind = pdf ? 'pdf' : kind
+  if (isServerlessHost()) {
+    try {
+      const text = await extractPlateText(bytes, readKind)
+      if (text.trim()) return text
+      throw new Error('Document OCR returned no text from the file.')
+    } catch (err) {
+      throw new Error(ocrCommandError(err, pdf))
+    }
   }
   const imagePath = join(tmpdir(), `fleetwise-ocr-${Date.now()}-${Math.random().toString(16).slice(2)}.bin`)
   await writeFile(imagePath, bytes)
   try {
-    const { stdout } = await execFileAsync(process.execPath, [readPlateScriptPath(), imagePath, kind], {
+    const { stdout } = await execFileAsync(process.execPath, [readPlateScriptPath(), imagePath, readKind], {
       timeout: 240_000,
       maxBuffer: 8 * 1024 * 1024,
       windowsHide: true,

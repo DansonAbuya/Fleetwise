@@ -270,6 +270,8 @@ export function plateFromCertificateText(text: string) {
   const bikes = plates.filter((plate) => plate.startsWith('KM') && plate.length === 8)
   if (bikes.length === 1) return bikes[0]
   if (plates.length === 1) return plates[0]
+  if (bikes.length) return bikes[0]
+  if (plates.length) return plates[0]
   return null
 }
 

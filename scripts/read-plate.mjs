@@ -31,6 +31,10 @@ const pool = []
 const waiters = []
 let creating = 0
 
+function labeledKenyanPlate(text) {
+  return parseKenyanPlate(registrationPlate(text) || '')
+}
+
 export async function extractPdfjsRegistration(bytes) {
   const source = unwrapPdf(bytes)
   const pdf = await readPdf(source.pdf ? source.bytes : bytes, false)
@@ -47,17 +51,18 @@ export async function extractPlateText(bytes, kind = 'photo') {
     return withFoundPlate(chunks.join('\n'))
   }
   if (source.pdf || kind === 'pdf') {
-    const pdfjsText = await extractPdfjsRegistration(source.pdf ? source.bytes : bytes)
+    const pdfBytes = source.pdf ? source.bytes : bytes
+    const pdfjsText = await extractPdfjsRegistration(pdfBytes)
     if (pdfjsText.trim()) chunks.push(pdfjsText.trim())
-    if (registrationPlate(chunks.join('\n'))) return withFoundPlate(chunks.join('\n'))
-    const pdf = await readPdf(source.pdf ? source.bytes : bytes, true)
+    if (labeledKenyanPlate(chunks.join('\n'))) return withFoundPlate(chunks.join('\n'))
+    const pdf = await readPdf(pdfBytes, true)
     if (pdf.text.trim() && pdf.text.trim() !== pdfjsText.trim()) chunks.push(pdf.text.trim())
     const pages = pdf.pages
     if (pages.length) {
       const ocrText = await ocrPrepared(pages, 'certificate')
       if (ocrText.trim()) chunks.push(ocrText.trim())
     }
-    if (!registrationPlate(chunks.join('\n')) && !kenyanPlatesIn(chunks.join('\n'))[0] && pages.length) {
+    if (!labeledKenyanPlate(chunks.join('\n')) && pages.length) {
       const photoText = await ocrPrepared(pages.slice(0, 1), 'photo')
       if (photoText.trim()) chunks.push(photoText.trim())
     }
@@ -138,7 +143,12 @@ async function readPdf(buffer, raster = true) {
   try {
     return await readPdfDocument(buffer, raster)
   } catch {
-    return { text: '', pages: [] }
+    if (!raster) return { text: '', pages: [] }
+    try {
+      return await readPdfDocument(buffer, true)
+    } catch {
+      return { text: '', pages: [] }
+    }
   }
 }
 
@@ -150,7 +160,9 @@ async function readPdfDocument(buffer, raster = true) {
     data,
     disableFontFace: true,
     isOffscreenCanvasSupported: false,
-    useSystemFonts: true,
+    useSystemFonts: false,
+    disableRange: true,
+    disableStream: true,
     verbosity: 0,
     useWasm: false,
     useWorkerFetch: false,
@@ -181,7 +193,7 @@ async function readPdfDocument(buffer, raster = true) {
       }
     }
     const joined = texts.join('\n')
-    if (raster && !registrationPlate(joined)) {
+    if (raster && !labeledKenyanPlate(joined)) {
       for (let n = 1; n <= pageCount; n++) {
         const page = await pdf.getPage(n)
         try {
