@@ -8,7 +8,8 @@ import { SHEET_MODULES, stockDocumentsModule, syncSheetModules } from '@/lib/mod
 import { readStockRegisterSnapshot } from '@/lib/modules/stock-documents'
 import type { SheetCells, SheetSyncMode } from '@/lib/modules/types'
 import { compactPlate, listRegistrationNumbers, plateFromCertificateText, plateFromText } from '@/lib/plates'
-import { beginProcessJob, endProcessJob, fileMatchesFocus, getProcessJob, isProcessCancelled, isProcessRunning, isStaleProcess, markProcessMatches, processGeneration, requestProcessStop, touchProcessItem, type ProcessFocus } from '@/lib/processing'
+import { attachLastAction, beginProcessJob, endProcessJob, fileMatchesFocus, getProcessJob, isProcessCancelled, isProcessRunning, isStaleProcess, markProcessMatches, processFocusLabel, processGeneration, requestProcessStop, touchProcessItem, type ProcessFocus } from '@/lib/processing'
+import { confirmedPlate, forgetFile, hydrateProcessCursor, lastAction, markConfirmed, markTried, persistProcessCursor, recordLastAction, wasTriedRecently } from '@/lib/process-cursor'
 import { requireSession } from '@/lib/session'
 import { EMPTY_STATS, filterVehicles, fleetStats, slimVehicle, type VehicleQuery } from '@/lib/vehicles'
 import type { DocType, FleetConfig, FleetSnapshot, InboxItem, TypedFile, VehicleRecord } from '@/lib/types'
@@ -17,9 +18,6 @@ let rememberedPlates: string[] = []
 
 const OCR_BATCH = 12
 const OCR_CONCURRENCY = 2
-const OCR_RETRY_MS = 30 * 60 * 1000
-const ocrTried = new Map<string, number>()
-const ocrConfirmed = new Map<string, { plate: string; at: number }>()
 
 async function mapPool<T>(items: T[], limit: number, fn: (item: T) => Promise<void>) {
   const generation = processGeneration()
@@ -35,37 +33,15 @@ async function mapPool<T>(items: T[], limit: number, fn: (item: T) => Promise<vo
   await Promise.all(Array.from({ length: Math.min(limit, items.length) || 0 }, () => worker()))
 }
 
-function ocrTriedRecently(fileId: string) {
-  const at = ocrTried.get(fileId)
-  if (!at) return false
-  if (Date.now() - at > OCR_RETRY_MS) {
-    ocrTried.delete(fileId)
-    return false
-  }
-  return true
-}
-
-function markOcrTried(fileId: string) {
-  ocrTried.set(fileId, Date.now())
-}
-
 function namedPlateOf(file: { name: string; type: DocType }) {
   return plateFromTypedName(file.name, file.type) || plateFromText(file.name)
 }
 
-function markOcrConfirmed(fileId: string, plate: string) {
-  ocrConfirmed.set(fileId, { plate: compactPlate(plate), at: Date.now() })
-}
-
 function nameMatchesDocument(file: { id: string; name: string; type: DocType }) {
   const named = namedPlateOf(file)
-  const hit = ocrConfirmed.get(file.id)
+  const hit = confirmedPlate(file.id)
   if (!named || !hit) return false
-  if (Date.now() - hit.at > OCR_RETRY_MS) {
-    ocrConfirmed.delete(file.id)
-    return false
-  }
-  return hit.plate === compactPlate(named)
+  return hit === compactPlate(named)
 }
 
 function emptySnapshot(session: { name: string; email: string; image?: string }, config: FleetConfig | null, extra: Partial<FleetSnapshot> = {}): FleetSnapshot {
@@ -148,6 +124,8 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
       config = await saveConfig({ ...config, spreadsheetId: workbook.id, spreadsheetName: workbook.name })
     }
   }
+  await hydrateProcessCursor(config).catch(() => lastAction())
+  attachLastAction(lastAction())
   const live = getProcessJob()
   const requested = focus && focus !== 'off' ? focus : undefined
   const jobFocus: ProcessFocus | undefined = requested || (!live.cancelled && (live.running || live.advancing) ? live.focus : undefined)
@@ -197,8 +175,9 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
     ingest: {
       ...ingest,
       more: Boolean(!isProcessCancelled() && ingest.more),
-      remaining: isProcessCancelled() ? 0 : ingest.remaining || 0,
+      remaining: ingest.remaining || lastAction().remaining || 0,
       focus: ingest.focus || jobFocus,
+      lastAction: lastAction(),
       notice: sheetMatchNotice(sheet.matched, ingest.renamedFiles),
       error: ingest.error || (sheet.missing.length
         ? `These files were renamed in Drive, but STOCK DOCUMENTS has no Registration Number for ${listRegistrationNumbers(sheet.missing)}. Add that plate on the sheet, then scan again.`
@@ -384,17 +363,39 @@ export async function syncGmail() {
 
 export async function getProcessingJob() {
   await requireSession()
+  const config = await loadConfig()
+  if (config) await hydrateProcessCursor(config).catch(() => lastAction())
+  attachLastAction(lastAction())
   return getProcessJob()
 }
 
 export async function runProcessing(focus: ProcessFocus = 'all') {
   await requireSession()
+  const config = await requireConfig()
+  await hydrateProcessCursor(config).catch(() => lastAction())
+  recordLastAction({
+    focus,
+    status: 'running',
+    detail: `Continuing ${processFocusLabel(focus)} from the last file`,
+  })
+  attachLastAction(lastAction())
   return loadFleet('full', false, focus)
 }
 
 export async function stopProcessing() {
   await requireSession()
+  const config = await loadConfig()
+  const live = getProcessJob()
   requestProcessStop()
+  recordLastAction({
+    focus: live.focus,
+    status: 'paused',
+    remaining: live.remaining || lastAction().remaining || 0,
+    done: live.done,
+    detail: live.currentId ? `Stopped while reading ${live.items.find((item) => item.fileId === live.currentId)?.name || 'a file'}` : 'Stopped. Start the same job to continue from this point.',
+  })
+  if (config) await persistProcessCursor(config).catch(() => {})
+  attachLastAction(lastAction())
   return getProcessJob()
 }
 
@@ -406,9 +407,9 @@ export async function ocrUnmatchedPhotos(fileId?: string) {
   }
   const { unmatched, files } = await scanFolders(config)
   const target = fileId ? files.find((file) => file.id === fileId) || unmatched.find((file) => file.id === fileId) : undefined
-  if (fileId) ocrConfirmed.delete(fileId)
+  if (fileId) forgetFile(fileId)
   const readable = unmatched.filter((file) => isOcrImage(file.mimeType, file.name) || plateFromText(file.name))
-  const waiting = fileId ? (target ? [target] : []) : readable.filter((file) => !nameMatchesDocument(file) && !ocrTriedRecently(file.id))
+  const waiting = fileId ? (target ? [target] : []) : readable.filter((file) => !nameMatchesDocument(file) && !wasTriedRecently(file.id))
   const remainingAfter = Math.max(0, waiting.length - OCR_BATCH)
   const candidates = waiting.slice(0, OCR_BATCH)
   if (!candidates.length) {
@@ -418,13 +419,14 @@ export async function ocrUnmatchedPhotos(fileId?: string) {
     throw new Error('A processing run is already live. Open Processing to watch it.')
   }
   beginProcessJob('Unmatched', candidates, 'repair')
-  for (const file of candidates) markOcrTried(file.id)
   let renamed = 0
   try {
     await mapPool(candidates, fileId ? 1 : OCR_CONCURRENCY, async (file) => {
       try {
         const result = await ocrAndRename(config, session.name, file, { verify: true })
         renamed += result.renamed
+        markTried(file.id)
+        recordLastAction({ focus: 'repair', status: 'running', fileId: file.id, fileName: result.file?.name || file.name, plate: result.plate || undefined })
       } catch (err) {
         const message = err instanceof Error ? err.message : 'OCR error'
         touchProcessItem(file.id, { stage: 'error', detail: message, name: file.name, type: file.type, mimeType: file.mimeType })
@@ -438,6 +440,8 @@ export async function ocrUnmatchedPhotos(fileId?: string) {
   }
   await appendAudit(config, session.name, `OCR read plates on ${renamed} of ${candidates.length} photos`)
   await touchSync(config)
+  recordLastAction({ focus: 'repair', status: remainingAfter > 0 ? 'running' : 'done', remaining: remainingAfter })
+  await persistProcessCursor(config).catch(() => {})
   if (isProcessRunning()) endProcessJob(undefined, { remaining: remainingAfter, renamed })
   const next = await loadFleet('auto', true, remainingAfter > 0 ? 'repair' : 'off')
   const more = remainingAfter > 0 || Boolean(next.ingest?.more)
@@ -474,7 +478,7 @@ async function ocrAndRename(config: FleetConfig, user: string, file: TypedFile, 
   const usesRegistrationField = file.type === 'certificate' || file.type === 'logbook'
   const labeled = usesRegistrationField ? plateFromCertificateText(ocr.text) : null
   const documentPlate = labeled || ocr.plate
-  if (documentPlate) markOcrConfirmed(file.id, documentPlate)
+  if (documentPlate) markConfirmed(file.id, documentPlate)
   let plate = documentPlate || named
   if (usesRegistrationField) {
     if (documentPlate) {
@@ -529,35 +533,33 @@ function watchingLabel(config: FleetConfig, focus: ProcessFocus) {
 
 function pendingForFocus(file: TypedFile, focus: ProcessFocus, sheetPlates?: Set<string>) {
   if (!fileMatchesFocus(file, focus)) return false
-  const named = namedPlateOf(file)
-  if (focus === 'repair') {
-    if (ocrTriedRecently(file.id)) return false
-    if (!named && !isOcrImage(file.mimeType, file.name)) return false
-    if (!named) return true
-    if (!sheetPlates?.has(compactPlate(named))) return true
-    return !nameMatchesDocument(file)
-  }
+  if (wasTriedRecently(file.id)) return false
   if (nameMatchesDocument(file)) return false
-  if (ocrTriedRecently(file.id)) return false
+  const named = namedPlateOf(file)
+  const readable = isOcrImage(file.mimeType, file.name)
+  if (!named && !readable) return false
   const onSheet = Boolean(named && sheetPlates?.has(compactPlate(named)))
-  if (onSheet && file.type !== 'photo' && file.type !== 'certificate') return false
-  return Boolean(named || isOcrImage(file.mimeType, file.name))
+  if (onSheet) return false
+  return true
+}
+
+function orderForResume(files: TypedFile[]) {
+  const lastId = lastAction().fileId
+  const sorted = [...files].sort((a, b) => (a.modifiedTime || '').localeCompare(b.modifiedTime || '') || a.id.localeCompare(b.id) || a.name.localeCompare(b.name))
+  if (!lastId) return sorted
+  const index = sorted.findIndex((file) => file.id === lastId)
+  if (index < 0) return sorted
+  return [...sorted.slice(index + 1), ...sorted.slice(0, index + 1)]
 }
 
 async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 'full' = 'auto', files?: TypedFile[], sheetPlates?: Set<string>, focus: ProcessFocus = 'all') {
   const watching = watchingLabel(config, focus)
   const listed = files || (await scanFolders(config)).files
   const toNormalize = listed.filter((file) => fileMatchesFocus(file, focus) && plateFromTypedName(file.name, file.type) && !hasCanonicalName(file) && !isOcrImage(file.mimeType, file.name))
-  const pending = listed.filter((file) => pendingForFocus(file, focus, sheetPlates)).sort((a, b) => {
-    const aNamed = namedPlateOf(a)
-    const bNamed = namedPlateOf(b)
-    const aOnSheet = Boolean(aNamed && sheetPlates?.has(compactPlate(aNamed)))
-    const bOnSheet = Boolean(bNamed && sheetPlates?.has(compactPlate(bNamed)))
-    return Number(aOnSheet) - Number(bOnSheet)
-  })
+  const pending = orderForResume(listed.filter((file) => pendingForFocus(file, focus, sheetPlates)))
   const newestCertificate = mode === 'full' && (focus === 'all' || focus === 'certificates')
     ? listed
-      .filter((file) => file.type === 'certificate' && isOcrImage(file.mimeType, file.name) && !nameMatchesDocument(file) && !ocrTriedRecently(file.id))
+      .filter((file) => file.type === 'certificate' && isOcrImage(file.mimeType, file.name) && !nameMatchesDocument(file) && !wasTriedRecently(file.id))
       .sort((a, b) => (b.modifiedTime || '').localeCompare(a.modifiedTime || ''))
       .find((file) => !pending.some((item) => item.id === file.id))
     : undefined
@@ -581,7 +583,6 @@ async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 
     return { watching, attempted: 0, renamed: 0, remaining: pending.length, more: pending.length > 0, renamedFiles: [] as TypedFile[], started: false, focus }
   }
   if (candidates.length) beginProcessJob(watching, candidates, focus)
-  for (const file of ocrCandidates) markOcrTried(file.id)
   let renamed = 0
   let error: string | undefined
   const renamedFiles: TypedFile[] = []
@@ -593,8 +594,20 @@ async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 
       renamed += result.renamed
       if (result.file) renamedFiles.push(result.file)
       if (result.error && !error) error = result.error
+      markTried(file.id)
+      recordLastAction({
+        focus,
+        status: 'running',
+        fileId: file.id,
+        fileName: result.file?.name || file.name,
+        plate: result.plate || undefined,
+        detail: result.plate ? `Read ${result.plate} on ${result.file?.name || file.name}` : `Finished ${file.name}`,
+        done: (lastAction().done || 0) + 1,
+      })
     } catch (err) {
       error = err instanceof Error ? err.message : 'OCR error'
+      markTried(file.id)
+      recordLastAction({ focus, status: 'running', fileId: file.id, fileName: file.name, detail: error })
       touchProcessItem(file.id, { stage: 'error', detail: error, name: file.name, type: file.type, mimeType: file.mimeType })
       await appendAudit(config, 'System', `OCR failed for ${file.name}: ${error}`)
     }
@@ -630,7 +643,20 @@ async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 
     error = unreadPlateMessage(ocrCandidates, watching)
   }
   const stopped = isStaleProcess(generation) || isProcessCancelled()
-  return { watching, attempted: candidates.length, renamed, remaining: stopped ? 0 : remainingAfter, more: !stopped && remainingAfter > 0, error: stopped ? undefined : error, renamedFiles, started: candidates.length > 0, focus }
+  recordLastAction({
+    focus,
+    status: stopped ? 'paused' : remainingAfter > 0 ? 'running' : 'done',
+    remaining: stopped ? pending.length : remainingAfter,
+    done: lastAction().done,
+    detail: stopped
+      ? `Paused ${processFocusLabel(focus)} after ${lastAction().fileName || 'the last file'}. Start again to continue.`
+      : remainingAfter > 0
+        ? `${processFocusLabel(focus)} batch finished. ${remainingAfter} still need a plate.`
+        : `${processFocusLabel(focus)} caught up.`,
+  })
+  await persistProcessCursor(config).catch(() => {})
+  attachLastAction(lastAction())
+  return { watching, attempted: candidates.length, renamed, remaining: stopped ? lastAction().remaining || pending.length : remainingAfter, more: !stopped && remainingAfter > 0, error: stopped ? undefined : error, renamedFiles, started: candidates.length > 0, focus, lastAction: lastAction() }
 }
 
 function mergeTypedFiles(files: TypedFile[], updates: TypedFile[]) {

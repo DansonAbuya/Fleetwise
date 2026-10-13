@@ -394,7 +394,7 @@ function FleetApp() {
         applySnapshot(next, ok)
         ok = undefined
         if (!next.ingest?.more) break
-        const left = next.ingest.remaining ? ` · ${next.ingest.remaining} waiting` : ''
+        const left = next.ingest.remaining ? ` · ${next.ingest.remaining} still need a plate` : ''
         setBusy(`Starting the next batch${left}`)
         next = await loadFleet('auto')
       }
@@ -426,7 +426,7 @@ function FleetApp() {
             else moreWorkRef.current = Boolean(next.ingest?.more)
             if (!next.ingest?.more) break
             if (!cancelled) {
-              const left = next.ingest.remaining ? ` · ${next.ingest.remaining} waiting` : ''
+              const left = next.ingest.remaining ? ` · ${next.ingest.remaining} still need a plate` : ''
               setBusy(`Starting the next batch${left}`)
             }
             next = await loadFleet('auto')
@@ -672,7 +672,7 @@ function FleetApp() {
         </>}
         {active === 'Vehicles' && <section className="panel table-panel standalone"><div className="panel-heading"><div><h2>All vehicles</h2><p>{fleet?.config?.spreadsheetId ? `Matched to Registration Number rows on STOCK DOCUMENTS in ${fleet.config.spreadsheetName || 'Fleet Assets'}.` : 'Vehicles come from STOCK DOCUMENTS on Fleet Assets or Fleet Assets - KE once Sheets access is granted.'}</p></div><button className="button primary" onClick={() => openUpload()} disabled={!configured}><Plus size={16} /> Upload document</button></div><div className="table-toolbar"><div className="search-box"><Search size={16} /><input value={query} onChange={(e) => { setQuery(e.target.value); setVehiclePage(1) }} placeholder="Search plate or brand..." aria-label="Search plate or brand" /></div><label className="field-label">Status<select className="assign-input" value={statusFilter} onChange={(e) => { setStatusFilter(e.target.value as StatusFilter); setVehiclePage(1) }}><option value="all">All</option><option value="Complete">Complete</option><option value="Needs attention">Needs attention</option></select></label><BrandFilter value={brandFilter} brands={brands} unbrandedCount={unbrandedCount} onChange={(next) => { setBrandFilter(next); setVehiclePage(1) }} /><MissingFilters value={missingFilters} onChange={(next) => { setMissingFilters(next); setVehiclePage(1) }} /></div><VehicleTable vehicles={vehicles} total={vehicleTotal} page={vehiclePage} pageSize={vehiclePageSize} pageSizes={[25, 50, 100]} loading={tableBusy} onPageChange={setVehiclePage} onPageSizeChange={(size) => { setVehiclePageSize(size); setVehiclePage(1) }} onSelect={setSelected} /></section>}
         {active === 'Insurance inbox' && <InboxView inbox={inbox} config={fleet?.config ?? null} gmailConnected={Boolean(fleet?.gmailConnected)} ocrConfigured={Boolean(fleet?.ocrConfigured)} busy={Boolean(busy)} onSync={() => refresh(syncGmail(), 'Gmail inbox checked.')} onAssign={(input) => refresh(assignUnmatched(input), `Assigned ${input.plate}.`)} />}
-        {active === 'Processing' && <ProcessingView lastSync={fleet?.lastSync} vehicles={vehicleCount} unmatched={unmatched} busy={Boolean(busy)} configured={configured} ocrConfigured={Boolean(fleet?.ocrConfigured)} ingest={fleet?.ingest} job={processJob} photosFolder={fleet?.config?.photosName} certificatesFolder={fleet?.config?.certificatesName} onScan={() => refresh(loadFleet('full', false, 'off'), 'Folders scanned. No OCR ran — start photos, insurance, or match repair below.')} onGmail={() => refresh(syncGmail(), 'Gmail inbox checked.')} onOcr={() => refresh(ocrUnmatchedPhotos(), 'Read plates from unmatched photos and insurance files.')} onStart={async (focus) => { if (processJob?.running || processJob?.advancing) await stopProcessing(); return refresh(runProcessing(focus), `Started ${processFocusLabel(focus)}. Stop this job before switching to another.`) }} onStop={async () => { const next = await stopProcessing(); setProcessJob(next); moreWorkRef.current = false; setFleet((current) => current?.ingest ? { ...current, ingest: { ...current.ingest, more: false, remaining: 0 } } : current); setBusy(''); setBatchNotice(''); setSuccess('Stopped. Start photos, insurance, all files, or match repair when you are ready.') }} />}
+        {active === 'Processing' && <ProcessingView lastSync={fleet?.lastSync} vehicles={vehicleCount} unmatched={unmatched} busy={Boolean(busy)} configured={configured} ocrConfigured={Boolean(fleet?.ocrConfigured)} ingest={fleet?.ingest} job={processJob} photosFolder={fleet?.config?.photosName} certificatesFolder={fleet?.config?.certificatesName} onScan={() => refresh(loadFleet('full', false, 'off'), 'Folders scanned. No OCR ran — start photos, insurance, or match repair below.')} onGmail={() => refresh(syncGmail(), 'Gmail inbox checked.')} onOcr={() => refresh(ocrUnmatchedPhotos(), 'Read plates from unmatched photos and insurance files.')} onStart={async (focus) => { if ((processJob?.running || processJob?.advancing) && processJob.focus && processJob.focus !== focus) await stopProcessing(); const prior = processJob?.lastAction || fleet?.ingest?.lastAction; const resume = prior?.focus === focus && (prior.status === 'paused' || prior.status === 'running'); return refresh(runProcessing(focus), resume ? `Continuing ${processFocusLabel(focus)} from ${prior?.fileName || 'the last file'}.` : `Started ${processFocusLabel(focus)}. Stop to pause; start the same job to continue from there.`) }} onStop={async () => { const next = await stopProcessing(); setProcessJob(next); moreWorkRef.current = false; setFleet((current) => current?.ingest ? { ...current, ingest: { ...current.ingest, more: false, remaining: next.lastAction?.remaining || current.ingest.remaining, lastAction: next.lastAction } } : current); setBusy(''); setBatchNotice(''); setSuccess(next.lastAction?.fileName ? `Paused after ${next.lastAction.fileName}. Start the same job to continue.` : 'Paused. Start the same job to continue from this point.') }} />}
         {active === 'Unmatched' && <UnmatchedView files={unmatched} busy={Boolean(busy)} ocrConfigured={Boolean(fleet?.ocrConfigured)} onAssign={(input) => refresh(assignUnmatched(input), `Assigned ${input.plate}.`)} onOcr={(fileId) => refresh(ocrUnmatchedPhotos(fileId), fileId ? 'Read plate from file.' : 'Read plates from unmatched photos and insurance files.')} />}
         {active === 'Audit log' && <AuditView events={fleet?.audit || []} onExport={() => exportAudit(fleet?.audit || [])} />}
         {active === 'Settings' && <SettingsView fleet={fleet} firstRun={!configured} busy={Boolean(busy) && busy !== 'Loading Drive…' && busy !== 'Opening console…' && busy !== 'Loading the vehicle register…'} onSave={(input) => { writeSavedFolders(input); return refresh(saveFolderConfig(input), 'Folder and sheet configuration saved.') }} onBrowse={listDriveFolders} onBrowseSheets={listSpreadsheets} />}
@@ -777,17 +777,21 @@ function ProcessingView({ lastSync, vehicles, unmatched, busy, configured, ocrCo
   const live = Boolean(job?.running || advancing)
   const batch = job?.batch || 1
   const remaining = job?.remaining || ingest?.remaining || waiting.length
-  const focusLabel = processFocusLabel(job?.focus || ingest?.focus)
+  const last = job?.lastAction || ingest?.lastAction
+  const focusLabel = processFocusLabel(job?.focus || ingest?.focus || last?.focus)
+  const lastWhen = last?.at ? new Date(last.at).toLocaleString() : ''
   return <div className="view-stack">
     <section className="panel process-hero">
       <div className="batch-percent">{percent}<span>%</span></div>
-      <div><span className="eyebrow">{advancing ? 'NEXT BATCH' : job?.running ? `LIVE · ${focusLabel.toUpperCase()} · BATCH ${batch}` : 'CHOOSE A JOB'}</span>
-        <h2>{advancing ? `Batch ${batch} of ${focusLabel} finished — starting the next files` : job?.running ? `Reading ${focusLabel.toLowerCase()} · batch ${batch}` : 'Pick what to process first'}</h2>
+      <div><span className="eyebrow">{advancing ? 'NEXT BATCH' : job?.running ? `LIVE · ${focusLabel.toUpperCase()} · BATCH ${batch}` : last?.status === 'paused' ? 'PAUSED' : 'CHOOSE A JOB'}</span>
+        <h2>{advancing ? `Batch ${batch} of ${focusLabel} finished — starting the next files` : job?.running ? `Reading ${focusLabel.toLowerCase()} · batch ${batch}` : last?.fileName ? `Resume from ${last.fileName}` : 'Pick what to process first'}</h2>
         <p>{advancing
-          ? `${job?.lastRenamed ?? ingest?.renamed ?? 0} file(s) renamed in batch ${batch}. The next ${focusLabel.toLowerCase()} batch is starting now${remaining ? ` · ${remaining} still waiting` : ''}.`
+          ? `${job?.lastRenamed ?? ingest?.renamed ?? 0} file(s) renamed in batch ${batch}. The next ${focusLabel.toLowerCase()} batch is starting now${remaining ? ` · ${remaining} still need a plate` : ''}.`
           : live
-            ? `Running ${focusLabel.toLowerCase()}. Stop this job, then start photos, insurance, all files, or match repair.`
-            : `Start photos, insurance, all waiting files, or only wrong matches. Stop one job and start another whenever you need. Photos folder: ${photosFolder || 'not set'}. Insurance folder: ${certificatesFolder || 'not set'}.${ingest?.remaining ? ` ${ingest.remaining} still waiting.` : ''}${ingest?.attempted ? ` Last ingest: ${ingest.renamed} renamed of ${ingest.attempted} file(s).` : ''}`}</p>
+            ? `Running ${focusLabel.toLowerCase()}. Stop to pause; start the same job later to continue from the last file.`
+            : last?.fileName
+              ? `Last action: ${processFocusLabel(last.focus)} · ${last.fileName}${last.plate ? ` · ${last.plate}` : ''}${lastWhen ? ` · ${lastWhen}` : ''}. Start that job to continue from this point.`
+              : `Start photos, insurance, all waiting files, or only wrong matches. Stop pauses the job; starting the same one continues from the last file. Photos folder: ${photosFolder || 'not set'}. Insurance folder: ${certificatesFolder || 'not set'}.`}</p>
       </div>
       {advancing && <div className="process-advance" role="status"><LoaderCircle size={16} className="spin-icon" /> Ending batch {batch} and opening the next {remaining ? `${Math.min(12, remaining)} of ${remaining}` : 'files'}.</div>}
       <div className="process-tasks" role="group" aria-label="Processing jobs">
@@ -796,7 +800,7 @@ function ProcessingView({ lastSync, vehicles, unmatched, busy, configured, ocrCo
           return <button key={task.id} type="button" className={`process-task ${current ? 'active' : ''}`} disabled={!configured || !ocrConfigured || (busy && !live)} onClick={() => onStart(task.id)}>
             <strong>{task.label}</strong>
             <span>{task.detail}</span>
-            {current ? <em>Running</em> : <em><Play size={12} /> Start</em>}
+            {current ? <em>Running</em> : last?.focus === task.id && last.status === 'paused' ? <em><Play size={12} /> Continue</em> : <em><Play size={12} /> Start</em>}
           </button>
         })}
       </div>

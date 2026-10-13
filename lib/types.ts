@@ -109,5 +109,15 @@ export type FleetSnapshot = {
     focus?: 'all' | 'photos' | 'certificates' | 'repair'
     error?: string
     notice?: string
+    lastAction?: {
+      focus?: 'all' | 'photos' | 'certificates' | 'repair'
+      status?: string
+      fileName?: string
+      plate?: string
+      detail?: string
+      at?: string
+      remaining?: number
+      done?: number
+    }
   }
 }

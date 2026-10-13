@@ -1,4 +1,5 @@
 import { compactPlate } from '@/lib/plates'
+import type { ProcessLastAction } from '@/lib/process-cursor'
 import type { DocType } from '@/lib/types'
 
 export type ProcessFocus = 'all' | 'photos' | 'certificates' | 'repair'
@@ -34,6 +35,7 @@ export type ProcessJob = {
   items: ProcessItem[]
   error?: string
   currentId?: string
+  lastAction?: ProcessLastAction
 }
 
 const MAX_ITEMS = 48
@@ -122,6 +124,10 @@ export function fileMatchesFocus(file: { type: DocType }, focus: ProcessFocus) {
 
 export function getProcessJob(): ProcessJob {
   return job
+}
+
+export function attachLastAction(action?: ProcessLastAction) {
+  job = { ...job, lastAction: action }
 }
 
 export function isProcessRunning() {

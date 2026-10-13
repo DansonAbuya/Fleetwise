@@ -170,8 +170,14 @@ export function pickOcrPlate(text: string, kind: 'certificate' | 'photo' = 'phot
   }
   const labeled = plateFromCertificateText(text)
   if (labeled) bump(labeled, 8)
-  const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1] || b[0].length - a[0].length)
+  const ranked = [...counts.entries()].sort((a, b) => {
+    if (b[1] !== a[1]) return b[1] - a[1]
+    const bike = Number(b[0].startsWith('KM')) - Number(a[0].startsWith('KM'))
+    if (bike) return bike
+    return b[0].length - a[0].length
+  })
   if (ranked[0]?.[1] >= 2) return ranked[0][0]
+  if (kind === 'photo' && ranked[0]?.[0].startsWith('KM') && ranked[0][0].length === 8) return ranked[0][0]
   if (kind === 'photo' && ranked.length === 1) return ranked[0][0]
   if (ranked[0] && ranked[0][1] > (ranked[1]?.[1] || 0)) return ranked[0][0]
   return plateFromText(text)
@@ -262,4 +268,5 @@ export const APP_FILE_NAMES = new Set([
   'fleetwise-config.json',
   'fleetwise-audit.jsonl',
   'fleetwise-gmail-state.json',
+  'fleetwise-process.json',
 ])

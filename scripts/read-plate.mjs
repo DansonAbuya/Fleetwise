@@ -23,33 +23,32 @@ const waiters = []
 let creating = 0
 
 export async function extractPlateText(bytes, kind = 'photo') {
+  const source = unwrapPdf(bytes)
   const chunks = []
-  if (isPdf(bytes)) {
-    const pdf = await readPdf(bytes)
+  if (source.pdf) {
+    const pdf = await readPdf(source.bytes)
     if (pdf.text.trim()) chunks.push(pdf.text.trim())
-    if (!registrationPlate(pdf.text) && !kenyanPlatesIn(pdf.text)[0]) {
-      const pages = pdf.pages.length ? pdf.pages : []
-      if (pages.length) {
-        const ocrText = await ocrPrepared(pages, 'certificate')
-        if (ocrText.trim()) chunks.push(ocrText.trim())
-      }
-      if (!registrationPlate(chunks.join('\n')) && !kenyanPlatesIn(chunks.join('\n'))[0] && pages.length) {
-        const photoText = await ocrPrepared(pages.slice(0, 1), 'photo')
-        if (photoText.trim()) chunks.push(photoText.trim())
-      }
+    const pages = pdf.pages
+    if (pages.length) {
+      const ocrText = await ocrPrepared(pages, 'certificate')
+      if (ocrText.trim()) chunks.push(ocrText.trim())
     }
-    return withFoundPlate(chunks.join('\n'))
-  }
-  if (kind === 'pdf' || kind === 'certificate' || kind === 'logbook') {
-    const documentText = await ocrPrepared([bytes], 'certificate')
-    if (documentText.trim()) chunks.push(documentText.trim())
-    if (!registrationPlate(documentText) && !kenyanPlatesIn(documentText)[0]) {
-      const photoText = await ocrPrepared([bytes], 'photo')
+    if (!registrationPlate(chunks.join('\n')) && !kenyanPlatesIn(chunks.join('\n'))[0] && pages.length) {
+      const photoText = await ocrPrepared(pages.slice(0, 1), 'photo')
       if (photoText.trim()) chunks.push(photoText.trim())
     }
     return withFoundPlate(chunks.join('\n'))
   }
-  const ocrText = await ocrPrepared([bytes], 'photo')
+  if (kind === 'pdf' || kind === 'certificate' || kind === 'logbook') {
+    const documentText = await ocrPrepared([source.bytes], 'certificate')
+    if (documentText.trim()) chunks.push(documentText.trim())
+    if (!registrationPlate(documentText) && !kenyanPlatesIn(documentText)[0]) {
+      const photoText = await ocrPrepared([source.bytes], 'photo')
+      if (photoText.trim()) chunks.push(photoText.trim())
+    }
+    return withFoundPlate(chunks.join('\n'))
+  }
+  const ocrText = await ocrPrepared([source.bytes], 'photo')
   if (ocrText.trim()) chunks.push(ocrText.trim())
   return withFoundPlate(chunks.join('\n'))
 }
@@ -65,29 +64,6 @@ export async function shutdownOcrWorkers() {
   const slots = pool.splice(0, pool.length)
   waiters.length = 0
   await Promise.all(slots.map((slot) => slot.worker.terminate().catch(() => {})))
-}
-
-const isCli = process.argv[1]?.replace(/\\/g, '/').endsWith('read-plate.mjs')
-if (isCli) {
-  process.on('uncaughtException', (err) => {
-    console.error(ocrStartError(err instanceof Error ? err.message : String(err)))
-    process.exit(1)
-  })
-  const file = process.argv[2]
-  const kind = process.argv[3] || 'photo'
-  if (!file) {
-    console.error('Usage: node scripts/read-plate.mjs <image-or-pdf-path> [photo|pdf|certificate]')
-    process.exit(1)
-  }
-  try {
-    const text = await extractPlateText(await readFile(file), kind)
-    process.stdout.write(text)
-    await shutdownOcrWorkers()
-  } catch (err) {
-    console.error(ocrStartError(err instanceof Error ? err.message : String(err)))
-    await shutdownOcrWorkers()
-    process.exit(1)
-  }
 }
 
 class NodeCanvasFactory {
@@ -107,40 +83,50 @@ class NodeCanvasFactory {
   }
 }
 
+function pdfOffset(buffer) {
+  const start = buffer.subarray(0, Math.min(buffer.length, 2048)).toString('latin1').indexOf('%PDF-')
+  return start
+}
+
+function unwrapPdf(buffer) {
+  const start = pdfOffset(buffer)
+  if (start < 0) return { pdf: false, bytes: buffer }
+  return { pdf: true, bytes: start === 0 ? buffer : buffer.subarray(start) }
+}
+
 function isPdf(buffer) {
-  return buffer.length >= 5 && buffer.subarray(0, 5).toString('utf8') === '%PDF-'
+  return pdfOffset(buffer) >= 0
+}
+
+function pdfAssetUrl(folder) {
+  return pathToFileURL(join(root, 'node_modules', 'pdfjs-dist', folder) + '/').href
 }
 
 async function readPdf(buffer) {
   try {
-    return await readPdfDocument(buffer, true)
+    return await readPdfDocument(buffer)
   } catch {
-    try {
-      return await readPdfDocument(buffer, false)
-    } catch {
-      return { text: '', pages: [] }
-    }
+    return { text: '', pages: [] }
   }
 }
 
-async function readPdfDocument(buffer, withFonts) {
+async function readPdfDocument(buffer) {
   const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs')
   const data = Uint8Array.from(buffer)
-  const fonts = withFonts
-    ? {
-        standardFontDataUrl: pathToFileURL(join(root, 'node_modules', 'pdfjs-dist', 'standard_fonts') + '/').href,
-        cMapUrl: pathToFileURL(join(root, 'node_modules', 'pdfjs-dist', 'cmaps') + '/').href,
-        cMapPacked: true,
-      }
-    : {}
+  const canvasFactory = new NodeCanvasFactory()
   const loadingTask = getDocument({
     data,
     disableFontFace: true,
     isOffscreenCanvasSupported: false,
     useSystemFonts: true,
     verbosity: 0,
-    canvasFactory: new NodeCanvasFactory(),
-    ...fonts,
+    useWasm: false,
+    useWorkerFetch: false,
+    cMapUrl: pdfAssetUrl('cmaps'),
+    cMapPacked: true,
+    standardFontDataUrl: pdfAssetUrl('standard_fonts'),
+    wasmUrl: pdfAssetUrl('wasm'),
+    iccUrl: pdfAssetUrl('iccs'),
   })
   const pdf = await loadingTask.promise
   const texts = []
@@ -159,25 +145,37 @@ async function readPdfDocument(buffer, withFonts) {
       }
     }
     const joined = texts.join('\n')
-    if (!registrationPlate(joined) && !kenyanPlatesIn(joined)[0]) {
+    if (!registrationPlate(joined)) {
       for (let n = 1; n <= pageCount; n++) {
         const page = await pdf.getPage(n)
         try {
-          const viewport = page.getViewport({ scale: scaleFor(page) })
-          const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height))
-          const canvasContext = canvas.getContext('2d')
-          await page.render({ canvasContext, canvas, viewport }).promise
-          pages.push(canvas.toBuffer('image/png'))
+          pages.push(await rasterPage(page, canvasFactory))
         } catch {
           // Text extraction still runs if a page cannot be rasterized.
         }
       }
     }
   } finally {
-    await Promise.resolve(pdf.cleanup?.()).catch(() => {})
-    await Promise.resolve(loadingTask.destroy?.()).catch(() => {})
+    try {
+      pdf.cleanup?.()
+    } catch {
+      // pdf.js cleanup can throw after text is already extracted.
+    }
   }
-  return { text: texts.join('\n'), pages }
+  return { text: texts.join('\n'), pages: pages.filter(Boolean) }
+}
+
+async function rasterPage(page, canvasFactory) {
+  const viewport = page.getViewport({ scale: scaleFor(page) })
+  const canvasAndContext = canvasFactory.create(Math.ceil(viewport.width), Math.ceil(viewport.height))
+  await page.render({
+    canvasContext: canvasAndContext.context,
+    canvas: canvasAndContext.canvas,
+    viewport,
+  }).promise
+  const png = canvasAndContext.canvas.toBuffer('image/png')
+  canvasFactory.destroy(canvasAndContext)
+  return png
 }
 
 function layoutText(items) {
@@ -384,7 +382,7 @@ async function ocrPrepared(images, kind) {
   try {
     for (let index = 0; index < variants.length; index++) {
       const modes = kind === 'photo'
-        ? (index === 0 ? ['11', '6', '7'] : ['7'])
+        ? (index === 0 ? ['11', '6', '7'] : index < 4 ? ['7', '8'] : ['8'])
         : (index === 0 ? ['4', '6', '11'] : ['6', '7'])
       const whitelist = kind === 'photo'
         ? 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -'
@@ -407,9 +405,12 @@ async function ocrPrepared(images, kind) {
           for (const plate of kenyanPlatesIn(text)) {
             seen.set(plate, (seen.get(plate) || 0) + 1)
           }
-          const top = [...seen.entries()].sort((a, b) => b[1] - a[1])[0]
-          if (kind === 'photo' && top && ((data.confidence || 0) >= 72 || top[1] >= 2)) return chunks.join('\n')
-          if (kind !== 'photo' && top && top[1] >= 2) return chunks.join('\n')
+          const top = [...seen.entries()].sort((a, b) => {
+            if (b[1] !== a[1]) return b[1] - a[1]
+            return Number(b[0].startsWith('KM')) - Number(a[0].startsWith('KM')) || b[0].length - a[0].length
+          })[0]
+          if (kind === 'photo' && top && (top[1] >= 2 || (top[0].startsWith('KM') && top[0].length === 8 && (data.confidence || 0) >= 78))) return chunks.join('\n')
+          if (kind !== 'photo' && (labeled || (top && top[1] >= 2))) return chunks.join('\n')
         } catch {
           // Try the next crop or page-seg mode.
         }
@@ -426,22 +427,67 @@ async function imageVariants(bytes, kind) {
   try {
     img = await loadImage(bytes)
   } catch {
-    return [bytes]
+    return []
   }
   const scale = scaleForImage(img, kind)
-  const rects = kind === 'photo' ? photoRects(img).slice(0, 8) : documentRects(img)
-  const cropScale = kind === 'photo' ? Math.max(scale, 2) : Math.max(scale, 1.6)
+  const rects = kind === 'photo' ? photoRects(img).slice(0, 6) : documentRects(img)
+  const cropScale = kind === 'photo' ? Math.max(scale, 2.4) : Math.max(scale, 1.8)
   const variants = [
     renderPlain(img, { scale }),
     renderPrepared(img, { scale, invert: false }),
   ]
-  if (kind === 'photo') variants.push(renderPrepared(img, { scale, invert: true }))
+  if (kind === 'photo') {
+    variants.push(renderPrepared(img, { scale, invert: true }))
+    variants.push(renderYellowBoost(img, { scale }))
+  }
   for (const rect of rects) {
     variants.push(renderPlain(img, { scale: cropScale, rect }))
     variants.push(renderPrepared(img, { scale: cropScale, invert: false, rect }))
   }
+  if (kind === 'photo' && rects[0]) {
+    variants.push(renderRotated(img, -8, rects[0], cropScale))
+    variants.push(renderRotated(img, 8, rects[0], cropScale))
+    variants.push(renderYellowBoost(img, { scale: cropScale, rect: rects[0] }))
+  }
   if (kind !== 'photo') variants.push(renderPrepared(img, { scale, invert: true }))
   return variants
+}
+
+function renderRotated(img, angle, rect, scale = 2) {
+  const source = rect || { left: 0, top: 0, width: img.width, height: img.height }
+  const pad = Math.max(source.width, source.height) * 0.15
+  const w = Math.max(1, Math.round((source.width + pad * 2) * scale))
+  const h = Math.max(1, Math.round((source.height + pad * 2) * scale))
+  const canvas = createCanvas(w, h)
+  const ctx = canvas.getContext('2d')
+  ctx.fillStyle = '#ffffff'
+  ctx.fillRect(0, 0, w, h)
+  ctx.translate(w / 2, h / 2)
+  ctx.rotate((angle * Math.PI) / 180)
+  ctx.drawImage(img, source.left, source.top, source.width, source.height, -w / 2, -h / 2, w, h)
+  return canvas.toBuffer('image/png')
+}
+
+function renderYellowBoost(img, { scale = 1, rect } = {}) {
+  const source = rect || { left: 0, top: 0, width: img.width, height: img.height }
+  const w = Math.max(1, Math.round(source.width * scale))
+  const h = Math.max(1, Math.round(source.height * scale))
+  const canvas = createCanvas(w, h)
+  const ctx = canvas.getContext('2d')
+  ctx.drawImage(img, source.left, source.top, source.width, source.height, 0, 0, w, h)
+  const imageData = ctx.getImageData(0, 0, w, h)
+  const d = imageData.data
+  for (let i = 0; i < d.length; i += 4) {
+    const r = d[i]
+    const g = d[i + 1]
+    const b = d[i + 2]
+    const yellow = r > 140 && g > 120 && b < 140 && r + g > b * 1.8
+    const v = yellow ? 0 : 255
+    d[i] = d[i + 1] = d[i + 2] = v
+    d[i + 3] = 255
+  }
+  ctx.putImageData(imageData, 0, 0)
+  return canvas.toBuffer('image/png')
 }
 
 function renderPlain(img, { scale = 1, rect } = {}) {
@@ -574,6 +620,7 @@ function documentRects(img) {
   const { width, height } = img
   return [
     { left: 0, top: 0, width, height: Math.floor(height * 0.42) },
+    { left: Math.floor(width * 0.4), top: 0, width: Math.floor(width * 0.6), height: Math.floor(height * 0.38) },
     { left: 0, top: 0, width: Math.floor(width * 0.55), height: Math.floor(height * 0.45) },
     { left: Math.floor(width * 0.32), top: 0, width: Math.floor(width * 0.68), height: Math.floor(height * 0.5) },
     { left: 0, top: Math.floor(height * 0.08), width, height: Math.floor(height * 0.4) },
@@ -641,4 +688,22 @@ function ocrStartError(message) {
   }
   const clean = message.replace(/\s+/g, ' ').trim()
   return clean ? `Couldn't read that file: ${clean}` : "Couldn't read that file."
+}
+
+const isCli = process.argv[1]?.replace(/\\/g, '/').endsWith('read-plate.mjs')
+if (isCli) {
+  const file = process.argv[2]
+  const kind = process.argv[3] || 'photo'
+  if (!file) {
+    console.error('Usage: node scripts/read-plate.mjs <image-or-pdf-path> [photo|pdf|certificate]')
+    process.exit(1)
+  }
+  try {
+    const text = await extractPlateText(await readFile(file), kind)
+    process.stdout.write(text ? `${text}\n` : '')
+  } catch (err) {
+    console.error(ocrStartError(err instanceof Error ? err.message : String(err)))
+  } finally {
+    await shutdownOcrWorkers().catch(() => {})
+  }
 }

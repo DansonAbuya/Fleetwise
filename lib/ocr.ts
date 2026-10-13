@@ -6,8 +6,6 @@ import { promisify } from 'node:util'
 import { compactPlate, pickOcrPlate, plateConfidence, plateFromCertificateText } from '@/lib/plates'
 
 const execFileAsync = promisify(execFile)
-const MAX_BYTES = 28 * 1024 * 1024
-
 export function ocrConfigured() {
   return true
 }
@@ -45,14 +43,19 @@ export async function resolvePlateFromFile(input: {
 }
 
 function isPdfBytes(bytes: Buffer) {
-  return bytes.length >= 5 && bytes.subarray(0, 5).toString('utf8') === '%PDF-'
+  return bytes.subarray(0, Math.min(bytes.length, 2048)).toString('latin1').includes('%PDF-')
 }
 
 export async function plateFromImage(bytes: Buffer, mimeType?: string, filename?: string, kind?: string) {
   if (!isOcrImage(mimeType, filename) && !isPdfBytes(bytes)) return { plate: null as string | null, confidence: 0, text: '' }
   if (bytes.length === 0) return { plate: null, confidence: 0, text: '' }
   const ocrKind = ocrKindFor(bytes, mimeType, filename, kind)
-  const text = await readTextWithTesseract(bytes, mimeType, filename, ocrKind)
+  let text = ''
+  try {
+    text = await readTextWithTesseract(bytes, mimeType, filename, ocrKind)
+  } catch {
+    return { plate: null, confidence: 0, text: '' }
+  }
   const plateKind = ocrKind === 'photo' ? 'photo' : 'certificate'
   const labeled = plateFromCertificateText(text)
   if (ocrKind !== 'photo' && labeled) return { plate: labeled, confidence: 94, text }
