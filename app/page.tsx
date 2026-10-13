@@ -57,8 +57,8 @@ const MISSING_FILTERS: { id: MissingFilter; label: string }[] = [
 ]
 
 const PROCESS_TASKS: { id: ProcessFocus; label: string; detail: string }[] = [
-  { id: 'photos', label: 'Photos only', detail: 'Read plates from the photos folder and rename them.' },
-  { id: 'certificates', label: 'Insurance only', detail: 'Read registration from insurance PDFs and photos.' },
+  { id: 'photos', label: 'Photos only', detail: 'Read bike plates with Tesseract.js and rename Photos {plate}.' },
+  { id: 'certificates', label: 'Insurance only', detail: 'Rename new insurance PDFs from REGISTRATION No, then write chips on the sheet.' },
   { id: 'all', label: 'All waiting files', detail: 'Photos, insurance, and other waiting documents.' },
   { id: 'repair', label: 'Fix wrong matches', detail: 'Recheck unmatched and wrongly named plates.' },
 ]

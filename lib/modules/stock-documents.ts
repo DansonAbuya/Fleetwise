@@ -125,7 +125,7 @@ async function writeSheetMatches(config: FleetConfig, files: TypedFile[], mode: 
     const link = driveViewLink(file)
     if (!link) return
     chipRequests.push(chipRequest(register.sheetId, row.row, column.col, link))
-    column.value = (file.name || '').replace(/\.(pdf|jpe?g|png|webp|gif|heic)$/i, '').trim() || file.name || link
+    column.value = chipTitle(file)
     column.uri = link
     if (!seenMatched.has(row.plate)) {
       seenMatched.add(row.plate)
@@ -137,7 +137,6 @@ async function writeSheetMatches(config: FleetConfig, files: TypedFile[], mode: 
     for (const key of ['certificate', 'photo', 'photoBranded'] as ColumnKey[]) {
       const column = row.columns[key]
       if (!column || chipRequests.length >= writeLimit) continue
-      const type: DocType = key === 'photoBranded' ? 'photo' : key
       const correct = bestForRow.get(`${key}:${row.plate}`)
       const linkedId = column.uri ? driveIdFromUri(column.uri) : ''
       const linked = linkedId ? filesById.get(linkedId) : undefined
@@ -145,13 +144,15 @@ async function writeSheetMatches(config: FleetConfig, files: TypedFile[], mode: 
         ? filePlate(linked)
         : compactPlate(plateFromText(column.value || '') || '')
       const hasChip = isDriveDocumentUri(column.uri)
-      if (hasChip && currentPlate === row.plate) continue
-      if (hasChip && !currentPlate && linkedId && !linked) continue
-      if (correct && linkedId !== correct.id) {
-        queueChip(row, column, correct)
+      if (correct) {
+        const title = chipTitle(correct)
+        const shown = chipTitle({ name: column.value || '' })
+        const already = hasChip && linkedId === correct.id && shown === title
+        if (!already) queueChip(row, column, correct)
         continue
       }
-      if (hasChip && currentPlate && currentPlate !== row.plate && !correct) {
+      if (hasChip && !currentPlate && linkedId && !linked) continue
+      if (hasChip && currentPlate && currentPlate !== row.plate) {
         chipRequests.push(clearChipRequest(register.sheetId, row.row, column.col))
         column.value = ''
         column.uri = undefined
@@ -204,6 +205,10 @@ async function writeSheetMatches(config: FleetConfig, files: TypedFile[], mode: 
     cells: cellsFromRegister(register),
     more: chipRequests.length >= writeLimit,
   }
+}
+
+function chipTitle(file: { name?: string }) {
+  return (file.name || '').replace(/\.(pdf|jpe?g|png|webp|gif|heic)$/i, '').trim()
 }
 
 function filePlate(file: TypedFile) {

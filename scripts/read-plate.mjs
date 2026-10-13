@@ -22,12 +22,28 @@ const pool = []
 const waiters = []
 let creating = 0
 
+export async function extractPdfjsRegistration(bytes) {
+  const source = unwrapPdf(bytes)
+  if (!source.pdf) return ''
+  const pdf = await readPdf(source.bytes, false)
+  return withFoundPlate(pdf.text)
+}
+
 export async function extractPlateText(bytes, kind = 'photo') {
   const source = unwrapPdf(bytes)
   const chunks = []
-  if (source.pdf) {
-    const pdf = await readPdf(source.bytes)
-    if (pdf.text.trim()) chunks.push(pdf.text.trim())
+  if (kind === 'pdfjs') return extractPdfjsRegistration(bytes)
+  if (kind === 'photo') {
+    const ocrText = await ocrPrepared([source.bytes], 'photo')
+    if (ocrText.trim()) chunks.push(ocrText.trim())
+    return withFoundPlate(chunks.join('\n'))
+  }
+  if (source.pdf || kind === 'pdf') {
+    const pdfjsText = await extractPdfjsRegistration(source.pdf ? source.bytes : bytes)
+    if (pdfjsText.trim()) chunks.push(pdfjsText.trim())
+    if (registrationPlate(chunks.join('\n'))) return withFoundPlate(chunks.join('\n'))
+    const pdf = await readPdf(source.pdf ? source.bytes : bytes, true)
+    if (pdf.text.trim() && pdf.text.trim() !== pdfjsText.trim()) chunks.push(pdf.text.trim())
     const pages = pdf.pages
     if (pages.length) {
       const ocrText = await ocrPrepared(pages, 'certificate')
@@ -39,7 +55,7 @@ export async function extractPlateText(bytes, kind = 'photo') {
     }
     return withFoundPlate(chunks.join('\n'))
   }
-  if (kind === 'pdf' || kind === 'certificate' || kind === 'logbook') {
+  if (kind === 'certificate' || kind === 'logbook') {
     const documentText = await ocrPrepared([source.bytes], 'certificate')
     if (documentText.trim()) chunks.push(documentText.trim())
     if (!registrationPlate(documentText) && !kenyanPlatesIn(documentText)[0]) {
@@ -102,15 +118,15 @@ function pdfAssetUrl(folder) {
   return pathToFileURL(join(root, 'node_modules', 'pdfjs-dist', folder) + '/').href
 }
 
-async function readPdf(buffer) {
+async function readPdf(buffer, raster = true) {
   try {
-    return await readPdfDocument(buffer)
+    return await readPdfDocument(buffer, raster)
   } catch {
     return { text: '', pages: [] }
   }
 }
 
-async function readPdfDocument(buffer) {
+async function readPdfDocument(buffer, raster = true) {
   const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs')
   const data = Uint8Array.from(buffer)
   const canvasFactory = new NodeCanvasFactory()
@@ -149,7 +165,7 @@ async function readPdfDocument(buffer) {
       }
     }
     const joined = texts.join('\n')
-    if (!registrationPlate(joined)) {
+    if (raster && !registrationPlate(joined)) {
       for (let n = 1; n <= pageCount; n++) {
         const page = await pdf.getPage(n)
         try {
@@ -747,7 +763,7 @@ if (isCli) {
   const file = process.argv[2]
   const kind = process.argv[3] || 'photo'
   if (!file) {
-    console.error('Usage: node scripts/read-plate.mjs <image-or-pdf-path> [photo|pdf|certificate]')
+    console.error('Usage: node scripts/read-plate.mjs <image-or-pdf-path> [photo|pdf|certificate|pdfjs]')
     process.exit(1)
   }
   try {

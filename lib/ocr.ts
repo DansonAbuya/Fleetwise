@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { compactPlate, pickOcrPlate, plateConfidence, plateFromCertificateText } from '@/lib/plates'
+import { isInsurancePdf, isPdfBytes, registrationFromPdfjs } from '@/lib/pdf-registration'
 
 const execFileAsync = promisify(execFile)
 export function ocrConfigured() {
@@ -42,39 +43,53 @@ export async function resolvePlateFromFile(input: {
   return named
 }
 
-function isPdfBytes(bytes: Buffer) {
-  return bytes.subarray(0, Math.min(bytes.length, 65_536)).toString('latin1').includes('%PDF-')
-}
-
 export async function plateFromImage(bytes: Buffer, mimeType?: string, filename?: string, kind?: string) {
   if (!isOcrImage(mimeType, filename) && !isPdfBytes(bytes)) return { plate: null as string | null, confidence: 0, text: '' }
   if (bytes.length === 0) return { plate: null, confidence: 0, text: '' }
   const ocrKind = ocrKindFor(bytes, mimeType, filename, kind)
+  if (ocrKind === 'photo') {
+    return readBikePhotoWithTesseract(bytes, mimeType, filename)
+  }
+  if (isInsurancePdf(bytes, mimeType, filename)) {
+    const pdfjs = await registrationFromPdfjs(bytes)
+    if (pdfjs.plate) return { plate: pdfjs.plate, confidence: 96, text: pdfjs.text }
+  }
   let text = ''
   try {
     text = await readTextWithTesseract(bytes, mimeType, filename, ocrKind)
   } catch {
     return { plate: null, confidence: 0, text: '' }
   }
-  const plateKind = ocrKind === 'photo' ? 'photo' : 'certificate'
   const labeled = plateFromCertificateText(text)
-  if (ocrKind !== 'photo' && labeled) return { plate: labeled, confidence: 94, text }
-  const plate = pickOcrPlate(text, plateKind)
+  if (labeled) return { plate: labeled, confidence: 94, text }
+  const plate = pickOcrPlate(text, 'certificate')
   if (!plate) return { plate: null, confidence: 0, text }
   return { plate, confidence: labeled === plate ? 94 : 86, text }
 }
 
 function ocrKindFor(bytes: Buffer, mimeType?: string, filename?: string, kind?: string) {
+  if (kind === 'photo') return 'photo'
   if (isPdfFile(bytes, mimeType, filename) || kind === 'certificate' || kind === 'logbook') {
     if (isPdfFile(bytes, mimeType, filename)) return 'pdf'
     return 'certificate'
   }
-  if (kind === 'photo') return 'photo'
   return 'photo'
 }
 
+async function readBikePhotoWithTesseract(bytes: Buffer, mimeType?: string, filename?: string) {
+  let text = ''
+  try {
+    text = await readTextWithTesseract(bytes, mimeType, filename, 'photo')
+  } catch {
+    return { plate: null as string | null, confidence: 0, text: '' }
+  }
+  const plate = pickOcrPlate(text, 'photo')
+  if (!plate) return { plate: null, confidence: 0, text }
+  return { plate, confidence: 86, text }
+}
+
 function isPdfFile(bytes: Buffer, mimeType?: string, filename?: string) {
-  return isPdfBytes(bytes) || (mimeType || '').toLowerCase().includes('pdf') || /\.pdf$/i.test(filename || '')
+  return isInsurancePdf(bytes, mimeType, filename)
 }
 
 function commandOutput(err: unknown) {

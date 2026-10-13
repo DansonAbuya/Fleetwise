@@ -536,11 +536,13 @@ function watchingLabel(config: FleetConfig, focus: ProcessFocus) {
 
 function pendingForFocus(file: TypedFile, focus: ProcessFocus, sheetPlates?: Set<string>) {
   if (!fileMatchesFocus(file, focus)) return false
-  if (wasTriedRecently(file.id)) return false
-  if (nameMatchesDocument(file)) return false
   const named = namedPlateOf(file)
   const readable = isOcrImage(file.mimeType, file.name)
-  if (file.type === 'certificate') return readable || /\.pdf$/i.test(file.name) || (file.mimeType || '').includes('pdf')
+  if (file.type === 'certificate') {
+    if (hasCanonicalName(file) && nameMatchesDocument(file)) return false
+    return readable || /\.pdf$/i.test(file.name) || (file.mimeType || '').includes('pdf') || (file.mimeType || '').startsWith('application/vnd.google-apps.')
+  }
+  if (wasTriedRecently(file.id) || nameMatchesDocument(file)) return false
   if (!named && !readable) return false
   const onSheet = Boolean(named && sheetPlates?.has(compactPlate(named)))
   if (onSheet) return false
@@ -549,11 +551,16 @@ function pendingForFocus(file: TypedFile, focus: ProcessFocus, sheetPlates?: Set
 
 function orderForResume(files: TypedFile[]) {
   const lastId = lastAction().fileId
-  const sorted = [...files].sort((a, b) => (a.modifiedTime || '').localeCompare(b.modifiedTime || '') || a.id.localeCompare(b.id) || a.name.localeCompare(b.name))
-  if (!lastId) return sorted
-  const index = sorted.findIndex((file) => file.id === lastId)
-  if (index < 0) return sorted
-  return [...sorted.slice(index + 1), ...sorted.slice(0, index + 1)]
+  const unnamed = files
+    .filter((file) => !hasCanonicalName(file))
+    .sort((a, b) => (b.modifiedTime || '').localeCompare(a.modifiedTime || '') || a.id.localeCompare(b.id) || a.name.localeCompare(b.name))
+  const named = files
+    .filter((file) => hasCanonicalName(file))
+    .sort((a, b) => (a.modifiedTime || '').localeCompare(b.modifiedTime || '') || a.id.localeCompare(b.id) || a.name.localeCompare(b.name))
+  if (!lastId) return [...unnamed, ...named]
+  const index = named.findIndex((file) => file.id === lastId)
+  const rotated = index < 0 ? named : [...named.slice(index + 1), ...named.slice(0, index + 1)]
+  return [...unnamed, ...rotated]
 }
 
 async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 'full' = 'auto', files?: TypedFile[], sheetPlates?: Set<string>, focus: ProcessFocus = 'all') {
