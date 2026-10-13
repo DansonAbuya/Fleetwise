@@ -148,7 +148,7 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
   const continuing = Boolean(ingest.more)
   const sheet = await syncSheetIndex(config, continuing ? 'match' : mode, files)
   if ((ingest.started || closeLive) && isProcessRunning() && !isStaleProcess(ingestGen)) {
-    markProcessMatches(sheet.matched, sheet.missing)
+    markProcessMatches(sheet.matched, sheet.missing, sheet.plates)
     endProcessJob(ingest.error || sheet.error, { remaining: ingest.remaining || 0, renamed: ingest.renamed })
   }
   const emptyGmail = { state: { processedIds: [] as string[], items: [] as InboxItem[] } }
@@ -477,7 +477,7 @@ async function ocrAndRename(config: FleetConfig, user: string, file: TypedFile, 
   const ocr = await plateFromImage(bytes, file.mimeType, file.name, file.type)
   const usesRegistrationField = file.type === 'certificate' || file.type === 'logbook'
   const labeled = usesRegistrationField ? plateFromCertificateText(ocr.text) : null
-  const documentPlate = labeled || ocr.plate
+  const documentPlate = labeled || ocr.plate || (usesRegistrationField ? plateFromText(ocr.text) : null)
   if (documentPlate) markConfirmed(file.id, documentPlate)
   let plate = documentPlate || named
   if (usesRegistrationField) {
@@ -515,12 +515,15 @@ async function ocrAndRename(config: FleetConfig, user: string, file: TypedFile, 
     plate,
     name: file.name,
   })
-  if (name === file.name) return { renamed: 0, text: ocr.text, name, plate, file: { ...file, name, plate, type: file.type } }
+  if (name === file.name) {
+    touchProcessItem(file.id, { stage: 'matching', detail: `Named ${name} from REGISTRATION No ${plate}. Matching on STOCK DOCUMENTS`, plate, name })
+    return { renamed: 0, text: ocr.text, name, plate, file: { ...file, name, plate, type: file.type } }
+  }
   const updated = await moveAndRename(file.id, { name })
   await appendAudit(config, user, named && compactPlate(named) !== compactPlate(plate)
     ? `Corrected ${file.name} to ${name} from the document`
     : `OCR matched ${file.name} to ${plate}`)
-  touchProcessItem(file.id, { stage: 'renaming', detail: `Renamed to ${name}`, plate, name })
+  touchProcessItem(file.id, { stage: 'matching', detail: `Renamed to ${name}. Matching ${plate} on STOCK DOCUMENTS`, plate, name })
   return { renamed: 1, text: ocr.text, name, plate, file: { ...file, ...updated, name, plate, type: file.type } }
 }
 

@@ -749,14 +749,14 @@ function InboxView({ inbox, config, gmailConnected, ocrConfigured, busy, onSync,
 
 const PROCESS_STEPS = ['queued', 'opening', 'reading', 'renaming', 'matching', 'matched'] as const
 
-function processStageLabel(stage: string) {
+function processStageLabel(stage: string, plate?: string | null) {
   if (stage === 'queued') return 'Queued'
   if (stage === 'opening') return 'Opening'
   if (stage === 'reading') return 'Reading plate'
   if (stage === 'renaming') return 'Renaming'
   if (stage === 'matching') return 'Matching sheet'
   if (stage === 'matched') return 'Matched'
-  if (stage === 'unmatched') return 'Needs a plate'
+  if (stage === 'unmatched') return plate ? 'Not on register' : 'Needs a plate'
   if (stage === 'error') return 'Could not process'
   return stage
 }
@@ -826,10 +826,17 @@ function ProcessingView({ lastSync, vehicles, unmatched, busy, configured, ocrCo
               <span>{labelFor(item.type)}{item.plate ? ` · ${item.plate}` : ''}</span>
               <p>{item.detail}</p>
               <ol className="process-steps" aria-label="Processing steps">
-                {PROCESS_STEPS.map((step, index) => <li key={step} className={item.stage === 'error' || item.stage === 'unmatched' ? (index === 0 ? 'is-done' : '') : stepIndex >= index ? (stepIndex === index && item.stage !== 'matched' ? 'is-current' : 'is-done') : ''}>{processStageLabel(step === 'matched' ? 'matched' : step)}</li>)}
+                {PROCESS_STEPS.map((step, index) => {
+                  const namedOffSheet = item.stage === 'unmatched' && Boolean(item.plate)
+                  const failed = item.stage === 'error' || (item.stage === 'unmatched' && !item.plate)
+                  const doneThrough = namedOffSheet ? PROCESS_STEPS.indexOf('matching') : stepIndex
+                  const current = namedOffSheet ? step === 'matching' : stepIndex === index && item.stage !== 'matched'
+                  const done = failed ? index === 0 : doneThrough >= index && !current
+                  return <li key={step} className={failed ? (index === 0 ? 'is-done' : '') : current ? 'is-current' : done ? 'is-done' : ''}>{processStageLabel(step === 'matched' ? 'matched' : step)}</li>
+                })}
               </ol>
             </div>
-            <span className={`process-flag stage-${item.stage}`}>{item.stage === 'opening' || item.stage === 'reading' || item.stage === 'renaming' || item.stage === 'matching' ? <LoaderCircle size={14} className="spin-icon" /> : null}{processStageLabel(item.stage)}</span>
+            <span className={`process-flag stage-${item.stage}`}>{item.stage === 'opening' || item.stage === 'reading' || item.stage === 'renaming' || item.stage === 'matching' ? <LoaderCircle size={14} className="spin-icon" /> : null}{processStageLabel(item.stage, item.plate)}</span>
           </article>
         })}
         {waiting.map((file) => <article className="process-card stage-unmatched" key={file.id}>

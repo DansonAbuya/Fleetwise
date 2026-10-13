@@ -216,9 +216,9 @@ export function listRegistrationNumbers(plates: string[]) {
   return `${unique.slice(0, 5).join(', ')}, and ${unique.length - 5} more`
 }
 
-const REG_LABEL = /(?:^|\b)(?:vehicle\s+|motor(?:\s+vehicle)?\s+|m\.?\s*v\.?\s+)?(?:registration(?:\s*(?:no\.?|number|num|mark|#))?|reg(?:istration)?\.?\s*(?:no\.?|number|num|mark|#)?)\.?(?:\b|$)/i
+const REG_LABEL = /\b(?:vehicle\s+|motor(?:\s+vehicle)?\s+|m\.?\s*v\.?\s*)?(?:registration|reg)(?:[\s.:\-–]*?(?:no\.?|number|num|mark|#))?(?![A-Za-z])/i
 const NEXT_FIELD = /\b(chassis|make|model|engine|body|colour|color|year|seating|tonnage|policy|insured|commencement|expiry|owner|pin|tare|gvw)\b/i
-const REG_LABEL_GLOBAL = /\b(?:vehicle\s+|motor(?:\s+vehicle)?\s+|m\.?\s*v\.?\s+)?(?:registration(?:\s*(?:no\.?|number|num|mark|#))?|reg(?:istration)?\.?\s*(?:no\.?|number|num|mark|#)?)\.?/gi
+const REG_LABEL_GLOBAL = /\b(?:vehicle\s+|motor(?:\s+vehicle)?\s+|m\.?\s*v\.?\s*)?(?:registration|reg)(?:[\s.:\-–]*?(?:no\.?|number|num|mark|#))?(?![A-Za-z])/gi
 
 /** Use the value of REGISTRATION / REGISTRATION No on a logbook or insurance certificate. */
 export function plateFromCertificateText(text: string) {
@@ -231,27 +231,35 @@ export function plateFromCertificateText(text: string) {
       let score = weight
       if (compactPlate(raw) === plate) score += 50
       if (plate.length === 8) score += 8
+      if (plate.startsWith('KM')) score += 6
       scored.push({ plate, weight: score })
     }
   }
   for (let i = 0; i < lines.length; i++) {
     if (!REG_LABEL.test(lines[i])) continue
     const afterLabel = lines[i]
-      .replace(/^.*?(?:registration(?:\s*(?:no\.?|number|num|mark|#))?|reg\.?\s*(?:no\.?|number|num|mark|#))\.?\s*[:\-–.]*/i, '')
+      .replace(/^.*?\b(?:registration|reg)(?:[\s.:\-–]*?(?:no\.?|number|num|mark|#))?\.?\s*[:\-–.]*/i, '')
       .trim()
     add(afterLabel, 90)
     if (i > 0 && !NEXT_FIELD.test(lines[i - 1])) add(lines[i - 1], 55)
-    if (lines[i + 1] && !NEXT_FIELD.test(lines[i + 1]) && !REG_LABEL.test(lines[i + 1])) add(lines[i + 1], 80)
-    if (lines[i + 2] && !NEXT_FIELD.test(lines[i + 2]) && !REG_LABEL.test(lines[i + 2])) add(lines[i + 2], 40)
-    add([afterLabel, lines[i + 1], lines[i + 2]].filter(Boolean).join(' '), 70)
+    const next1 = lines[i + 1]
+    const next2 = lines[i + 2]
+    if (next1 && !NEXT_FIELD.test(next1)) add(next1, 80)
+    if (next2 && !NEXT_FIELD.test(next2)) add(next2, 50)
+    add([afterLabel, next1, next2].filter(Boolean).join(' '), 70)
   }
   const flat = text.replace(/\s+/g, ' ')
   for (const match of flat.matchAll(REG_LABEL_GLOBAL)) {
     const start = (match.index || 0) + match[0].length
-    add(flat.slice(start, start + 180), 85)
+    add(flat.slice(start, start + 220), 85)
   }
   scored.sort((a, b) => b.weight - a.weight || b.plate.length - a.plate.length)
-  return scored[0]?.plate || null
+  if (scored[0]?.plate) return scored[0].plate
+  const plates = platesFromText(text)
+  const bikes = plates.filter((plate) => plate.startsWith('KM') && plate.length === 8)
+  if (bikes.length === 1) return bikes[0]
+  if (plates.length === 1) return plates[0]
+  return null
 }
 
 export function plateConfidence(filename: string, subject = '', body = '') {

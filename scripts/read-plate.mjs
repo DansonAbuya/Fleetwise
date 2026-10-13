@@ -251,7 +251,7 @@ function fixPlate(raw, prefixLetters) {
 
 function registrationPlate(raw) {
   const text = String(raw || '')
-  const label = /\b(?:vehicle\s+|motor(?:\s+vehicle)?\s+|m\.?\s*v\.?\s+)?(?:registration(?:\s*(?:no\.?|number|num|mark|#))?|reg(?:istration)?\.?\s*(?:no\.?|number|num|mark|#)?)\.?/gi
+  const label = /\b(?:vehicle\s+|motor(?:\s+vehicle)?\s+|m\.?\s*v\.?\s*)?(?:registration|reg)(?:[\s.:\-–]*?(?:no\.?|number|num|mark|#))?(?![A-Za-z])/gi
   let match
   while ((match = label.exec(text))) {
     const window = text.slice(match.index, match.index + 280)
