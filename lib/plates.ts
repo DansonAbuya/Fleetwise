@@ -1,14 +1,25 @@
+import { z } from 'zod'
+
 const PLATE_RE = /K[A-Z]{2,3}[\s\-._]*\d{3}[\s\-._]*[A-Z]/gi
 const COMPACT_PLATE_RE = /K[A-Z]{3}\d{3}[A-Z]|K[A-Z]{2}\d{3}[A-Z]/gi
-const COMPACT_PLATE_ID = /^K[A-Z]{2,3}\d{3}[A-Z]$/
-
-export function isKenyanPlate(plate: string) {
-  return COMPACT_PLATE_ID.test(compactPlate(plate))
-}
 
 /** Always one token, e.g. KMHE520A or KDA482M — never split across lines or spaces. */
 export function compactPlate(raw: string) {
   return raw.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/[^A-Za-z0-9]/g, '').toUpperCase()
+}
+
+export const kenyanPlateSchema = z
+  .string()
+  .transform((value) => compactPlate(value))
+  .pipe(z.string().regex(/^K[A-Z]{2}\d{3}[A-Z]$|^K[A-Z]{3}\d{3}[A-Z]$/, 'Not a Kenyan registration number'))
+
+export function parseKenyanPlate(raw: string | null | undefined) {
+  const result = kenyanPlateSchema.safeParse(raw || '')
+  return result.success ? result.data : null
+}
+
+export function isKenyanPlate(plate: string) {
+  return Boolean(parseKenyanPlate(plate))
 }
 
 export function extractKenyanPlate(raw: string) {
@@ -26,17 +37,15 @@ export function kenyanPlatesIn(raw: string) {
 }
 
 export function normalizePlate(raw: string) {
-  const compact = compactPlate(raw)
-  if (/^(K[A-Z]{3}\d{3}[A-Z]|K[A-Z]{2}\d{3}[A-Z])$/.test(compact)) return compact
-  return compact
+  return parseKenyanPlate(raw) || compactPlate(raw)
 }
 
 export function platesFromText(text: string) {
   const found: string[] = []
   const add = (raw: string) => {
-    const plate = normalizePlate(raw)
-    if (!isKenyanPlate(plate)) return
-    if (!found.includes(plate)) found.push(plate)
+    const plate = parseKenyanPlate(raw)
+    if (!plate || found.includes(plate)) return
+    found.push(plate)
   }
   for (const match of text.matchAll(PLATE_RE)) add(match[0])
   const compactAll = compactPlate(text)
@@ -156,8 +165,9 @@ export function pickOcrPlate(text: string, kind: 'certificate' | 'photo' = 'phot
   }
   const counts = new Map<string, number>()
   const bump = (plate: string, weight = 1) => {
-    if (!isKenyanPlate(plate)) return
-    counts.set(plate, (counts.get(plate) || 0) + weight)
+    const valid = parseKenyanPlate(plate)
+    if (!valid) return
+    counts.set(valid, (counts.get(valid) || 0) + weight)
   }
   for (const line of String(text || '').split(/\r?\n/)) {
     const compact = compactPlate(line)
@@ -254,8 +264,9 @@ export function plateFromCertificateText(text: string) {
     add(flat.slice(start, start + 220), 85)
   }
   scored.sort((a, b) => b.weight - a.weight || b.plate.length - a.plate.length)
-  if (scored[0]?.plate) return scored[0].plate
-  const plates = platesFromText(text)
+  const labeled = parseKenyanPlate(scored[0]?.plate)
+  if (labeled) return labeled
+  const plates = platesFromText(text).map((plate) => parseKenyanPlate(plate)).filter((plate): plate is string => Boolean(plate))
   const bikes = plates.filter((plate) => plate.startsWith('KM') && plate.length === 8)
   if (bikes.length === 1) return bikes[0]
   if (plates.length === 1) return plates[0]

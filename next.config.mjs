@@ -1,5 +1,6 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  serverExternalPackages: ['sharp', 'zod', 'tesseract.js', 'pdfjs-dist', '@napi-rs/canvas'],
   typescript: {
     ignoreBuildErrors: true,
   },

@@ -3,7 +3,7 @@ import { unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
-import { plateFromCertificateText } from '@/lib/plates'
+import { parseKenyanPlate, plateFromCertificateText } from '@/lib/plates'
 
 const execFileAsync = promisify(execFile)
 
@@ -28,10 +28,10 @@ export async function registrationFromPdfjs(bytes: Buffer) {
       cwd: process.cwd(),
     })
     const text = stdout || ''
-    return { text, plate: plateFromCertificateText(text) }
+    return { text, plate: parseKenyanPlate(plateFromCertificateText(text)) }
   } catch (err) {
     const stdout = err && typeof err === 'object' && 'stdout' in err ? String((err as { stdout?: unknown }).stdout || '') : ''
-    if (stdout.trim()) return { text: stdout, plate: plateFromCertificateText(stdout) }
+    if (stdout.trim()) return { text: stdout, plate: parseKenyanPlate(plateFromCertificateText(stdout)) }
     return { text: '', plate: null }
   } finally {
     await unlink(pdfPath).catch(() => {})

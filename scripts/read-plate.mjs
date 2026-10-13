@@ -3,7 +3,9 @@ import { mkdir, readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createCanvas, loadImage } from '@napi-rs/canvas'
+import sharp from 'sharp'
 import { createWorker } from 'tesseract.js'
+import { z } from 'zod'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const require = createRequire(import.meta.url)
@@ -70,7 +72,7 @@ export async function extractPlateText(bytes, kind = 'photo') {
 }
 
 function withFoundPlate(text) {
-  const plate = registrationPlate(text) || kenyanPlatesIn(text)[0]
+  const plate = parseKenyanPlate(registrationPlate(text) || kenyanPlatesIn(text)[0])
   if (!plate) return text
   if (new RegExp(`REGISTRATION No:\\s*${plate}`, 'i').test(text)) return text
   return `REGISTRATION No: ${plate}\n${text}`
@@ -439,10 +441,35 @@ function releaseWorker(worker) {
   if (slot) slot.busy = false
 }
 
+const kenyanPlateSchema = z.string().regex(/^K[A-Z]{2}\d{3}[A-Z]$|^K[A-Z]{3}\d{3}[A-Z]$/)
+
+function parseKenyanPlate(raw) {
+  const compact = String(raw || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase()
+  const result = kenyanPlateSchema.safeParse(compact)
+  return result.success ? result.data : ''
+}
+
+async function prepareImageForOcr(bytes, kind = 'photo') {
+  try {
+    const longest = kind === 'photo' ? 2200 : 2000
+    return await sharp(bytes, { failOn: 'none' })
+      .rotate()
+      .resize({ width: longest, height: longest, fit: 'inside', withoutEnlargement: false })
+      .normalize()
+      .sharpen({ sigma: 1.4 })
+      .gamma(1.12)
+      .png()
+      .toBuffer()
+  } catch {
+    return bytes
+  }
+}
+
 async function ocrPrepared(images, kind) {
   const variants = []
   for (const image of images) {
-    variants.push(...(await imageVariants(image, kind)))
+    const prepared = await prepareImageForOcr(image, kind)
+    variants.push(...(await imageVariants(prepared, kind)))
   }
   const worker = await acquireWorker()
   const chunks = []
@@ -465,13 +492,14 @@ async function ocrPrepared(images, kind) {
           const text = data.text?.trim()
           if (!text) continue
           chunks.push(text)
-          const labeled = registrationPlate(text)
+          const labeled = parseKenyanPlate(registrationPlate(text))
           if (labeled) {
             seen.set(labeled, (seen.get(labeled) || 0) + 4)
             if (kind !== 'photo') return chunks.join('\n')
           }
           for (const plate of kenyanPlatesIn(text)) {
-            seen.set(plate, (seen.get(plate) || 0) + 1)
+            const valid = parseKenyanPlate(plate)
+            if (valid) seen.set(valid, (seen.get(valid) || 0) + 1)
           }
           const top = [...seen.entries()].sort((a, b) => {
             if (b[1] !== a[1]) return b[1] - a[1]

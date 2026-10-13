@@ -3,7 +3,7 @@ import { unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
-import { compactPlate, pickOcrPlate, plateConfidence, plateFromCertificateText } from '@/lib/plates'
+import { compactPlate, parseKenyanPlate, pickOcrPlate, plateConfidence, plateFromCertificateText } from '@/lib/plates'
 import { isInsurancePdf, isPdfBytes, registrationFromPdfjs } from '@/lib/pdf-registration'
 
 const execFileAsync = promisify(execFile)
@@ -33,7 +33,7 @@ export async function resolvePlateFromFile(input: {
   const named = plateConfidence(input.filename, input.subject, input.body)
   if (!input.bytes || (!isOcrImage(input.mimeType, input.filename) && !isPdfBytes(input.bytes))) return named
   const ocr = await plateFromImage(input.bytes, input.mimeType, input.filename)
-  const documentPlate = plateFromCertificateText(ocr.text) || ocr.plate
+  const documentPlate = parseKenyanPlate(plateFromCertificateText(ocr.text) || ocr.plate)
   if (documentPlate) {
     if (named.plate && compactPlate(named.plate) !== compactPlate(documentPlate)) {
       return { plate: documentPlate, confidence: 92 }
@@ -52,7 +52,8 @@ export async function plateFromImage(bytes: Buffer, mimeType?: string, filename?
   }
   if (isInsurancePdf(bytes, mimeType, filename)) {
     const pdfjs = await registrationFromPdfjs(bytes)
-    if (pdfjs.plate) return { plate: pdfjs.plate, confidence: 96, text: pdfjs.text }
+    const pdfPlate = parseKenyanPlate(pdfjs.plate)
+    if (pdfPlate) return { plate: pdfPlate, confidence: 96, text: pdfjs.text }
   }
   let text = ''
   try {
@@ -60,9 +61,9 @@ export async function plateFromImage(bytes: Buffer, mimeType?: string, filename?
   } catch {
     return { plate: null, confidence: 0, text: '' }
   }
-  const labeled = plateFromCertificateText(text)
+  const labeled = parseKenyanPlate(plateFromCertificateText(text))
   if (labeled) return { plate: labeled, confidence: 94, text }
-  const plate = pickOcrPlate(text, 'certificate')
+  const plate = parseKenyanPlate(pickOcrPlate(text, 'certificate'))
   if (!plate) return { plate: null, confidence: 0, text }
   return { plate, confidence: labeled === plate ? 94 : 86, text }
 }
@@ -83,7 +84,7 @@ async function readBikePhotoWithTesseract(bytes: Buffer, mimeType?: string, file
   } catch {
     return { plate: null as string | null, confidence: 0, text: '' }
   }
-  const plate = pickOcrPlate(text, 'photo')
+  const plate = parseKenyanPlate(pickOcrPlate(text, 'photo'))
   if (!plate) return { plate: null, confidence: 0, text }
   return { plate, confidence: 86, text }
 }

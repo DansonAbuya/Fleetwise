@@ -7,7 +7,7 @@ import { isOcrImage, ocrConfigured, plateFromImage, resolvePlateFromFile } from 
 import { SHEET_MODULES, stockDocumentsModule, syncSheetModules } from '@/lib/modules'
 import { readStockRegisterSnapshot } from '@/lib/modules/stock-documents'
 import type { SheetCells, SheetSyncMode } from '@/lib/modules/types'
-import { compactPlate, listRegistrationNumbers, pickOcrPlate, plateFromCertificateText, plateFromText } from '@/lib/plates'
+import { compactPlate, listRegistrationNumbers, parseKenyanPlate, pickOcrPlate, plateFromCertificateText, plateFromText } from '@/lib/plates'
 import { attachLastAction, beginProcessJob, endProcessJob, fileMatchesFocus, getProcessJob, isProcessCancelled, isProcessRunning, isStaleProcess, markProcessMatches, processFocusLabel, processGeneration, requestProcessStop, touchProcessItem, type ProcessFocus } from '@/lib/processing'
 import { confirmedPlate, forgetFile, hydrateProcessCursor, lastAction, markConfirmed, markTried, persistProcessCursor, recordLastAction, wasTriedRecently } from '@/lib/process-cursor'
 import { requireSession } from '@/lib/session'
@@ -289,8 +289,8 @@ export async function uploadDocument(formData: FormData) {
 export async function assignUnmatched(input: { fileId: string; plate: string; type: DocType; currentType: DocType; name: string }) {
   const session = await requireSession()
   const config = await requireConfig()
-  const plate = compactPlate(plateFromText(input.plate) || input.plate)
-  if (!plate) throw new Error('Enter a registration plate')
+  const plate = parseKenyanPlate(input.plate)
+  if (!plate) throw new Error('Enter a Kenyan registration number, for example KMHE520A.')
   const currentFolder = folderIdForType(config, input.currentType)
   const nextFolder = folderIdForType(config, input.type)
   const file = await moveAndRename(input.fileId, {
@@ -481,9 +481,9 @@ async function ocrAndRename(config: FleetConfig, user: string, file: TypedFile, 
   })
   const ocr = await plateFromImage(downloaded.bytes, downloaded.mime || file.mimeType, downloaded.filename || file.name, usesRegistrationField ? 'certificate' : file.type)
   const labeled = usesRegistrationField ? plateFromCertificateText(ocr.text) : null
-  const documentPlate = labeled || (usesRegistrationField ? pickOcrPlate(ocr.text, 'certificate') : ocr.plate)
+  const documentPlate = parseKenyanPlate(labeled || (usesRegistrationField ? pickOcrPlate(ocr.text, 'certificate') : ocr.plate) || '')
   if (documentPlate) markConfirmed(file.id, documentPlate)
-  let plate = usesRegistrationField ? documentPlate : (documentPlate || named)
+  let plate = usesRegistrationField ? documentPlate : (documentPlate || parseKenyanPlate(named || ''))
   if (usesRegistrationField) {
     if (documentPlate) {
       if (named && compactPlate(named) !== compactPlate(documentPlate)) {
