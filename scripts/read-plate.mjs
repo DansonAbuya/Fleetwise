@@ -84,7 +84,7 @@ class NodeCanvasFactory {
 }
 
 function pdfOffset(buffer) {
-  const start = buffer.subarray(0, Math.min(buffer.length, 2048)).toString('latin1').indexOf('%PDF-')
+  const start = buffer.subarray(0, Math.min(buffer.length, 65_536)).toString('latin1').indexOf('%PDF-')
   return start
 }
 
@@ -133,6 +133,8 @@ async function readPdfDocument(buffer) {
   const pages = []
   try {
     const pageCount = Math.min(pdf.numPages, 3)
+    const formText = await pdfFormText(pdf)
+    if (formText.trim()) texts.push(formText)
     for (let n = 1; n <= pageCount; n++) {
       const page = await pdf.getPage(n)
       try {
@@ -140,6 +142,8 @@ async function readPdfDocument(buffer) {
         texts.push(layoutText(content.items))
         const raw = content.items.map((item) => String(item.str || '')).join(' ').replace(/\s+/g, ' ').trim()
         if (raw) texts.push(raw)
+        const fields = await pageFieldText(page)
+        if (fields.trim()) texts.push(fields)
       } catch {
         // Rasterize pages that have no usable text layer.
       }
@@ -151,7 +155,11 @@ async function readPdfDocument(buffer) {
         try {
           pages.push(await rasterPage(page, canvasFactory))
         } catch {
-          // Text extraction still runs if a page cannot be rasterized.
+          try {
+            pages.push(await rasterPage(page, canvasFactory, 1.4))
+          } catch {
+            // Text and form fields still run if a page cannot be rasterized.
+          }
         }
       }
     }
@@ -165,17 +173,61 @@ async function readPdfDocument(buffer) {
   return { text: texts.join('\n'), pages: pages.filter(Boolean) }
 }
 
-async function rasterPage(page, canvasFactory) {
-  const viewport = page.getViewport({ scale: scaleFor(page) })
+async function rasterPage(page, canvasFactory, scale) {
+  const viewport = page.getViewport({ scale: scale || scaleFor(page) })
   const canvasAndContext = canvasFactory.create(Math.ceil(viewport.width), Math.ceil(viewport.height))
+  const ctx = canvasAndContext.context
+  ctx.fillStyle = '#ffffff'
+  ctx.fillRect(0, 0, canvasAndContext.canvas.width, canvasAndContext.canvas.height)
   await page.render({
-    canvasContext: canvasAndContext.context,
+    canvasContext: ctx,
     canvas: canvasAndContext.canvas,
     viewport,
+    canvasFactory,
+    background: '#FFFFFF',
+    intent: 'print',
   }).promise
   const png = canvasAndContext.canvas.toBuffer('image/png')
   canvasFactory.destroy(canvasAndContext)
   return png
+}
+
+function fieldValue(value) {
+  if (value == null) return ''
+  if (Array.isArray(value)) return value.map((item) => fieldValue(item)).filter(Boolean).join(' ')
+  if (typeof value === 'object') return String(value.str || value.name || '').trim()
+  return String(value).trim()
+}
+
+async function pdfFormText(pdf) {
+  try {
+    const objects = await pdf.getFieldObjects?.()
+    if (!objects) return ''
+    const rows = []
+    for (const [name, fields] of Object.entries(objects)) {
+      for (const field of fields || []) {
+        const value = fieldValue(field.value ?? field.fieldValue ?? field.displayValue)
+        if (value) rows.push(`${name}: ${value}`)
+      }
+    }
+    return rows.join('\n')
+  } catch {
+    return ''
+  }
+}
+
+async function pageFieldText(page) {
+  try {
+    const annotations = await page.getAnnotations({ intent: 'display' })
+    return annotations.map((annotation) => {
+      const name = String(annotation.fieldName || annotation.title || '').trim()
+      const value = fieldValue(annotation.fieldValue ?? annotation.contentsObj ?? annotation.contents)
+      if (!name && !value) return ''
+      return name ? `${name}: ${value}` : value
+    }).filter(Boolean).join('\n')
+  } catch {
+    return ''
+  }
 }
 
 function layoutText(items) {

@@ -125,7 +125,7 @@ async function writeSheetMatches(config: FleetConfig, files: TypedFile[], mode: 
     const link = driveViewLink(file)
     if (!link) return
     chipRequests.push(chipRequest(register.sheetId, row.row, column.col, link))
-    column.value = file.name || link
+    column.value = (file.name || '').replace(/\.(pdf|jpe?g|png|webp|gif|heic)$/i, '').trim() || file.name || link
     column.uri = link
     if (!seenMatched.has(row.plate)) {
       seenMatched.add(row.plate)

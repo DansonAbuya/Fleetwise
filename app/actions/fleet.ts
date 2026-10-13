@@ -2,12 +2,12 @@
 
 import { appendAudit, folderIdForType, folderNameForType, formatTime, hasCanonicalName, loadAudit, loadConfig, loadGmailState, plateFromTypedName, resolveFolderName, saveConfig, saveGmailState, scanFolders, suggestedName } from '@/lib/fleet'
 import { getAttachment, findAttachments, getMessage, listRecentMessages, messageMeta } from '@/lib/gmail'
-import { downloadBinary, findFleetAssetsWorkbook, listFolders, listSharedDrives, listSpreadsheets as listSpreadsheetFiles, moveAndRename, searchFolders, uploadBinary } from '@/lib/drive'
+import { downloadBinary, downloadNamedFile, findFleetAssetsWorkbook, listFolders, listSharedDrives, listSpreadsheets as listSpreadsheetFiles, moveAndRename, searchFolders, uploadBinary } from '@/lib/drive'
 import { isOcrImage, ocrConfigured, plateFromImage, resolvePlateFromFile } from '@/lib/ocr'
 import { SHEET_MODULES, stockDocumentsModule, syncSheetModules } from '@/lib/modules'
 import { readStockRegisterSnapshot } from '@/lib/modules/stock-documents'
 import type { SheetCells, SheetSyncMode } from '@/lib/modules/types'
-import { compactPlate, listRegistrationNumbers, plateFromCertificateText, plateFromText } from '@/lib/plates'
+import { compactPlate, listRegistrationNumbers, pickOcrPlate, plateFromCertificateText, plateFromText } from '@/lib/plates'
 import { attachLastAction, beginProcessJob, endProcessJob, fileMatchesFocus, getProcessJob, isProcessCancelled, isProcessRunning, isStaleProcess, markProcessMatches, processFocusLabel, processGeneration, requestProcessStop, touchProcessItem, type ProcessFocus } from '@/lib/processing'
 import { confirmedPlate, forgetFile, hydrateProcessCursor, lastAction, markConfirmed, markTried, persistProcessCursor, recordLastAction, wasTriedRecently } from '@/lib/process-cursor'
 import { requireSession } from '@/lib/session'
@@ -425,7 +425,7 @@ export async function ocrUnmatchedPhotos(fileId?: string) {
       try {
         const result = await ocrAndRename(config, session.name, file, { verify: true })
         renamed += result.renamed
-        markTried(file.id)
+        if (result.plate) markTried(file.id)
         recordLastAction({ focus: 'repair', status: 'running', fileId: file.id, fileName: result.file?.name || file.name, plate: result.plate || undefined })
       } catch (err) {
         const message = err instanceof Error ? err.message : 'OCR error'
@@ -454,7 +454,8 @@ async function ocrAndRename(config: FleetConfig, user: string, file: TypedFile, 
   const typedPlate = plateFromTypedName(file.name, file.type)
   const named = typedPlate || plateFromText(file.name)
   const readable = isOcrImage(file.mimeType, file.name)
-  if (typedPlate && !readable) {
+  const usesRegistrationField = file.type === 'certificate' || file.type === 'logbook'
+  if (typedPlate && !readable && !usesRegistrationField) {
     const name = suggestedName(typedPlate, file.type, file.name)
     touchProcessItem(file.id, { stage: 'renaming', detail: `Filename already has ${typedPlate}`, plate: typedPlate, name: file.name, type: file.type, mimeType: file.mimeType })
     if (name === file.name) return { renamed: 0, text: '', name, plate: typedPlate, file: { ...file, name, plate: typedPlate, type: file.type } }
@@ -463,33 +464,34 @@ async function ocrAndRename(config: FleetConfig, user: string, file: TypedFile, 
     touchProcessItem(file.id, { stage: 'renaming', detail: `Renamed to ${name}`, plate: typedPlate, name })
     return { renamed: 1, text: '', name, plate: typedPlate, file: { ...file, ...updated, name, plate: typedPlate, type: file.type } }
   }
-  const checking = Boolean(options.verify || named)
   touchProcessItem(file.id, {
-    stage: checking ? 'reading' : 'opening',
-    detail: checking ? `Checking ${named || 'the filename'} against the document` : 'Downloading from Drive',
+    stage: 'opening',
+    detail: usesRegistrationField ? `Opening the PDF to read REGISTRATION No on ${file.name}` : 'Downloading from Drive',
     plate: named,
     name: file.name,
     type: file.type,
     mimeType: file.mimeType,
   })
-  const bytes = await downloadBinary(file.id)
-  touchProcessItem(file.id, { stage: 'reading', detail: named ? `Re-reading the registration number on ${file.name}` : 'Reading the registration number' })
-  const ocr = await plateFromImage(bytes, file.mimeType, file.name, file.type)
-  const usesRegistrationField = file.type === 'certificate' || file.type === 'logbook'
+  const downloaded = (file.mimeType || '').startsWith('application/vnd.google-apps.')
+    ? await downloadNamedFile(file.id)
+    : { bytes: await downloadBinary(file.id), mime: file.mimeType, filename: file.name }
+  touchProcessItem(file.id, {
+    stage: 'reading',
+    detail: usesRegistrationField ? 'Reading REGISTRATION No inside the certificate' : named ? `Re-reading the registration number on ${file.name}` : 'Reading the registration number',
+  })
+  const ocr = await plateFromImage(downloaded.bytes, downloaded.mime || file.mimeType, downloaded.filename || file.name, usesRegistrationField ? 'certificate' : file.type)
   const labeled = usesRegistrationField ? plateFromCertificateText(ocr.text) : null
-  const documentPlate = labeled || ocr.plate || (usesRegistrationField ? plateFromText(ocr.text) : null)
+  const documentPlate = labeled || (usesRegistrationField ? pickOcrPlate(ocr.text, 'certificate') : ocr.plate)
   if (documentPlate) markConfirmed(file.id, documentPlate)
-  let plate = documentPlate || named
+  let plate = usesRegistrationField ? documentPlate : (documentPlate || named)
   if (usesRegistrationField) {
     if (documentPlate) {
       if (named && compactPlate(named) !== compactPlate(documentPlate)) {
-        await appendAudit(config, user, `${file.type === 'logbook' ? 'Logbook' : 'Certificate'} ${file.name} was named ${named} but the document REGISTRATION field reads ${documentPlate}; renaming from the document`)
+        await appendAudit(config, user, `Certificate ${file.name} was named ${named} but REGISTRATION No on the PDF reads ${documentPlate}; renaming from the document`)
       }
       plate = documentPlate
-    } else if (named) {
-      plate = named
     } else {
-      const error = `Couldn't read REGISTRATION No on ${file.name}. Open Unmatched and type the plate if you can see it, or use a clearer PDF or photo.`
+      const error = `Couldn't read REGISTRATION No inside ${file.name}. Open the PDF, or type the plate on Unmatched if you can see it.`
       touchProcessItem(file.id, { stage: 'unmatched', detail: error })
       return {
         renamed: 0,
@@ -506,24 +508,22 @@ async function ocrAndRename(config: FleetConfig, user: string, file: TypedFile, 
   }
   const name = suggestedName(plate, file.type, file.name)
   if (named && documentPlate && compactPlate(named) === compactPlate(documentPlate) && name === file.name) {
-    touchProcessItem(file.id, { stage: 'renaming', detail: `Checked ${plate} — the filename already matches the document`, plate, name: file.name })
+    touchProcessItem(file.id, { stage: 'renaming', detail: `Checked ${plate} — the filename already matches REGISTRATION No`, plate, name: file.name })
     return { renamed: 0, text: ocr.text, name, plate, file: { ...file, name, plate, type: file.type } }
   }
   touchProcessItem(file.id, {
     stage: 'renaming',
-    detail: named && compactPlate(named) !== compactPlate(plate) ? `Correcting ${named} to ${plate}` : `Plate ${plate} — renaming in its folder`,
+    detail: `REGISTRATION No ${plate} — renaming to ${name}`,
     plate,
     name: file.name,
   })
   if (name === file.name) {
-    touchProcessItem(file.id, { stage: 'matching', detail: `Named ${name} from REGISTRATION No ${plate}. Matching on STOCK DOCUMENTS`, plate, name })
+    touchProcessItem(file.id, { stage: 'matching', detail: `Named ${name} from REGISTRATION No on the PDF. Matching on STOCK DOCUMENTS`, plate, name })
     return { renamed: 0, text: ocr.text, name, plate, file: { ...file, name, plate, type: file.type } }
   }
   const updated = await moveAndRename(file.id, { name })
-  await appendAudit(config, user, named && compactPlate(named) !== compactPlate(plate)
-    ? `Corrected ${file.name} to ${name} from the document`
-    : `OCR matched ${file.name} to ${plate}`)
-  touchProcessItem(file.id, { stage: 'matching', detail: `Renamed to ${name}. Matching ${plate} on STOCK DOCUMENTS`, plate, name })
+  await appendAudit(config, user, `Opened ${file.name} and renamed to ${name} from REGISTRATION No`)
+  touchProcessItem(file.id, { stage: 'matching', detail: `Renamed to ${name} from REGISTRATION No on the PDF`, plate, name })
   return { renamed: 1, text: ocr.text, name, plate, file: { ...file, ...updated, name, plate, type: file.type } }
 }
 
@@ -540,6 +540,7 @@ function pendingForFocus(file: TypedFile, focus: ProcessFocus, sheetPlates?: Set
   if (nameMatchesDocument(file)) return false
   const named = namedPlateOf(file)
   const readable = isOcrImage(file.mimeType, file.name)
+  if (file.type === 'certificate') return readable || /\.pdf$/i.test(file.name) || (file.mimeType || '').includes('pdf')
   if (!named && !readable) return false
   const onSheet = Boolean(named && sheetPlates?.has(compactPlate(named)))
   if (onSheet) return false
@@ -597,7 +598,7 @@ async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 
       renamed += result.renamed
       if (result.file) renamedFiles.push(result.file)
       if (result.error && !error) error = result.error
-      markTried(file.id)
+      if (result.plate) markTried(file.id)
       recordLastAction({
         focus,
         status: 'running',
@@ -609,7 +610,6 @@ async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 
       })
     } catch (err) {
       error = err instanceof Error ? err.message : 'OCR error'
-      markTried(file.id)
       recordLastAction({ focus, status: 'running', fileId: file.id, fileName: file.name, detail: error })
       touchProcessItem(file.id, { stage: 'error', detail: error, name: file.name, type: file.type, mimeType: file.mimeType })
       await appendAudit(config, 'System', `OCR failed for ${file.name}: ${error}`)

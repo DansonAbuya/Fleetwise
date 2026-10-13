@@ -43,7 +43,7 @@ export async function resolvePlateFromFile(input: {
 }
 
 function isPdfBytes(bytes: Buffer) {
-  return bytes.subarray(0, Math.min(bytes.length, 2048)).toString('latin1').includes('%PDF-')
+  return bytes.subarray(0, Math.min(bytes.length, 65_536)).toString('latin1').includes('%PDF-')
 }
 
 export async function plateFromImage(bytes: Buffer, mimeType?: string, filename?: string, kind?: string) {
@@ -65,9 +65,11 @@ export async function plateFromImage(bytes: Buffer, mimeType?: string, filename?
 }
 
 function ocrKindFor(bytes: Buffer, mimeType?: string, filename?: string, kind?: string) {
-  if (isPdfFile(bytes, mimeType, filename)) return 'pdf'
+  if (isPdfFile(bytes, mimeType, filename) || kind === 'certificate' || kind === 'logbook') {
+    if (isPdfFile(bytes, mimeType, filename)) return 'pdf'
+    return 'certificate'
+  }
   if (kind === 'photo') return 'photo'
-  if (kind === 'certificate' || kind === 'logbook') return 'certificate'
   return 'photo'
 }
 
