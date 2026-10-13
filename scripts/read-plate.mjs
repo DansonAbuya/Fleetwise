@@ -277,14 +277,14 @@ async function ocrPrepared(images, kind) {
     variants.push(...(await imageVariants(image, kind)))
   }
   const worker = await acquireWorker()
-  const modes = kind === 'photo' ? ['7', '6'] : ['6', '7']
   const chunks = []
   const seen = new Map()
   try {
-    for (const variant of variants) {
+    for (let index = 0; index < variants.length; index++) {
+      const modes = kind === 'photo' ? (index === 0 ? ['6', '11', '7'] : ['7']) : ['6', '7']
       for (const mode of modes) {
         await worker.setParameters({ tessedit_pageseg_mode: mode })
-        const { data } = await worker.recognize(variant)
+        const { data } = await worker.recognize(variants[index])
         const text = data.text?.trim()
         if (!text) continue
         chunks.push(text)
@@ -297,7 +297,7 @@ async function ocrPrepared(images, kind) {
           seen.set(plate, (seen.get(plate) || 0) + 1)
         }
         const top = [...seen.entries()].sort((a, b) => b[1] - a[1])[0]
-        if (top && top[1] >= 3) return chunks.join('\n')
+        if (top && top[1] >= (kind === 'photo' ? 2 : 3)) return chunks.join('\n')
       }
     }
   } finally {
@@ -317,11 +317,15 @@ async function imageVariants(bytes, kind) {
   const rects = kind === 'photo' ? photoRects(img) : documentRects(img)
   const cropScale = kind === 'photo' ? Math.max(scale, 2) : scale
   const variants = [renderPrepared(img, { scale, invert: false })]
+  if (kind === 'photo') variants.push(renderPrepared(img, { scale, invert: true }))
   for (const rect of rects) {
     variants.push(renderPrepared(img, { scale: cropScale, invert: false, rect }))
   }
   if (kind !== 'photo') variants.push(renderPrepared(img, { scale, invert: true }))
-  if (rects[0]) variants.push(renderPrepared(img, { scale: cropScale, invert: true, rect: rects[0] }))
+  const invertCount = kind === 'photo' ? Math.min(4, rects.length) : 1
+  for (const rect of rects.slice(0, invertCount)) {
+    variants.push(renderPrepared(img, { scale: cropScale, invert: true, rect }))
+  }
   return variants
 }
 
@@ -372,11 +376,81 @@ function renderPrepared(img, { scale = 1, invert = false, rect } = {}) {
 
 function photoRects(img) {
   const { width, height } = img
-  return [
-    plateBand(img),
-    { left: 0, top: Math.floor(height * 0.35), width, height: Math.floor(height * 0.55) },
-    { left: Math.floor(width * 0.15), top: Math.floor(height * 0.55), width: Math.floor(width * 0.7), height: Math.floor(height * 0.38) },
-  ].map((rect) => clampRect(rect, width, height))
+  const rects = [plateBand(img), ...colorPlateBoxes(img)]
+  const tile = 0.5
+  const steps = [0, 0.25, 0.5]
+  for (const y of steps) {
+    for (const x of steps) {
+      rects.push({
+        left: Math.floor(width * x),
+        top: Math.floor(height * y),
+        width: Math.floor(width * tile),
+        height: Math.floor(height * tile),
+      })
+    }
+  }
+  rects.push(
+    { left: 0, top: 0, width, height: Math.floor(height * 0.42) },
+    { left: 0, top: Math.floor(height * 0.29), width, height: Math.floor(height * 0.42) },
+    { left: 0, top: Math.floor(height * 0.58), width, height: Math.floor(height * 0.42) },
+    { left: 0, top: 0, width: Math.floor(width * 0.46), height },
+    { left: Math.floor(width * 0.27), top: 0, width: Math.floor(width * 0.46), height },
+    { left: Math.floor(width * 0.54), top: 0, width: Math.floor(width * 0.46), height },
+  )
+  return uniqueRects(rects.map((rect) => clampRect(rect, width, height)))
+}
+
+function uniqueRects(rects) {
+  const seen = new Set()
+  const unique = []
+  for (const rect of rects) {
+    const key = `${Math.round(rect.left / 8)}:${Math.round(rect.top / 8)}:${Math.round(rect.width / 8)}:${Math.round(rect.height / 8)}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    unique.push(rect)
+  }
+  return unique
+}
+
+function colorPlateBoxes(img) {
+  const { width, height } = img
+  const canvas = createCanvas(width, height)
+  const ctx = canvas.getContext('2d')
+  ctx.drawImage(img, 0, 0)
+  const { data } = ctx.getImageData(0, 0, width, height)
+  const cols = 6
+  const rows = 6
+  const cellW = Math.max(8, Math.floor(width / cols))
+  const cellH = Math.max(8, Math.floor(height / rows))
+  const cells = []
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      const x0 = col * cellW
+      const y0 = row * cellH
+      let yellow = 0
+      let white = 0
+      for (let y = y0; y < Math.min(height, y0 + cellH); y += 2) {
+        for (let x = x0; x < Math.min(width, x0 + cellW); x += 2) {
+          const i = (y * width + x) * 4
+          const r = data[i]
+          const g = data[i + 1]
+          const b = data[i + 2]
+          const luma = 0.299 * r + 0.587 * g + 0.114 * b
+          if (r > 145 && g > 125 && b < 120 && r + g > b * 2.2) yellow++
+          if (luma > 185 && Math.abs(r - g) < 35 && Math.abs(g - b) < 35) white++
+        }
+      }
+      cells.push({ score: yellow * 4 + white, x0, y0 })
+    }
+  }
+  cells.sort((a, b) => b.score - a.score)
+  const floor = Math.max(6, (cells[0]?.score || 0) * 0.22)
+  return cells.filter((cell) => cell.score >= floor).slice(0, 5).map((cell) => ({
+    left: Math.max(0, cell.x0 - Math.floor(cellW * 0.4)),
+    top: Math.max(0, cell.y0 - Math.floor(cellH * 0.4)),
+    width: Math.floor(cellW * 1.8),
+    height: Math.floor(cellH * 1.8),
+  }))
 }
 
 function documentRects(img) {
