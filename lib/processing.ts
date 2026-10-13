@@ -229,7 +229,10 @@ export function markProcessMatches(matched: string[] = [], missing: string[] = [
     if (item.stage === 'error') continue
     const key = compactPlate(item.plate || '')
     if (!key) {
-      touchProcessItem(item.fileId, { stage: 'unmatched', detail: 'No plate read yet. Open Unmatched and type it if you can see it on the file.' })
+      if (item.stage === 'queued' || item.stage === 'opening' || item.stage === 'reading' || item.stage === 'renaming' || item.stage === 'matching') continue
+      if (item.stage !== 'unmatched') {
+        touchProcessItem(item.fileId, { stage: 'unmatched', detail: 'No plate read yet. Open Unmatched and type it if you can see it on the file.' })
+      }
       continue
     }
     if (onSheet(key)) {

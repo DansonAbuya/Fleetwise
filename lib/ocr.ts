@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { compactPlate, parseKenyanPlate, pickOcrPlate, plateConfidence, plateFromCertificateText } from '@/lib/plates'
-import { isInsurancePdf, isPdfBytes, registrationFromPdfjs } from '@/lib/pdf-registration'
+import { isInsurancePdf, isPdfBytes } from '@/lib/pdf-registration'
 
 const execFileAsync = promisify(execFile)
 export function ocrConfigured() {
@@ -50,14 +50,10 @@ export async function plateFromImage(bytes: Buffer, mimeType?: string, filename?
   if (ocrKind === 'photo') {
     return readBikePhotoWithTesseract(bytes, mimeType, filename)
   }
-  if (isInsurancePdf(bytes, mimeType, filename)) {
-    const pdfjs = await registrationFromPdfjs(bytes)
-    const pdfPlate = parseKenyanPlate(pdfjs.plate)
-    if (pdfPlate) return { plate: pdfPlate, confidence: 96, text: pdfjs.text }
-  }
+  const readKind = isInsurancePdf(bytes, mimeType, filename) || ocrKind === 'pdf' ? 'pdf' : 'certificate'
   let text = ''
   try {
-    text = await readTextWithTesseract(bytes, mimeType, filename, ocrKind)
+    text = await readTextWithTesseract(bytes, mimeType, filename, readKind)
   } catch {
     return { plate: null, confidence: 0, text: '' }
   }

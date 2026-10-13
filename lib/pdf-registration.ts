@@ -17,7 +17,7 @@ export function isInsurancePdf(bytes: Buffer, mimeType?: string, filename?: stri
 
 /** Open an insurance PDF with pdfjs-dist and read REGISTRATION No from text, layout, and form fields. */
 export async function registrationFromPdfjs(bytes: Buffer) {
-  if (!bytes.length || !isPdfBytes(bytes)) return { text: '', plate: null as string | null }
+  if (!bytes.length) return { text: '', plate: null as string | null }
   const pdfPath = join(tmpdir(), `fleetwise-pdfjs-${Date.now()}-${Math.random().toString(16).slice(2)}.pdf`)
   await writeFile(pdfPath, bytes)
   try {

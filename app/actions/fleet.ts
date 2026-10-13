@@ -591,14 +591,15 @@ async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 
   }
   const candidates = [...toNormalize, ...(ocrConfigured() ? ocrCandidates : [])]
   if (candidates.length && isProcessRunning()) {
-    return { watching, attempted: 0, renamed: 0, remaining: pending.length, more: pending.length > 0, renamedFiles: [] as TypedFile[], started: false, focus }
+    return { watching, attempted: 0, renamed: 0, remaining: pending.length, more: true, renamedFiles: [] as TypedFile[], started: false, focus }
   }
   if (candidates.length) beginProcessJob(watching, candidates, focus)
   let renamed = 0
   let error: string | undefined
   const renamedFiles: TypedFile[] = []
   const generation = processGeneration()
-  await mapPool(candidates, OCR_CONCURRENCY, async (file) => {
+  const concurrency = focus === 'certificates' ? 1 : OCR_CONCURRENCY
+  await mapPool(candidates, concurrency, async (file) => {
     if (isStaleProcess(generation)) return
     try {
       const result = await ocrAndRename(config, user, file, { verify: Boolean(namedPlateOf(file)) })

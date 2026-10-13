@@ -26,8 +26,7 @@ let creating = 0
 
 export async function extractPdfjsRegistration(bytes) {
   const source = unwrapPdf(bytes)
-  if (!source.pdf) return ''
-  const pdf = await readPdf(source.bytes, false)
+  const pdf = await readPdf(source.pdf ? source.bytes : bytes, false)
   return withFoundPlate(pdf.text)
 }
 
