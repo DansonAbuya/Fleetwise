@@ -90,6 +90,10 @@ export function recordLastAction(patch: Partial<ProcessLastAction>) {
   }
 }
 
+export function isCursorHydrated() {
+  return hydrated
+}
+
 export async function hydrateProcessCursor(config: FleetConfig) {
   if (hydrated) return lastAction()
   hydrated = true

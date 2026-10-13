@@ -184,11 +184,11 @@ export async function loadAudit(): Promise<AuditEvent[]> {
     })
 }
 
-async function listTypedFiles(config: FleetConfig): Promise<TypedFile[]> {
+async function listTypedFiles(config: FleetConfig, fresh = false): Promise<TypedFile[]> {
   const [logbooks, certificates, photos] = await Promise.all([
-    listFolderFiles(config.logbooksId),
-    listFolderFiles(config.certificatesId),
-    listFolderFiles(config.photosId),
+    listFolderFiles(config.logbooksId, { fresh }),
+    listFolderFiles(config.certificatesId, { fresh }),
+    listFolderFiles(config.photosId, { fresh }),
   ])
   return [
     ...logbooks.map((file) => ({ ...file, type: 'logbook' as const, plate: plateFromTypedName(file.name, 'logbook') || plateFromText(file.name) })),
@@ -197,8 +197,8 @@ async function listTypedFiles(config: FleetConfig): Promise<TypedFile[]> {
   ]
 }
 
-export async function scanFolders(config: FleetConfig, sheetPlates?: Set<string>, sheetCells?: SheetCells, listed?: TypedFile[]) {
-  const typed = listed || await listTypedFiles(config)
+export async function scanFolders(config: FleetConfig, sheetPlates?: Set<string>, sheetCells?: SheetCells, listed?: TypedFile[], options?: { fresh?: boolean }) {
+  const typed = listed || await listTypedFiles(config, options?.fresh)
   const register = stockDocumentsModule.buildRegister(typed, {
     keys: sheetPlates || new Set(),
     cells: sheetCells || new Map(),

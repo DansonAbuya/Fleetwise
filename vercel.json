@@ -1,0 +1,8 @@
+{
+  "functions": {
+    "app/**/*.{js,jsx,ts,tsx}": {
+      "maxDuration": 300,
+      "includeFiles": "scripts/**"
+    }
+  }
+}

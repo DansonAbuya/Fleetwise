@@ -45,24 +45,41 @@ export async function driveGet<T>(path: string, params: Record<string, string> =
 
 const FOLDER_MIME = 'application/vnd.google-apps.folder'
 const MAX_NESTED_FOLDERS = 80
+const FOLDER_LIST_CACHE_MS = 20_000
+const FOLDER_LIST_CONCURRENCY = 5
+const folderFilesCache = new Map<string, { at: number; files: DriveItem[] }>()
 
-export async function listFolderFiles(folderId: string): Promise<DriveItem[]> {
+export function invalidateFolderFiles() {
+  folderFilesCache.clear()
+}
+
+export async function listFolderFiles(folderId: string, options?: { fresh?: boolean }): Promise<DriveItem[]> {
+  const cached = folderFilesCache.get(folderId)
+  if (!options?.fresh && cached && Date.now() - cached.at < FOLDER_LIST_CACHE_MS) return cached.files
   const files: DriveItem[] = []
   const queue = [folderId]
   const seen = new Set<string>()
   while (queue.length && seen.size < MAX_NESTED_FOLDERS) {
-    const current = queue.shift()
-    if (!current || seen.has(current)) continue
-    seen.add(current)
-    const children = await listDirectChildren(current)
-    for (const child of children) {
-      if (child.mimeType === FOLDER_MIME) {
-        if (!seen.has(child.id) && seen.size + queue.length < MAX_NESTED_FOLDERS) queue.push(child.id)
-        continue
+    const batch: string[] = []
+    while (queue.length && batch.length < FOLDER_LIST_CONCURRENCY && seen.size + batch.length < MAX_NESTED_FOLDERS) {
+      const current = queue.shift()
+      if (!current || seen.has(current)) continue
+      seen.add(current)
+      batch.push(current)
+    }
+    if (!batch.length) break
+    const nested = await Promise.all(batch.map((id) => listDirectChildren(id)))
+    for (const children of nested) {
+      for (const child of children) {
+        if (child.mimeType === FOLDER_MIME) {
+          if (!seen.has(child.id) && seen.size + queue.length < MAX_NESTED_FOLDERS) queue.push(child.id)
+          continue
+        }
+        if (!APP_FILE_NAMES.has(child.name)) files.push(child)
       }
-      if (!APP_FILE_NAMES.has(child.name)) files.push(child)
     }
   }
+  folderFilesCache.set(folderId, { at: Date.now(), files })
   return files
 }
 
@@ -342,6 +359,7 @@ export async function uploadBinary(folderId: string, name: string, bytes: Buffer
     headers: { 'Content-Type': `multipart/related; boundary=${boundary}` },
     body,
   })
+  invalidateFolderFiles()
   return res.json() as Promise<DriveItem>
 }
 
@@ -356,6 +374,7 @@ export async function moveAndRename(fileId: string, { name, addParent, removePar
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(name ? { name } : {}),
   })
+  invalidateFolderFiles()
   return res.json() as Promise<DriveItem>
 }
 

@@ -34,6 +34,9 @@ export const viewport: Viewport = {
   themeColor: '#00246B',
 }
 
+export const runtime = 'nodejs'
+export const maxDuration = 300
+
 export default function RootLayout({
   children,
 }: Readonly<{

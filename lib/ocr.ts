@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { compactPlate, parseKenyanPlate, pickOcrPlate, plateConfidence, plateFromCertificateText } from '@/lib/plates'
 import { isInsurancePdf, isPdfBytes } from '@/lib/pdf-registration'
+import { extractPlateText, isServerlessHost, readPlateScriptPath } from '@/lib/read-plate-runner'
 
 const execFileAsync = promisify(execFile)
 export function ocrConfigured() {
@@ -51,12 +52,7 @@ export async function plateFromImage(bytes: Buffer, mimeType?: string, filename?
     return readBikePhotoWithTesseract(bytes, mimeType, filename)
   }
   const readKind = isInsurancePdf(bytes, mimeType, filename) || ocrKind === 'pdf' ? 'pdf' : 'certificate'
-  let text = ''
-  try {
-    text = await readTextWithTesseract(bytes, mimeType, filename, readKind)
-  } catch {
-    return { plate: null, confidence: 0, text: '' }
-  }
+  const text = await readTextWithTesseract(bytes, mimeType, filename, readKind)
   const labeled = parseKenyanPlate(plateFromCertificateText(text))
   if (labeled) return { plate: labeled, confidence: 94, text }
   const plate = parseKenyanPlate(pickOcrPlate(text, 'certificate'))
@@ -74,12 +70,7 @@ function ocrKindFor(bytes: Buffer, mimeType?: string, filename?: string, kind?: 
 }
 
 async function readBikePhotoWithTesseract(bytes: Buffer, mimeType?: string, filename?: string) {
-  let text = ''
-  try {
-    text = await readTextWithTesseract(bytes, mimeType, filename, 'photo')
-  } catch {
-    return { plate: null as string | null, confidence: 0, text: '' }
-  }
+  const text = await readTextWithTesseract(bytes, mimeType, filename, 'photo')
   const plate = parseKenyanPlate(pickOcrPlate(text, 'photo'))
   if (!plate) return { plate: null, confidence: 0, text }
   return { plate, confidence: 86, text }
@@ -119,11 +110,16 @@ function ocrCommandError(err: unknown, pdf: boolean) {
 }
 
 async function readTextWithTesseract(bytes: Buffer, mimeType?: string, filename?: string, kind = 'photo') {
-  const imagePath = join(tmpdir(), `fleetwise-ocr-${Date.now()}-${Math.random().toString(16).slice(2)}.bin`)
-  await writeFile(imagePath, bytes)
   const pdf = kind === 'pdf' || isPdfFile(bytes, mimeType, filename)
   try {
-    const { stdout } = await execFileAsync(process.execPath, [join(process.cwd(), 'scripts', 'read-plate.mjs'), imagePath, kind], {
+    return await extractPlateText(bytes, kind)
+  } catch (err) {
+    if (isServerlessHost()) throw new Error(ocrCommandError(err, pdf))
+  }
+  const imagePath = join(tmpdir(), `fleetwise-ocr-${Date.now()}-${Math.random().toString(16).slice(2)}.bin`)
+  await writeFile(imagePath, bytes)
+  try {
+    const { stdout } = await execFileAsync(process.execPath, [readPlateScriptPath(), imagePath, kind], {
       timeout: 240_000,
       maxBuffer: 8 * 1024 * 1024,
       windowsHide: true,

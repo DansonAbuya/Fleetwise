@@ -1,9 +1,9 @@
 'use client'
 
 import { FormEvent, ReactNode, Suspense, useEffect, useRef, useState } from 'react'
-import { useRouter, useSearchParams } from 'next/navigation'
+import { useRouter } from 'next/navigation'
 import { signOut, useSession } from '@/lib/auth-client'
-import { assignUnmatched, exportVehicleRegister, getProcessingJob, listDriveFolders, listSpreadsheets, loadFleet, loadVehiclePage, loadWorkspace, ocrUnmatchedPhotos, runProcessing, saveFolderConfig, stopProcessing, syncGmail, uploadDocument } from '@/app/actions/fleet'
+import { assignUnmatched, exportVehicleRegister, getProcessingJob, listDriveFolders, listSpreadsheets, loadFleet, loadVehiclePage, loadWorkspace, loadWorkspacePanels, ocrUnmatchedPhotos, runProcessing, saveFolderConfig, stopProcessing, syncGmail, uploadDocument } from '@/app/actions/fleet'
 import { listRegistrationNumbers } from '@/lib/plates'
 import { processFocusLabel, type ProcessFocus, type ProcessJob } from '@/lib/processing'
 import { EMPTY_STATS } from '@/lib/vehicles'
@@ -209,6 +209,11 @@ function stubFleet(user: { name: string; email: string; image?: string }, folder
   }
 }
 
+function viewFromSearch(search = typeof window === 'undefined' ? '' : window.location.search): NavKey {
+  const slug = new URLSearchParams(search).get('view') as ViewSlug
+  return SLUGS[slug] || 'Overview'
+}
+
 function greeting() {
   const hour = new Date().getHours()
   if (hour < 12) return 'Good morning'
@@ -297,10 +302,8 @@ function Drawer({ title, eyebrow, subtitle, onClose, wide, children }: { title: 
 
 function FleetApp() {
   const router = useRouter()
-  const params = useSearchParams()
   const { user, isPending } = useSession()
-  const slug = (params.get('view') as ViewSlug) || 'overview'
-  const active = SLUGS[slug] || 'Overview'
+  const [active, setActive] = useState<NavKey>('Overview')
   const [query, setQuery] = useState('')
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [brandFilter, setBrandFilter] = useState('all')
@@ -330,24 +333,36 @@ function FleetApp() {
   const [batchNotice, setBatchNotice] = useState('')
   const batchCountRef = useRef(0)
   const lastBatchKey = useRef('')
+  const unmatchedLenRef = useRef(0)
+  const panelsLoaded = useRef(false)
   useEffect(() => {
     setMounted(true)
+    setActive(viewFromSearch())
     setDateLabel(new Date().toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }).toUpperCase())
     setHello(greeting())
     const folders = readSavedFolders()
     if (folders) {
       setFleet((current) => current || stubFleet({ name: 'Fleetwise', email: '' }, folders))
     }
+    function onPop() {
+      setActive(viewFromSearch())
+    }
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
   }, [])
   useEffect(() => {
     setLastSyncLabel(fleet?.lastSync ? new Date(fleet.lastSync).toLocaleString() : 'Not synced')
   }, [fleet?.lastSync])
 
-  function go(view: NavKey) {
+  function go(view: NavKey, replace = false) {
     setMobileNav(false)
     setNotificationsOpen(false)
     setProfileMenu(null)
-    router.push(`/?view=${TO_SLUG[view]}`)
+    setActive(view)
+    const url = `/?view=${TO_SLUG[view]}`
+    if (typeof window === 'undefined') return
+    if (replace) window.history.replaceState(null, '', url)
+    else if (`${window.location.pathname}${window.location.search}` !== url) window.history.pushState(null, '', url)
   }
 
   function toggleProfileMenu(source: 'side' | 'top') {
@@ -378,31 +393,42 @@ function FleetApp() {
       }
     }
     setFleet((current) => keepVehicles(current, next))
-    setRegisterTick((tick) => tick + 1)
+    const unmatchedCount = next.unmatched?.length || 0
+    if (unmatchedCount !== unmatchedLenRef.current || next.ingest?.renamed) {
+      unmatchedLenRef.current = unmatchedCount
+      setRegisterTick((tick) => tick + 1)
+    }
     if (next.ingest?.notice) setSuccess(ok ? `${ok} ${next.ingest.notice}` : next.ingest.notice)
     else if (ok) setSuccess(ok)
   }
 
-  async function refresh(loader: Promise<FleetSnapshot> = loadFleet(), ok?: string) {
+  async function runSync(loader: Promise<FleetSnapshot>, ok?: string) {
     autoScanLock.current = true
-    setBusy(ok ? 'Working…' : 'Loading Drive…')
     setError('')
-    setSuccess('')
     try {
       let next = await loader
       while (true) {
         applySnapshot(next, ok)
         ok = undefined
         if (!next.ingest?.more) break
-        const left = next.ingest.remaining ? ` · ${next.ingest.remaining} still need a plate` : ''
-        setBusy(`Starting the next batch${left}`)
         next = await loadFleet('auto')
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to load Drive')
     } finally {
       autoScanLock.current = false
-      setBusy('')
+    }
+  }
+
+  async function refresh(loader: Promise<FleetSnapshot> = loadFleet(), ok?: string, wait = true) {
+    if (wait) {
+      setBusy(ok ? 'Working…' : 'Loading Drive…')
+      setSuccess('')
+    }
+    try {
+      await runSync(loader, ok)
+    } finally {
+      if (wait) setBusy('')
     }
   }
 
@@ -411,35 +437,22 @@ function FleetApp() {
     if (!user) return
     let cancelled = false
     async function boot() {
-      setBusy('Opening console…')
       setError('')
       try {
         const workspace = await loadWorkspace()
         if (cancelled) return
         setFleet((current) => keepVehicles(current, workspace))
-        setBusy('Loading the vehicle register…')
         autoScanLock.current = true
         try {
-          let next = await loadFleet()
-          while (true) {
-            if (!cancelled) applySnapshot(next, next.ingest?.notice)
-            else moreWorkRef.current = Boolean(next.ingest?.more)
-            if (!next.ingest?.more) break
-            if (!cancelled) {
-              const left = next.ingest.remaining ? ` · ${next.ingest.remaining} still need a plate` : ''
-              setBusy(`Starting the next batch${left}`)
-            }
-            next = await loadFleet('auto')
-          }
+          const next = await loadFleet('auto', false, 'off')
+          if (!cancelled) applySnapshot(next, next.ingest?.notice)
         } catch (err) {
           if (!cancelled) setError(err instanceof Error ? err.message : 'Unable to load Drive')
         } finally {
           autoScanLock.current = false
-          if (!cancelled) setBusy('')
         }
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : 'Unable to load Drive')
-        setBusy('')
       }
     }
     boot()
@@ -458,41 +471,23 @@ function FleetApp() {
     if (!user) return
     async function watchFolders() {
       if (document.hidden || autoScanLock.current || activeRef.current === 'Settings') return
+      if (activeRef.current !== 'Processing' && activeRef.current !== 'Overview') return
       autoScanLock.current = true
       try {
-        let next = await loadFleet('auto')
-        while (true) {
-          applySnapshot(next, next.ingest?.notice)
-          if (!next.ingest?.more) break
-          next = await loadFleet('auto')
-        }
+        const next = await loadFleet('auto', false, 'off')
+        applySnapshot(next, next.ingest?.notice)
       } catch {
         // Keep watching; the next tick retries.
       } finally {
         autoScanLock.current = false
       }
     }
-    const timer = window.setInterval(watchFolders, 45_000)
-    document.addEventListener('visibilitychange', watchFolders)
-    return () => {
-      window.clearInterval(timer)
-      document.removeEventListener('visibilitychange', watchFolders)
-    }
+    const timer = window.setInterval(watchFolders, 90_000)
+    return () => window.clearInterval(timer)
   }, [user])
   useEffect(() => {
-    if (!user || !fleet?.ingest?.more) return
-    const timer = window.setInterval(() => {
-      if (autoScanLock.current || document.hidden || activeRef.current === 'Settings') return
-      refresh(loadFleet('auto'))
-    }, 800)
-    return () => window.clearInterval(timer)
-  }, [user, fleet?.ingest?.more])
-  useEffect(() => {
-    if (params.get('view') && !SLUGS[slug]) router.replace('/?view=overview')
-  }, [params, slug, router])
-  useEffect(() => {
-    if (fleet && !fleet.config && slug !== 'settings') router.replace('/?view=settings')
-  }, [fleet, slug, router])
+    if (fleet && !fleet.config && active !== 'Settings') go('Settings', true)
+  }, [fleet, active])
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
       if (event.key === 'Escape') {
@@ -575,6 +570,8 @@ function FleetApp() {
   }, [active, query, statusFilter, brandFilter, missingKey, vehiclePage, vehiclePageSize, spreadsheetId, registerTick])
   useEffect(() => {
     if (!user) return
+    const live = Boolean(processJob?.running || processJob?.advancing || fleet?.ingest?.more)
+    if (!live && active !== 'Processing') return
     let cancelled = false
     async function tick() {
       try {
@@ -585,12 +582,28 @@ function FleetApp() {
       }
     }
     tick()
-    const timer = window.setInterval(tick, processJob?.running || fleet?.ingest?.more ? 700 : 4000)
+    const timer = window.setInterval(tick, live ? 700 : 5000)
     return () => {
       cancelled = true
       window.clearInterval(timer)
     }
-  }, [user, active, processJob?.running])
+  }, [user, active, processJob?.running, processJob?.advancing, fleet?.ingest?.more])
+  useEffect(() => {
+    if (active !== 'Insurance inbox' && active !== 'Audit log') return
+    if (panelsLoaded.current) return
+    let cancelled = false
+    loadWorkspacePanels().then((data) => {
+      if (cancelled) return
+      panelsLoaded.current = true
+      setFleet((current) => current ? {
+        ...current,
+        inbox: data.inbox.length ? data.inbox : current.inbox,
+        audit: data.audit.length ? data.audit : current.audit,
+        gmailConnected: data.gmailConnected || current.gmailConnected,
+      } : current)
+    }).catch(() => {})
+    return () => { cancelled = true }
+  }, [active])
   const notifications = [
     ...unmatched.slice(0, 8).map((file) => ({ id: file.id, title: 'Unmatched document', message: file.name, time: file.modifiedTime || '', view: 'Unmatched' as NavKey })),
     ...inbox.filter((item) => item.status === 'Needs review').map((item) => ({ id: item.id, title: 'Certificate needs review', message: `${item.vehicle} · ${item.attachment}`, time: item.received, view: 'Insurance inbox' as NavKey })),
@@ -672,10 +685,10 @@ function FleetApp() {
         </>}
         {active === 'Vehicles' && <section className="panel table-panel standalone"><div className="panel-heading"><div><h2>All vehicles</h2><p>{fleet?.config?.spreadsheetId ? `Matched to Registration Number rows on STOCK DOCUMENTS in ${fleet.config.spreadsheetName || 'Fleet Assets'}.` : 'Vehicles come from STOCK DOCUMENTS on Fleet Assets or Fleet Assets - KE once Sheets access is granted.'}</p></div><button className="button primary" onClick={() => openUpload()} disabled={!configured}><Plus size={16} /> Upload document</button></div><div className="table-toolbar"><div className="search-box"><Search size={16} /><input value={query} onChange={(e) => { setQuery(e.target.value); setVehiclePage(1) }} placeholder="Search plate or brand..." aria-label="Search plate or brand" /></div><label className="field-label">Status<select className="assign-input" value={statusFilter} onChange={(e) => { setStatusFilter(e.target.value as StatusFilter); setVehiclePage(1) }}><option value="all">All</option><option value="Complete">Complete</option><option value="Needs attention">Needs attention</option></select></label><BrandFilter value={brandFilter} brands={brands} unbrandedCount={unbrandedCount} onChange={(next) => { setBrandFilter(next); setVehiclePage(1) }} /><MissingFilters value={missingFilters} onChange={(next) => { setMissingFilters(next); setVehiclePage(1) }} /></div><VehicleTable vehicles={vehicles} total={vehicleTotal} page={vehiclePage} pageSize={vehiclePageSize} pageSizes={[25, 50, 100]} loading={tableBusy} onPageChange={setVehiclePage} onPageSizeChange={(size) => { setVehiclePageSize(size); setVehiclePage(1) }} onSelect={setSelected} /></section>}
         {active === 'Insurance inbox' && <InboxView inbox={inbox} config={fleet?.config ?? null} gmailConnected={Boolean(fleet?.gmailConnected)} ocrConfigured={Boolean(fleet?.ocrConfigured)} busy={Boolean(busy)} onSync={() => refresh(syncGmail(), 'Gmail inbox checked.')} onAssign={(input) => refresh(assignUnmatched(input), `Assigned ${input.plate}.`)} />}
-        {active === 'Processing' && <ProcessingView lastSync={fleet?.lastSync} vehicles={vehicleCount} unmatched={unmatched} busy={Boolean(busy)} configured={configured} ocrConfigured={Boolean(fleet?.ocrConfigured)} ingest={fleet?.ingest} job={processJob} photosFolder={fleet?.config?.photosName} certificatesFolder={fleet?.config?.certificatesName} onScan={() => refresh(loadFleet('full', false, 'off'), 'Folders scanned. No OCR ran — start photos, insurance, or match repair below.')} onGmail={() => refresh(syncGmail(), 'Gmail inbox checked.')} onOcr={() => refresh(ocrUnmatchedPhotos(), 'Read plates from unmatched photos and insurance files.')} onStart={async (focus) => { if ((processJob?.running || processJob?.advancing) && processJob.focus && processJob.focus !== focus) await stopProcessing(); const prior = processJob?.lastAction || fleet?.ingest?.lastAction; const resume = prior?.focus === focus && (prior.status === 'paused' || prior.status === 'running'); return refresh(runProcessing(focus), resume ? `Continuing ${processFocusLabel(focus)} from ${prior?.fileName || 'the last file'}.` : `Started ${processFocusLabel(focus)}. Stop to pause; start the same job to continue from there.`) }} onStop={async () => { const next = await stopProcessing(); setProcessJob(next); moreWorkRef.current = false; setFleet((current) => current?.ingest ? { ...current, ingest: { ...current.ingest, more: false, remaining: next.lastAction?.remaining || current.ingest.remaining, lastAction: next.lastAction } } : current); setBusy(''); setBatchNotice(''); setSuccess(next.lastAction?.fileName ? `Paused after ${next.lastAction.fileName}. Start the same job to continue.` : 'Paused. Start the same job to continue from this point.') }} />}
-        {active === 'Unmatched' && <UnmatchedView files={unmatched} busy={Boolean(busy)} ocrConfigured={Boolean(fleet?.ocrConfigured)} onAssign={(input) => refresh(assignUnmatched(input), `Assigned ${input.plate}.`)} onOcr={(fileId) => refresh(ocrUnmatchedPhotos(fileId), fileId ? 'Read plate from file.' : 'Read plates from unmatched photos and insurance files.')} />}
+        {active === 'Processing' && <ProcessingView lastSync={fleet?.lastSync} vehicles={vehicleCount} unmatched={unmatched} busy={Boolean(busy)} configured={configured} ocrConfigured={Boolean(fleet?.ocrConfigured)} ingest={fleet?.ingest} job={processJob} photosFolder={fleet?.config?.photosName} certificatesFolder={fleet?.config?.certificatesName} onScan={() => refresh(loadFleet('full', false, 'off'), 'Folders scanned. No OCR ran — start photos, insurance, or match repair below.')} onGmail={() => refresh(syncGmail(), 'Gmail inbox checked.')} onOcr={() => refresh(ocrUnmatchedPhotos(), 'Read plates from unmatched photos and insurance files.', false)} onStart={async (focus) => { if ((processJob?.running || processJob?.advancing) && processJob.focus && processJob.focus !== focus) await stopProcessing(); const prior = processJob?.lastAction || fleet?.ingest?.lastAction; const resume = prior?.focus === focus && (prior.status === 'paused' || prior.status === 'running'); setProcessJob((current) => ({ running: true, watching: current?.watching || '', attempted: current?.attempted || 0, done: current?.done || 0, matched: current?.matched || 0, failed: current?.failed || 0, batch: current?.batch || 1, remaining: current?.remaining || 0, lastRenamed: current?.lastRenamed || 0, advancing: false, focus, items: current?.items || [], lastAction: current?.lastAction || prior })); return refresh(runProcessing(focus), resume ? `Continuing ${processFocusLabel(focus)} from ${prior?.fileName || 'the last file'}.` : `Started ${processFocusLabel(focus)}. Stop to pause; start the same job to continue from there.`, false) }} onStop={async () => { const next = await stopProcessing(); setProcessJob(next); moreWorkRef.current = false; setFleet((current) => current?.ingest ? { ...current, ingest: { ...current.ingest, more: false, remaining: next.lastAction?.remaining || current.ingest.remaining, lastAction: next.lastAction } } : current); setBusy(''); setBatchNotice(''); setSuccess(next.lastAction?.fileName ? `Paused after ${next.lastAction.fileName}. Start the same job to continue.` : 'Paused. Start the same job to continue from this point.') }} />}
+        {active === 'Unmatched' && <UnmatchedView files={unmatched} busy={Boolean(busy)} ocrConfigured={Boolean(fleet?.ocrConfigured)} onAssign={(input) => refresh(assignUnmatched(input), `Assigned ${input.plate}.`)} onOcr={(fileId) => refresh(ocrUnmatchedPhotos(fileId), fileId ? 'Read plate from file.' : 'Read plates from unmatched photos and insurance files.', false)} />}
         {active === 'Audit log' && <AuditView events={fleet?.audit || []} onExport={() => exportAudit(fleet?.audit || [])} />}
-        {active === 'Settings' && <SettingsView fleet={fleet} firstRun={!configured} busy={Boolean(busy) && busy !== 'Loading Drive…' && busy !== 'Opening console…' && busy !== 'Loading the vehicle register…'} onSave={(input) => { writeSavedFolders(input); return refresh(saveFolderConfig(input), 'Folder and sheet configuration saved.') }} onBrowse={listDriveFolders} onBrowseSheets={listSpreadsheets} />}
+        {active === 'Settings' && <SettingsView fleet={fleet} firstRun={!configured} busy={Boolean(busy)} onSave={(input) => { writeSavedFolders(input); return refresh(saveFolderConfig(input), 'Folder and sheet configuration saved.') }} onBrowse={listDriveFolders} onBrowseSheets={listSpreadsheets} />}
       </div>
     </main>
     {selected && <Drawer title={selected.plate} eyebrow="VEHICLE DETAILS" subtitle={`${selected.brand ? `${selected.brand} · ` : ''}${selected.present} / ${selected.total} required documents`} onClose={() => setSelected(null)}>
@@ -761,9 +774,10 @@ function processStageLabel(stage: string, plate?: string | null) {
   return stage
 }
 
-function ProcessThumb({ item }: { item: { fileId: string; name: string; preview: boolean; type: DocType } }) {
+function ProcessThumb({ item }: { item: { fileId: string; name: string; preview: boolean; type: DocType; stage?: string } }) {
   const [broken, setBroken] = useState(false)
-  if (item.preview && !broken) {
+  const showPreview = item.preview && !broken && (item.stage === 'opening' || item.stage === 'reading' || item.stage === 'renaming' || item.stage === 'matching')
+  if (showPreview) {
     return <img className="process-thumb-img" src={`/documents/${item.fileId}?preview=1`} alt={item.name} onError={() => setBroken(true)} />
   }
   return item.type === 'photo' ? <ImageIcon size={22} /> : <FileText size={22} />
@@ -797,7 +811,7 @@ function ProcessingView({ lastSync, vehicles, unmatched, busy, configured, ocrCo
       <div className="process-tasks" role="group" aria-label="Processing jobs">
         {PROCESS_TASKS.map((task) => {
           const current = (job?.focus || ingest?.focus) === task.id && live
-          return <button key={task.id} type="button" className={`process-task ${current ? 'active' : ''}`} disabled={!configured || !ocrConfigured || (busy && !live)} onClick={() => onStart(task.id)}>
+          return <button key={task.id} type="button" className={`process-task ${current ? 'active' : ''}`} disabled={!configured || !ocrConfigured || (busy && !live) || current} onClick={() => onStart(task.id)}>
             <strong>{task.label}</strong>
             <span>{task.detail}</span>
             {current ? <em>Running</em> : last?.focus === task.id && last.status === 'paused' ? <em><Play size={12} /> Continue</em> : <em><Play size={12} /> Start</em>}
@@ -840,7 +854,7 @@ function ProcessingView({ lastSync, vehicles, unmatched, busy, configured, ocrCo
           </article>
         })}
         {waiting.map((file) => <article className="process-card stage-unmatched" key={file.id}>
-          <div className="process-thumb"><ProcessThumb item={{ fileId: file.id, name: file.name, preview: /\.(jpe?g|png|gif|webp)$/i.test(file.name), type: file.type }} /></div>
+          <div className="process-thumb"><ProcessThumb item={{ fileId: file.id, name: file.name, preview: false, type: file.type }} /></div>
           <div className="process-card-copy"><strong>{file.name}</strong><span>{labelFor(file.type)}{file.plate ? ` · ${file.plate}` : ''}</span><p>Waiting to match a Registration Number. Use Read plates, or assign the plate under Unmatched.</p></div>
           <span className="process-flag stage-unmatched">Waiting</span>
         </article>)}

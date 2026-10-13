@@ -9,15 +9,16 @@ import { readStockRegisterSnapshot } from '@/lib/modules/stock-documents'
 import type { SheetCells, SheetSyncMode } from '@/lib/modules/types'
 import { compactPlate, listRegistrationNumbers, parseKenyanPlate, pickOcrPlate, plateFromCertificateText, plateFromText } from '@/lib/plates'
 import { attachLastAction, beginProcessJob, endProcessJob, fileMatchesFocus, getProcessJob, isProcessCancelled, isProcessRunning, isStaleProcess, markProcessMatches, processFocusLabel, processGeneration, requestProcessStop, touchProcessItem, type ProcessFocus } from '@/lib/processing'
-import { confirmedPlate, forgetFile, hydrateProcessCursor, lastAction, markConfirmed, markTried, persistProcessCursor, recordLastAction, wasTriedRecently } from '@/lib/process-cursor'
+import { confirmedPlate, forgetFile, hydrateProcessCursor, isCursorHydrated, lastAction, markConfirmed, markTried, persistProcessCursor, recordLastAction, wasTriedRecently } from '@/lib/process-cursor'
 import { requireSession } from '@/lib/session'
 import { EMPTY_STATS, filterVehicles, fleetStats, slimVehicle, type VehicleQuery } from '@/lib/vehicles'
 import type { DocType, FleetConfig, FleetSnapshot, InboxItem, TypedFile, VehicleRecord } from '@/lib/types'
 
 let rememberedPlates: string[] = []
 
-const OCR_BATCH = 12
-const OCR_CONCURRENCY = 2
+const ON_VERCEL = Boolean(process.env.VERCEL)
+const OCR_BATCH = ON_VERCEL ? 2 : 12
+const OCR_CONCURRENCY = ON_VERCEL ? 1 : 2
 
 async function mapPool<T>(items: T[], limit: number, fn: (item: T) => Promise<void>) {
   const generation = processGeneration()
@@ -130,11 +131,14 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
   const requested = focus && focus !== 'off' ? focus : undefined
   const jobFocus: ProcessFocus | undefined = requested || (!live.cancelled && (live.running || live.advancing) ? live.focus : undefined)
   const skipOcr = focus === 'off' || (!requested && (isProcessCancelled() || live.cancelled || !jobFocus))
+  const watchPass = focus === 'off'
+  const skipSheetWrite = watchPass && mode === 'auto'
+  const skipExtras = watchPass && mode === 'auto'
   const preview = config.spreadsheetId ? await readStockRegisterSnapshot(config) : { vehicles: [], unmatched: [], plates: new Set<string>(), cells: new Map() as SheetCells, error: undefined as string | undefined }
   let ingest = { watching: '', attempted: 0, renamed: 0, remaining: 0, more: false, error: undefined as string | undefined, renamedFiles: [] as TypedFile[], started: false, focus: jobFocus }
   let files: TypedFile[] = []
   try {
-    const listed = await scanFolders(config, preview.plates, preview.cells)
+    const listed = await scanFolders(config, preview.plates, preview.cells, undefined, { fresh: !skipOcr || mode === 'full' })
     ingest = skipOcr
       ? { watching: '', attempted: 0, renamed: 0, remaining: 0, more: false, error: undefined, renamedFiles: [] as TypedFile[], started: false, focus: undefined }
       : await ingestIncoming(config, session.name, mode, listed.files, preview.plates, jobFocus || 'all')
@@ -146,16 +150,20 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
   }
   const ingestGen = processGeneration()
   const continuing = Boolean(ingest.more)
-  const sheet = await syncSheetIndex(config, continuing ? 'match' : mode, files)
+  const sheet = skipSheetWrite && !ingest.renamed
+    ? { plates: preview.plates, error: preview.error, missing: [] as string[], matched: [] as string[], hint: '', cells: preview.cells, more: false }
+    : await syncSheetIndex(config, continuing ? 'match' : mode, files)
   if ((ingest.started || closeLive) && isProcessRunning() && !isStaleProcess(ingestGen)) {
     markProcessMatches(sheet.matched, sheet.missing, sheet.plates)
     endProcessJob(ingest.error || sheet.error, { remaining: ingest.remaining || 0, renamed: ingest.renamed })
   }
   const emptyGmail = { state: { processedIds: [] as string[], items: [] as InboxItem[] } }
+  const plates = sheet.plates?.size ? sheet.plates : preview.plates
+  const cells = sheet.cells?.size ? sheet.cells : preview.cells
   const [{ vehicles, unmatched }, audit, gmail] = await Promise.all([
-    scanFolders(config, sheet.plates?.size ? sheet.plates : preview.plates, sheet.cells?.size ? sheet.cells : preview.cells, files),
-    continuing ? Promise.resolve([] as FleetSnapshot['audit']) : loadAudit().catch(() => [] as FleetSnapshot['audit']),
-    continuing ? Promise.resolve(emptyGmail) : loadGmailState().catch(() => emptyGmail),
+    scanFolders(config, plates, cells, files),
+    skipExtras || continuing ? Promise.resolve([] as FleetSnapshot['audit']) : loadAudit().catch(() => [] as FleetSnapshot['audit']),
+    skipExtras || continuing ? Promise.resolve(emptyGmail) : loadGmailState().catch(() => emptyGmail),
   ])
   const registerVehicles = vehicles.length ? vehicles : preview.vehicles
   return {
@@ -363,10 +371,26 @@ export async function syncGmail() {
 
 export async function getProcessingJob() {
   await requireSession()
-  const config = await loadConfig()
-  if (config) await hydrateProcessCursor(config).catch(() => lastAction())
+  if (!isCursorHydrated()) {
+    const config = await loadConfig()
+    if (config) await hydrateProcessCursor(config).catch(() => lastAction())
+  }
   attachLastAction(lastAction())
   return getProcessJob()
+}
+
+export async function loadWorkspacePanels() {
+  await requireSession()
+  const emptyGmail = { state: { processedIds: [] as string[], items: [] as InboxItem[] } }
+  const [audit, gmail] = await Promise.all([
+    loadAudit().catch(() => [] as FleetSnapshot['audit']),
+    loadGmailState().catch(() => emptyGmail),
+  ])
+  return {
+    inbox: gmail.state.items,
+    audit,
+    gmailConnected: Boolean(gmail.state.lastSync),
+  }
 }
 
 export async function runProcessing(focus: ProcessFocus = 'all') {
@@ -405,7 +429,7 @@ export async function ocrUnmatchedPhotos(fileId?: string) {
   if (!ocrConfigured()) {
     throw new Error('Photo OCR is not available. Restart the app after installing tesseract.js.')
   }
-  const { unmatched, files } = await scanFolders(config)
+  const { unmatched, files } = await scanFolders(config, undefined, undefined, undefined, { fresh: true })
   const target = fileId ? files.find((file) => file.id === fileId) || unmatched.find((file) => file.id === fileId) : undefined
   if (fileId) forgetFile(fileId)
   const readable = unmatched.filter((file) => isOcrImage(file.mimeType, file.name) || plateFromText(file.name))
@@ -592,7 +616,7 @@ async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 
   }
   const candidates = [...toNormalize, ...(ocrConfigured() ? ocrCandidates : [])]
   if (candidates.length && isProcessRunning()) {
-    return { watching, attempted: 0, renamed: 0, remaining: pending.length, more: true, renamedFiles: [] as TypedFile[], started: false, focus }
+    return { watching, attempted: 0, renamed: 0, remaining: pending.length, more: false, renamedFiles: [] as TypedFile[], started: false, focus }
   }
   if (candidates.length) beginProcessJob(watching, candidates, focus)
   let renamed = 0

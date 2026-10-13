@@ -577,7 +577,9 @@ async function sync(config: FleetConfig, files: TypedFile[], mode: SheetSyncMode
     return { moduleId: 'stock-documents', keys: new Set(), written: 0, missing: [], matched: [], hint: '', cells: new Map() }
   }
   const matches = await writeSheetMatches(config, files, mode)
-  const collateral = await ensureCollateralFolders(config, mode)
+  const collateral = mode === 'full'
+    ? await ensureCollateralFolders(config, mode)
+    : { written: 0, cells: matches.cells, more: false }
   return {
     moduleId: 'stock-documents',
     keys: matches.plates,

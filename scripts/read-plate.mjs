@@ -1,5 +1,7 @@
+import { existsSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { mkdir, readFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createCanvas, loadImage } from '@napi-rs/canvas'
@@ -9,8 +11,13 @@ import { z } from 'zod'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const require = createRequire(import.meta.url)
-const langPath = join(root, 'scripts', 'tessdata')
-const cachePath = join(root, '.tesseract-cache')
+const langPath = [
+  join(root, 'scripts', 'tessdata'),
+  join(process.cwd(), 'scripts', 'tessdata'),
+  join('/var/task', 'scripts', 'tessdata'),
+].find((dir) => existsSync(join(dir, 'eng.traineddata.gz')) || existsSync(join(dir, 'eng.traineddata')))
+  || join(root, 'scripts', 'tessdata')
+const cachePath = join(tmpdir(), 'fleetwise-tesseract-cache')
 const workerPath = require.resolve('tesseract.js/src/worker-script/node/index.js')
 let corePath = ''
 try {
@@ -115,8 +122,16 @@ function isPdf(buffer) {
   return pdfOffset(buffer) >= 0
 }
 
+function pdfjsRoot() {
+  try {
+    return dirname(require.resolve('pdfjs-dist/package.json'))
+  } catch {
+    return join(root, 'node_modules', 'pdfjs-dist')
+  }
+}
+
 function pdfAssetUrl(folder) {
-  return pathToFileURL(join(root, 'node_modules', 'pdfjs-dist', folder) + '/').href
+  return pathToFileURL(join(pdfjsRoot(), folder) + '/').href
 }
 
 async function readPdf(buffer, raster = true) {
