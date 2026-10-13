@@ -1,38 +1,64 @@
+import { createRequire } from 'node:module'
 import { mkdir, readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createCanvas, loadImage } from '@napi-rs/canvas'
-import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs'
 import { createWorker } from 'tesseract.js'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
+const require = createRequire(import.meta.url)
 const langPath = join(root, 'scripts', 'tessdata')
 const cachePath = join(root, '.tesseract-cache')
+const workerPath = require.resolve('tesseract.js/src/worker-script/node/index.js')
+let corePath = ''
+try {
+  corePath = dirname(require.resolve('tesseract.js-core/package.json'))
+} catch {
+  corePath = ''
+}
 
-const MAX_WORKERS = 2
+const MAX_WORKERS = 1
 const pool = []
 const waiters = []
 let creating = 0
 
 export async function extractPlateText(bytes, kind = 'photo') {
   const chunks = []
-  if (isPdf(bytes) || kind === 'pdf' || kind === 'certificate') {
-    if (isPdf(bytes)) {
-      const pdf = await readPdf(bytes)
-      if (pdf.text.trim()) chunks.push(pdf.text.trim())
-      if (!registrationPlate(pdf.text) && pdf.pages.length) {
-        const ocrText = await ocrPrepared(pdf.pages, 'certificate')
+  if (isPdf(bytes)) {
+    const pdf = await readPdf(bytes)
+    if (pdf.text.trim()) chunks.push(pdf.text.trim())
+    if (!registrationPlate(pdf.text) && !kenyanPlatesIn(pdf.text)[0]) {
+      const pages = pdf.pages.length ? pdf.pages : []
+      if (pages.length) {
+        const ocrText = await ocrPrepared(pages, 'certificate')
         if (ocrText.trim()) chunks.push(ocrText.trim())
       }
-      return chunks.join('\n')
+      if (!registrationPlate(chunks.join('\n')) && !kenyanPlatesIn(chunks.join('\n'))[0] && pages.length) {
+        const photoText = await ocrPrepared(pages.slice(0, 1), 'photo')
+        if (photoText.trim()) chunks.push(photoText.trim())
+      }
     }
-    const ocrText = await ocrPrepared([bytes], 'certificate')
-    if (ocrText.trim()) chunks.push(ocrText.trim())
-    return chunks.join('\n')
+    return withFoundPlate(chunks.join('\n'))
+  }
+  if (kind === 'pdf' || kind === 'certificate' || kind === 'logbook') {
+    const documentText = await ocrPrepared([bytes], 'certificate')
+    if (documentText.trim()) chunks.push(documentText.trim())
+    if (!registrationPlate(documentText) && !kenyanPlatesIn(documentText)[0]) {
+      const photoText = await ocrPrepared([bytes], 'photo')
+      if (photoText.trim()) chunks.push(photoText.trim())
+    }
+    return withFoundPlate(chunks.join('\n'))
   }
   const ocrText = await ocrPrepared([bytes], 'photo')
   if (ocrText.trim()) chunks.push(ocrText.trim())
-  return chunks.join('\n')
+  return withFoundPlate(chunks.join('\n'))
+}
+
+function withFoundPlate(text) {
+  const plate = registrationPlate(text) || kenyanPlatesIn(text)[0]
+  if (!plate) return text
+  if (new RegExp(`REGISTRATION No:\\s*${plate}`, 'i').test(text)) return text
+  return `REGISTRATION No: ${plate}\n${text}`
 }
 
 export async function shutdownOcrWorkers() {
@@ -64,33 +90,76 @@ if (isCli) {
   }
 }
 
+class NodeCanvasFactory {
+  create(width, height) {
+    const canvas = createCanvas(Math.max(1, width), Math.max(1, height))
+    return { canvas, context: canvas.getContext('2d') }
+  }
+  reset(canvasAndContext, width, height) {
+    canvasAndContext.canvas.width = Math.max(1, width)
+    canvasAndContext.canvas.height = Math.max(1, height)
+  }
+  destroy(canvasAndContext) {
+    canvasAndContext.canvas.width = 0
+    canvasAndContext.canvas.height = 0
+    canvasAndContext.canvas = null
+    canvasAndContext.context = null
+  }
+}
+
 function isPdf(buffer) {
   return buffer.length >= 5 && buffer.subarray(0, 5).toString('utf8') === '%PDF-'
 }
 
 async function readPdf(buffer) {
+  try {
+    return await readPdfDocument(buffer, true)
+  } catch {
+    try {
+      return await readPdfDocument(buffer, false)
+    } catch {
+      return { text: '', pages: [] }
+    }
+  }
+}
+
+async function readPdfDocument(buffer, withFonts) {
+  const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs')
   const data = Uint8Array.from(buffer)
+  const fonts = withFonts
+    ? {
+        standardFontDataUrl: pathToFileURL(join(root, 'node_modules', 'pdfjs-dist', 'standard_fonts') + '/').href,
+        cMapUrl: pathToFileURL(join(root, 'node_modules', 'pdfjs-dist', 'cmaps') + '/').href,
+        cMapPacked: true,
+      }
+    : {}
   const loadingTask = getDocument({
     data,
     disableFontFace: true,
     isOffscreenCanvasSupported: false,
     useSystemFonts: true,
     verbosity: 0,
+    canvasFactory: new NodeCanvasFactory(),
+    ...fonts,
   })
   const pdf = await loadingTask.promise
   const texts = []
   const pages = []
   try {
-    const pageCount = Math.min(pdf.numPages, 2)
+    const pageCount = Math.min(pdf.numPages, 3)
     for (let n = 1; n <= pageCount; n++) {
       const page = await pdf.getPage(n)
-      const content = await page.getTextContent()
-      texts.push(layoutText(content.items))
-      const raw = content.items.map((item) => String(item.str || '')).join(' ').replace(/\s+/g, ' ').trim()
-      if (raw) texts.push(raw)
+      try {
+        const content = await page.getTextContent()
+        texts.push(layoutText(content.items))
+        const raw = content.items.map((item) => String(item.str || '')).join(' ').replace(/\s+/g, ' ').trim()
+        if (raw) texts.push(raw)
+      } catch {
+        // Rasterize pages that have no usable text layer.
+      }
     }
     const joined = texts.join('\n')
-    if (!registrationPlate(joined)) {
+    if (!registrationPlate(joined) && !kenyanPlatesIn(joined)[0]) {
       for (let n = 1; n <= pageCount; n++) {
         const page = await pdf.getPage(n)
         try {
@@ -141,15 +210,50 @@ function layoutText(items) {
 function kenyanPlatesIn(raw) {
   const compact = String(raw || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase()
   const found = []
-  for (const match of compact.matchAll(/K[A-Z]{3}\d{3}[A-Z]|K[A-Z]{2}\d{3}[A-Z]/g)) {
-    if (!found.includes(match[0])) found.push(match[0])
+  const add = (plate) => {
+    if (plate && !found.includes(plate)) found.push(plate)
+  }
+  for (const match of compact.matchAll(/K[A-Z]{3}\d{3}[A-Z]|K[A-Z]{2}\d{3}[A-Z]/g)) add(match[0])
+  for (let i = 0; i < compact.length - 6; i++) {
+    if (compact[i] !== 'K') continue
+    add(fixPlate(compact.slice(i, i + 8), 3))
+    add(fixPlate(compact.slice(i, i + 7), 2))
   }
   return found
 }
 
+function fixPlate(raw, prefixLetters) {
+  const length = 1 + prefixLetters + 3 + 1
+  if (!raw || raw.length !== length || raw[0] !== 'K') return ''
+  const toLetter = (ch) => (/[A-Z]/.test(ch) ? ch : ch === '0' ? 'O' : ch === '1' ? 'I' : ch === '5' ? 'S' : ch === '8' ? 'B' : ch)
+  const toDigit = (ch) => (/\d/.test(ch) ? ch : ch === 'O' || ch === 'Q' || ch === 'D' ? '0' : ch === 'I' || ch === 'L' ? '1' : ch === 'Z' ? '2' : ch === 'S' ? '5' : ch === 'G' ? '6' : ch === 'B' ? '8' : ch)
+  let cost = 0
+  const letters = []
+  for (let i = 0; i < prefixLetters; i++) {
+    const ch = raw[i + 1]
+    const next = toLetter(ch)
+    if (!/[A-Z]/.test(next)) return ''
+    if (next !== ch) cost++
+    letters.push(next)
+  }
+  const digits = []
+  for (let i = 0; i < 3; i++) {
+    const ch = raw[1 + prefixLetters + i]
+    const next = toDigit(ch)
+    if (!/\d/.test(next)) return ''
+    if (next !== ch) cost++
+    digits.push(next)
+  }
+  const last = toLetter(raw[length - 1])
+  if (!/[A-Z]/.test(last)) return ''
+  if (last !== raw[length - 1]) cost++
+  if (cost > 1) return ''
+  return `K${letters.join('')}${digits.join('')}${last}`
+}
+
 function registrationPlate(raw) {
   const text = String(raw || '')
-  const label = /\b(?:vehicle\s+|motor(?:\s+vehicle)?\s+)?(?:registration(?:\s*(?:no\.?|number|num|mark|#))?|reg\.?\s*(?:no\.?|number|num|#))\.?/gi
+  const label = /\b(?:vehicle\s+|motor(?:\s+vehicle)?\s+|m\.?\s*v\.?\s+)?(?:registration(?:\s*(?:no\.?|number|num|mark|#))?|reg(?:istration)?\.?\s*(?:no\.?|number|num|mark|#)?)\.?/gi
   let match
   while ((match = label.exec(text))) {
     const window = text.slice(match.index, match.index + 280)
@@ -233,12 +337,10 @@ async function createOcrWorker() {
     langPath,
     cachePath,
     gzip: true,
-    errorHandler: (err) => {
-      const message = err instanceof Error ? err.message : String(err)
-      throw new Error(ocrStartError(message))
-    },
+    workerPath,
+    ...(corePath ? { corePath } : {}),
+    errorHandler: () => {},
   })
-  await worker.setParameters({ tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789' })
   return worker
 }
 
@@ -281,23 +383,36 @@ async function ocrPrepared(images, kind) {
   const seen = new Map()
   try {
     for (let index = 0; index < variants.length; index++) {
-      const modes = kind === 'photo' ? (index === 0 ? ['6', '11', '7'] : ['7']) : ['6', '7']
+      const modes = kind === 'photo'
+        ? (index === 0 ? ['11', '6', '7'] : ['7'])
+        : (index === 0 ? ['4', '6', '11'] : ['6', '7'])
+      const whitelist = kind === 'photo'
+        ? 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -'
+        : 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 -./:()#'
       for (const mode of modes) {
-        await worker.setParameters({ tessedit_pageseg_mode: mode })
-        const { data } = await worker.recognize(variants[index])
-        const text = data.text?.trim()
-        if (!text) continue
-        chunks.push(text)
-        const labeled = registrationPlate(text)
-        if (labeled) {
-          seen.set(labeled, (seen.get(labeled) || 0) + 4)
-          if (kind !== 'photo') return chunks.join('\n')
+        try {
+          await worker.setParameters({
+            tessedit_pageseg_mode: mode,
+            tessedit_char_whitelist: whitelist,
+          })
+          const { data } = await worker.recognize(variants[index])
+          const text = data.text?.trim()
+          if (!text) continue
+          chunks.push(text)
+          const labeled = registrationPlate(text)
+          if (labeled) {
+            seen.set(labeled, (seen.get(labeled) || 0) + 4)
+            if (kind !== 'photo') return chunks.join('\n')
+          }
+          for (const plate of kenyanPlatesIn(text)) {
+            seen.set(plate, (seen.get(plate) || 0) + 1)
+          }
+          const top = [...seen.entries()].sort((a, b) => b[1] - a[1])[0]
+          if (kind === 'photo' && top && ((data.confidence || 0) >= 72 || top[1] >= 2)) return chunks.join('\n')
+          if (kind !== 'photo' && top && top[1] >= 2) return chunks.join('\n')
+        } catch {
+          // Try the next crop or page-seg mode.
         }
-        for (const plate of kenyanPlatesIn(text)) {
-          seen.set(plate, (seen.get(plate) || 0) + 1)
-        }
-        const top = [...seen.entries()].sort((a, b) => b[1] - a[1])[0]
-        if (top && top[1] >= (kind === 'photo' ? 2 : 3)) return chunks.join('\n')
       }
     }
   } finally {
@@ -314,19 +429,32 @@ async function imageVariants(bytes, kind) {
     return [bytes]
   }
   const scale = scaleForImage(img, kind)
-  const rects = kind === 'photo' ? photoRects(img) : documentRects(img)
-  const cropScale = kind === 'photo' ? Math.max(scale, 2) : scale
-  const variants = [renderPrepared(img, { scale, invert: false })]
+  const rects = kind === 'photo' ? photoRects(img).slice(0, 8) : documentRects(img)
+  const cropScale = kind === 'photo' ? Math.max(scale, 2) : Math.max(scale, 1.6)
+  const variants = [
+    renderPlain(img, { scale }),
+    renderPrepared(img, { scale, invert: false }),
+  ]
   if (kind === 'photo') variants.push(renderPrepared(img, { scale, invert: true }))
   for (const rect of rects) {
+    variants.push(renderPlain(img, { scale: cropScale, rect }))
     variants.push(renderPrepared(img, { scale: cropScale, invert: false, rect }))
   }
   if (kind !== 'photo') variants.push(renderPrepared(img, { scale, invert: true }))
-  const invertCount = kind === 'photo' ? Math.min(4, rects.length) : 1
-  for (const rect of rects.slice(0, invertCount)) {
-    variants.push(renderPrepared(img, { scale: cropScale, invert: true, rect }))
-  }
   return variants
+}
+
+function renderPlain(img, { scale = 1, rect } = {}) {
+  const source = rect || { left: 0, top: 0, width: img.width, height: img.height }
+  const w = Math.max(1, Math.round(source.width * scale))
+  const h = Math.max(1, Math.round(source.height * scale))
+  const canvas = createCanvas(w, h)
+  const ctx = canvas.getContext('2d')
+  ctx.imageSmoothingEnabled = true
+  ctx.fillStyle = '#ffffff'
+  ctx.fillRect(0, 0, w, h)
+  ctx.drawImage(img, source.left, source.top, source.width, source.height, 0, 0, w, h)
+  return canvas.toBuffer('image/png')
 }
 
 function scaleForImage(img, kind) {
@@ -366,7 +494,8 @@ function renderPrepared(img, { scale = 1, invert = false, rect } = {}) {
   for (let i = 0, p = 0; i < d.length; i += 4, p++) {
     let v = ((gray[p] - min) / range) * 255
     if (invert) v = 255 - v
-    v = v < 110 ? Math.max(0, v * 0.72) : Math.min(255, 210 + (v - 110) * 0.4)
+    const mid = 128
+    v = Math.max(0, Math.min(255, mid + (v - mid) * 1.35))
     d[i] = d[i + 1] = d[i + 2] = v
     d[i + 3] = 255
   }
@@ -376,27 +505,15 @@ function renderPrepared(img, { scale = 1, invert = false, rect } = {}) {
 
 function photoRects(img) {
   const { width, height } = img
-  const rects = [plateBand(img), ...colorPlateBoxes(img)]
-  const tile = 0.5
-  const steps = [0, 0.25, 0.5]
-  for (const y of steps) {
-    for (const x of steps) {
-      rects.push({
-        left: Math.floor(width * x),
-        top: Math.floor(height * y),
-        width: Math.floor(width * tile),
-        height: Math.floor(height * tile),
-      })
-    }
-  }
-  rects.push(
-    { left: 0, top: 0, width, height: Math.floor(height * 0.42) },
-    { left: 0, top: Math.floor(height * 0.29), width, height: Math.floor(height * 0.42) },
-    { left: 0, top: Math.floor(height * 0.58), width, height: Math.floor(height * 0.42) },
-    { left: 0, top: 0, width: Math.floor(width * 0.46), height },
-    { left: Math.floor(width * 0.27), top: 0, width: Math.floor(width * 0.46), height },
-    { left: Math.floor(width * 0.54), top: 0, width: Math.floor(width * 0.46), height },
-  )
+  const rects = [
+    plateBand(img),
+    ...colorPlateBoxes(img),
+    { left: 0, top: 0, width: Math.floor(width * 0.55), height: Math.floor(height * 0.55) },
+    { left: Math.floor(width * 0.45), top: 0, width: Math.floor(width * 0.55), height: Math.floor(height * 0.55) },
+    { left: 0, top: Math.floor(height * 0.45), width: Math.floor(width * 0.55), height: Math.floor(height * 0.55) },
+    { left: Math.floor(width * 0.45), top: Math.floor(height * 0.45), width: Math.floor(width * 0.55), height: Math.floor(height * 0.55) },
+    { left: 0, top: Math.floor(height * 0.28), width, height: Math.floor(height * 0.44) },
+  ]
   return uniqueRects(rects.map((rect) => clampRect(rect, width, height)))
 }
 
@@ -456,9 +573,11 @@ function colorPlateBoxes(img) {
 function documentRects(img) {
   const { width, height } = img
   return [
-    { left: 0, top: 0, width, height: Math.floor(height * 0.48) },
-    { left: Math.floor(width * 0.35), top: 0, width: Math.floor(width * 0.65), height: Math.floor(height * 0.55) },
-    { left: 0, top: Math.floor(height * 0.12), width, height: Math.floor(height * 0.35) },
+    { left: 0, top: 0, width, height: Math.floor(height * 0.42) },
+    { left: 0, top: 0, width: Math.floor(width * 0.55), height: Math.floor(height * 0.45) },
+    { left: Math.floor(width * 0.32), top: 0, width: Math.floor(width * 0.68), height: Math.floor(height * 0.5) },
+    { left: 0, top: Math.floor(height * 0.08), width, height: Math.floor(height * 0.4) },
+    { left: Math.floor(width * 0.08), top: Math.floor(height * 0.18), width: Math.floor(width * 0.84), height: Math.floor(height * 0.28) },
   ].map((rect) => clampRect(rect, width, height))
 }
 

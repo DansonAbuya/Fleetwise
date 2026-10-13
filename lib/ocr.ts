@@ -6,7 +6,7 @@ import { promisify } from 'node:util'
 import { compactPlate, pickOcrPlate, plateConfidence, plateFromCertificateText } from '@/lib/plates'
 
 const execFileAsync = promisify(execFile)
-const MAX_BYTES = 12 * 1024 * 1024
+const MAX_BYTES = 28 * 1024 * 1024
 
 export function ocrConfigured() {
   return true
@@ -49,9 +49,8 @@ function isPdfBytes(bytes: Buffer) {
 }
 
 export async function plateFromImage(bytes: Buffer, mimeType?: string, filename?: string, kind?: string) {
-  if ((!isOcrImage(mimeType, filename) && !isPdfBytes(bytes)) || bytes.length === 0 || bytes.length > MAX_BYTES) {
-    return { plate: null as string | null, confidence: 0, text: '' }
-  }
+  if (!isOcrImage(mimeType, filename) && !isPdfBytes(bytes)) return { plate: null as string | null, confidence: 0, text: '' }
+  if (bytes.length === 0) return { plate: null, confidence: 0, text: '' }
   const ocrKind = ocrKindFor(bytes, mimeType, filename, kind)
   const text = await readTextWithTesseract(bytes, mimeType, filename, ocrKind)
   const plateKind = ocrKind === 'photo' ? 'photo' : 'certificate'
@@ -63,9 +62,9 @@ export async function plateFromImage(bytes: Buffer, mimeType?: string, filename?
 }
 
 function ocrKindFor(bytes: Buffer, mimeType?: string, filename?: string, kind?: string) {
+  if (isPdfFile(bytes, mimeType, filename)) return 'pdf'
   if (kind === 'photo') return 'photo'
   if (kind === 'certificate' || kind === 'logbook') return 'certificate'
-  if (isPdfFile(bytes, mimeType, filename)) return 'pdf'
   return 'photo'
 }
 
@@ -73,9 +72,21 @@ function isPdfFile(bytes: Buffer, mimeType?: string, filename?: string) {
   return isPdfBytes(bytes) || (mimeType || '').toLowerCase().includes('pdf') || /\.pdf$/i.test(filename || '')
 }
 
+function commandOutput(err: unknown) {
+  if (!err || typeof err !== 'object') return { stdout: '', stderr: '', message: String(err) }
+  const row = err as { stdout?: unknown; stderr?: unknown; message?: unknown; killed?: boolean; signal?: unknown; code?: unknown }
+  return {
+    stdout: String(row.stdout || ''),
+    stderr: String(row.stderr || ''),
+    message: `${row.message || ''}\n${row.stderr || ''}`,
+    killed: Boolean(row.killed) || row.signal != null,
+    code: row.code,
+  }
+}
+
 function ocrCommandError(err: unknown, pdf: boolean) {
-  const message = err instanceof Error ? `${err.message}\n${'stderr' in err ? String((err as { stderr?: string }).stderr || '') : ''}` : String(err)
-  if (/timed out|etimedout|aborted due to timeout/i.test(message)) {
+  const { message, killed } = commandOutput(err)
+  if (killed || /timed out|etimedout|aborted due to timeout|sigterm|sigkill/i.test(message)) {
     return pdf
       ? "Couldn't finish reading that PDF in time. Try a smaller file, or open Unmatched and type the plate."
       : "Couldn't finish reading that photo in time. Try a closer crop of the plate, or type the plate on Unmatched."
@@ -93,15 +104,19 @@ function ocrCommandError(err: unknown, pdf: boolean) {
 async function readTextWithTesseract(bytes: Buffer, mimeType?: string, filename?: string, kind = 'photo') {
   const imagePath = join(tmpdir(), `fleetwise-ocr-${Date.now()}-${Math.random().toString(16).slice(2)}.bin`)
   await writeFile(imagePath, bytes)
+  const pdf = kind === 'pdf' || isPdfFile(bytes, mimeType, filename)
   try {
     const { stdout } = await execFileAsync(process.execPath, [join(process.cwd(), 'scripts', 'read-plate.mjs'), imagePath, kind], {
-      timeout: 180_000,
-      maxBuffer: 5 * 1024 * 1024,
+      timeout: 240_000,
+      maxBuffer: 8 * 1024 * 1024,
       windowsHide: true,
+      cwd: process.cwd(),
     })
     return stdout || ''
   } catch (err) {
-    throw new Error(ocrCommandError(err, kind !== 'photo'))
+    const { stdout } = commandOutput(err)
+    if (stdout.trim()) return stdout
+    throw new Error(ocrCommandError(err, pdf))
   } finally {
     await unlink(imagePath).catch(() => {})
   }

@@ -210,9 +210,9 @@ export function listRegistrationNumbers(plates: string[]) {
   return `${unique.slice(0, 5).join(', ')}, and ${unique.length - 5} more`
 }
 
-const REG_LABEL = /(?:^|\b)(?:vehicle\s+|motor(?:\s+vehicle)?\s+)?(?:registration(?:\s*(?:no\.?|number|num|mark|#))?|reg\.?\s*(?:no\.?|number|num|mark|#))\.?(?:\b|$)/i
+const REG_LABEL = /(?:^|\b)(?:vehicle\s+|motor(?:\s+vehicle)?\s+|m\.?\s*v\.?\s+)?(?:registration(?:\s*(?:no\.?|number|num|mark|#))?|reg(?:istration)?\.?\s*(?:no\.?|number|num|mark|#)?)\.?(?:\b|$)/i
 const NEXT_FIELD = /\b(chassis|make|model|engine|body|colour|color|year|seating|tonnage|policy|insured|commencement|expiry|owner|pin|tare|gvw)\b/i
-const REG_LABEL_GLOBAL = /\b(?:vehicle\s+|motor(?:\s+vehicle)?\s+)?(?:registration(?:\s*(?:no\.?|number|num|mark|#))?|reg\.?\s*(?:no\.?|number|num|mark|#))\.?/gi
+const REG_LABEL_GLOBAL = /\b(?:vehicle\s+|motor(?:\s+vehicle)?\s+|m\.?\s*v\.?\s+)?(?:registration(?:\s*(?:no\.?|number|num|mark|#))?|reg(?:istration)?\.?\s*(?:no\.?|number|num|mark|#)?)\.?/gi
 
 /** Use the value of REGISTRATION / REGISTRATION No on a logbook or insurance certificate. */
 export function plateFromCertificateText(text: string) {
