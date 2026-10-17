@@ -13,6 +13,22 @@ export const kenyanPlateSchema = z
   .transform((value) => compactPlate(value))
   .pipe(z.string().regex(/^K[A-Z]{2}\d{3}[A-Z]$|^K[A-Z]{3}\d{3}[A-Z]$/, 'Not a Kenyan registration number'))
 
+const photoPrefix = (process.env.PHOTO_PLATE_PREFIX || 'KM').toUpperCase().replace(/[^A-Z]/g, '') || 'KM'
+const photoPattern = new RegExp(process.env.PHOTO_PLATE_PATTERN || `^${photoPrefix}[A-Z]{${Math.max(0, 4 - photoPrefix.length)}}\\d{3}[A-Z]$`)
+
+export const photoRegistrationResultSchema = z.object({
+  registrationNumber: z.string().nullable(),
+  status: z.enum(['success', 'review_required', 'unreadable']),
+  confidence: z.number().nullable(),
+  reason: z.string().optional(),
+  processingTimeMs: z.number(),
+})
+
+export function parsePhotoPlate(raw: string | null | undefined) {
+  const plate = parseKenyanPlate(raw)
+  return plate && photoPattern.test(plate) ? plate : null
+}
+
 export function parseKenyanPlate(raw: string | null | undefined) {
   const result = kenyanPlateSchema.safeParse(raw || '')
   return result.success ? result.data : null
@@ -159,10 +175,7 @@ function repairKenyanPlate(raw: string, prefixLetters: 2 | 3) {
 }
 
 export function pickOcrPlate(text: string, kind: 'certificate' | 'photo' = 'photo') {
-  if (kind === 'certificate') {
-    const labeled = plateFromCertificateText(text)
-    if (labeled) return labeled
-  }
+  if (kind === 'certificate') return plateFromCertificateText(text)
   const counts = new Map<string, number>()
   const bump = (plate: string, weight = 1) => {
     const valid = parseKenyanPlate(plate)
@@ -180,17 +193,24 @@ export function pickOcrPlate(text: string, kind: 'certificate' | 'photo' = 'phot
   }
   const labeled = plateFromCertificateText(text)
   if (labeled) bump(labeled, 8)
+  for (const plate of pairSplitPlateParts(text)) bump(plate, 6)
+  const compactAll = compactPlate(text)
+  const missingK = compactAll.match(/(?:^|[^A-Z])(M[A-Z]{2}\d{3}[A-Z])/)
+  if (missingK) bump(`K${missingK[1]}`, 3)
+  const kmHits = compactAll.match(/KM[A-Z]{2}\d{3}[A-Z]/g) || []
+  for (const plate of kmHits) bump(plate, 5)
   const ranked = [...counts.entries()].sort((a, b) => {
     if (b[1] !== a[1]) return b[1] - a[1]
-    const bike = Number(b[0].startsWith('KM')) - Number(a[0].startsWith('KM'))
+    const bike = Number(b[0].startsWith('KM') && b[0].length === 8) - Number(a[0].startsWith('KM') && a[0].length === 8)
     if (bike) return bike
     return b[0].length - a[0].length
   })
+  const bikes = ranked.filter(([plate]) => plate.startsWith('KM') && plate.length === 8)
+  if (kind === 'photo' && bikes[0]) return bikes[0][0]
   if (ranked[0]?.[1] >= 2) return ranked[0][0]
-  if (kind === 'photo' && ranked[0]?.[0].startsWith('KM') && ranked[0][0].length === 8) return ranked[0][0]
   if (kind === 'photo' && ranked.length === 1) return ranked[0][0]
   if (ranked[0] && ranked[0][1] > (ranked[1]?.[1] || 0)) return ranked[0][0]
-  return plateFromText(text)
+  return kind === 'photo' ? null : plateFromText(text)
 }
 
 function toDigit(char: string) {
@@ -226,53 +246,154 @@ export function listRegistrationNumbers(plates: string[]) {
   return `${unique.slice(0, 5).join(', ')}, and ${unique.length - 5} more`
 }
 
-const REG_LABEL = /\b(?:vehicle\s+|motor(?:\s+vehicle)?\s+|m\.?\s*v\.?\s*)?(?:registration|reg)(?:[\s.:\-–]*?(?:no\.?|number|num|mark|#))?(?![A-Za-z])/i
-const NEXT_FIELD = /\b(chassis|make|model|engine|body|colour|color|year|seating|tonnage|policy|insured|commencement|expiry|owner|pin|tare|gvw)\b/i
-const REG_LABEL_GLOBAL = /\b(?:vehicle\s+|motor(?:\s+vehicle)?\s+|m\.?\s*v\.?\s*)?(?:registration|reg)(?:[\s.:\-–]*?(?:no\.?|number|num|mark|#))?(?![A-Za-z])/gi
+const REG_LABEL = /\b(?:(?:vehicle|motor(?:\s+vehicle)?|m\.?\s*v\.?|identification)\s+)?(?:registration|reg(?:n)?\.?)[\s.:\-–]*?(?:mark(?:\s+and\s+number)?|no\.?|number|num|#)\b|\bidentification\s+mark(?:\s+and\s+number)?\b/i
+const NEXT_FIELD = /\b(chassis|make|model|engine|body|colour|color|year|seating|tonnage|policy|insured|commencement|expiry|owner|pin|tare|gvw|cover|interpol|usage|cubic|certificate\s*no|date of)\b/i
+const REG_LABEL_GLOBAL = new RegExp(REG_LABEL.source, 'gi')
+const LABEL_STRIP = /^.*?\b(?:(?:vehicle|motor(?:\s+vehicle)?|m\.?\s*v\.?|identification)\s+)?(?:registration|reg(?:n)?\.?)[\s.:\-–]*?(?:mark(?:\s+and\s+number)?|no\.?|number|num|#)\b\.?\s*[:\-–.]*|^.*?\bidentification\s+mark(?:\s+and\s+number)?\b\.?\s*[:\-–.]*/i
+const SKIP_REG_LINE = /certificate of registration|registration certificate|date of (?:first )?registration|place of registration|registered (?:owner|keeper)/i
+const OTHER_HEADER = /^(chassis|make|model|engine|body|colour|color|year|owner|tare|gvw|class|type)\b/i
+const LABEL_CONTINUATION = /^(and\s+(?:number|no\.?)|of\s+(?:the\s+)?(?:motor\s+)?vehicle|of\s+trailer)$/i
 
-/** Use the value of REGISTRATION / REGISTRATION No on a logbook or insurance certificate. */
-export function plateFromCertificateText(text: string) {
-  if (!text?.trim()) return null
-  const lines = text.split(/\r?\n/).map((line) => line.replace(/\s+/g, ' ').trim()).filter(Boolean)
-  const scored: { plate: string; weight: number }[] = []
-  const add = (raw: string, weight: number) => {
-    if (!raw) return
-    for (const plate of [...kenyanPlatesIn(raw), ...platesFromText(raw)]) {
-      let score = weight
-      if (compactPlate(raw) === plate) score += 50
-      if (plate.length === 8) score += 8
-      if (plate.startsWith('KM')) score += 6
-      scored.push({ plate, weight: score })
-    }
+function cutAtNextField(raw: string) {
+  const index = raw.search(NEXT_FIELD)
+  return (index > 0 ? raw.slice(0, index) : raw).trim()
+}
+
+function isLabelContinuation(line: string) {
+  return LABEL_CONTINUATION.test(line.replace(/[.:\-–]/g, '').trim())
+}
+
+function registrationValueLines(lines: string[], start: number) {
+  const extras: string[] = []
+  for (let j = start; j < lines.length && j < start + 6 && extras.length < 2; j++) {
+    const line = lines[j]
+    if (isLabelContinuation(line) || SKIP_REG_LINE.test(line)) continue
+    if (REG_LABEL.test(line) || NEXT_FIELD.test(line) || OTHER_HEADER.test(line)) break
+    extras.push(line)
+    if (standaloneKenyanPlates(line).length && !isPrefixLine(compactPlate(line))) break
   }
+  return extras
+}
+
+function registrationFieldValues(text: string) {
+  const values: string[] = []
+  const push = (raw?: string) => {
+    const value = cutAtNextField(String(raw || '').replace(/\s+/g, ' ').trim())
+    if (value && !OTHER_HEADER.test(value) && !isLabelContinuation(value) && !values.includes(value)) values.push(value)
+  }
+  const lines = text.split(/\r?\n/).map((line) => line.replace(/\s+/g, ' ').trim()).filter(Boolean)
   for (let i = 0; i < lines.length; i++) {
-    if (!REG_LABEL.test(lines[i])) continue
-    const afterLabel = lines[i]
-      .replace(/^.*?\b(?:registration|reg)(?:[\s.:\-–]*?(?:no\.?|number|num|mark|#))?\.?\s*[:\-–.]*/i, '')
-      .trim()
-    add(afterLabel, 90)
-    if (i > 0 && !NEXT_FIELD.test(lines[i - 1])) add(lines[i - 1], 55)
-    const next1 = lines[i + 1]
-    const next2 = lines[i + 2]
-    if (next1 && !NEXT_FIELD.test(next1)) add(next1, 80)
-    if (next2 && !NEXT_FIELD.test(next2)) add(next2, 50)
-    add([afterLabel, next1, next2].filter(Boolean).join(' '), 70)
+    if (SKIP_REG_LINE.test(lines[i]) || !REG_LABEL.test(lines[i])) continue
+    let afterLabel = lines[i].replace(LABEL_STRIP, '').trim()
+    if (OTHER_HEADER.test(afterLabel) || SKIP_REG_LINE.test(afterLabel) || isLabelContinuation(afterLabel)) afterLabel = ''
+    push(afterLabel)
+    if (afterLabel && standaloneKenyanPlates(afterLabel).length) continue
+    const extras = registrationValueLines(lines, i + 1)
+    for (const extra of extras) push(extra)
+    if (extras.length >= 2) push(extras.join(' '))
   }
   const flat = text.replace(/\s+/g, ' ')
   for (const match of flat.matchAll(REG_LABEL_GLOBAL)) {
+    const nearby = flat.slice(match.index || 0, (match.index || 0) + match[0].length + 48)
+    if (SKIP_REG_LINE.test(nearby.slice(0, match[0].length + 12))) continue
     const start = (match.index || 0) + match[0].length
-    add(flat.slice(start, start + 220), 85)
+    push(flat.slice(start, start + 48))
   }
-  scored.sort((a, b) => b.weight - a.weight || b.plate.length - a.plate.length)
-  const labeled = parseKenyanPlate(scored[0]?.plate)
-  if (labeled) return labeled
-  const plates = platesFromText(text).map((plate) => parseKenyanPlate(plate)).filter((plate): plate is string => Boolean(plate))
-  const bikes = plates.filter((plate) => plate.startsWith('KM') && plate.length === 8)
-  if (bikes.length === 1) return bikes[0]
-  if (plates.length === 1) return plates[0]
-  if (bikes.length) return bikes[0]
-  if (plates.length) return plates[0]
-  return null
+  return values
+}
+
+function standaloneKenyanPlates(raw: string) {
+  const found: string[] = []
+  const add = (plate: string | null | undefined) => {
+    const valid = parseKenyanPlate(plate)
+    if (!valid || found.includes(valid)) return
+    found.push(valid)
+  }
+  const tokens = String(raw || '').toUpperCase().match(/[A-Z0-9]+/g) || []
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i]
+    if (token.length > 10) {
+      add(token.slice(0, 8))
+      add(token.slice(0, 7))
+      continue
+    }
+    add(token)
+    const next = tokens[i + 1]
+    if (next && isPrefixLine(token) && isNumberLine(next)) add(token + next)
+  }
+  const compact = compactPlate(raw)
+  if (compact.length >= 7 && compact.length <= 10) add(compact)
+  return found
+}
+
+function platesFromRegistrationValue(raw: string) {
+  const found: { plate: string; exact: boolean }[] = []
+  const add = (plate: string | null, exact: boolean) => {
+    const valid = parseKenyanPlate(plate)
+    if (!valid || found.some((row) => row.plate === valid)) return
+    found.push({ plate: valid, exact })
+  }
+  for (const plate of standaloneKenyanPlates(raw)) add(plate, true)
+  const compact = compactPlate(raw)
+  if (!found.length && compact.length >= 7 && compact.length <= 14) {
+    add(repairKenyanPlate(compact.slice(0, 8), 3), false)
+    add(repairKenyanPlate(compact.slice(0, 7), 2), false)
+  }
+  return found
+}
+
+export function certificatePlateCandidates(text: string) {
+  if (!text?.trim()) return [] as { plate: string; exact: boolean; weight: number }[]
+  const scored: { plate: string; exact: boolean; weight: number }[] = []
+  const add = (plate: string, exact: boolean, weight: number) => {
+    let score = weight + (exact ? 40 : 0)
+    if (plate.length === 8) score += 6
+    scored.push({ plate, exact, weight: score })
+  }
+  for (const value of registrationFieldValues(text)) {
+    const plates = platesFromRegistrationValue(value)
+    const compact = compactPlate(value)
+    for (const row of plates) add(row.plate, row.exact, compact === row.plate ? 110 : 90)
+  }
+  if (!scored.length) {
+    for (const plate of kenyanPlatesIn(text)) add(plate, true, 20)
+  }
+  const merged = new Map<string, { plate: string; exact: boolean; weight: number }>()
+  for (const row of scored) {
+    const current = merged.get(row.plate)
+    if (!current || row.weight > current.weight) merged.set(row.plate, row)
+    else if (row.exact) current.exact = true
+  }
+  return [...merged.values()].sort((a, b) => b.weight - a.weight || Number(b.exact) - Number(a.exact) || b.plate.length - a.plate.length)
+}
+
+/** Exact REGISTRATION No printed on the certificate — never a nearby fleet plate. */
+export function printedRegistrationPlate(text: string) {
+  const exact = certificatePlateCandidates(text).find((row) => row.exact)
+  return exact?.plate || null
+}
+
+/** Use the value of REGISTRATION / REGISTRATION No on a logbook or insurance certificate. */
+export function plateFromCertificateText(text: string, _sheetPlates?: Set<string>) {
+  return printedRegistrationPlate(text) || certificatePlateCandidates(text)[0]?.plate || null
+}
+
+/** NTSA logbook / copy of records: Registration Number or Registration mark, including two-line plates. */
+export function plateFromLogbookText(text: string) {
+  for (const value of registrationFieldValues(text)) {
+    const exact = platesFromRegistrationValue(value).find((row) => row.exact)
+    if (exact) return exact.plate
+  }
+  for (const value of registrationFieldValues(text)) {
+    const repaired = platesFromRegistrationValue(value)[0]?.plate
+    if (repaired) return repaired
+  }
+  return printedRegistrationPlate(text)
+}
+
+/** Printed field first. Do not morph digits toward STOCK DOCUMENTS. */
+export function matchCertificateToRegister(text: string, guess?: string | null, _sheetPlates?: Set<string>) {
+  return printedRegistrationPlate(text) || parseKenyanPlate(guess) || certificatePlateCandidates(text)[0]?.plate || null
 }
 
 export function plateConfidence(filename: string, subject = '', body = '') {
@@ -290,4 +411,5 @@ export const APP_FILE_NAMES = new Set([
   'fleetwise-audit.jsonl',
   'fleetwise-gmail-state.json',
   'fleetwise-process.json',
+  'fleetwise-insurance-cover.json',
 ])

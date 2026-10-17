@@ -1,7 +1,9 @@
+import { compactPlate } from '@/lib/plates'
+import { insuranceAlerts, insuranceState, type InsuranceCover } from '@/lib/insurance'
 import type { DocType, FleetStats, VehicleRecord } from '@/lib/types'
 
 export type VehicleStatusFilter = 'all' | 'Complete' | 'Needs attention'
-export type VehicleMissingFilter = 'logbook' | 'certificate' | 'photo' | 'collateral'
+export type VehicleMissingFilter = 'logbook' | 'certificate' | 'photo' | 'collateral' | 'agreement'
 
 export type VehicleQuery = {
   query?: string
@@ -22,13 +24,18 @@ export const EMPTY_STATS: FleetStats = {
   certificate: 0,
   photo: 0,
   collateral: 0,
+  agreement: 0,
   brands: [],
   unbranded: 0,
   newPlates: [],
+  insuranceWeek: 0,
+  insuranceTwoDays: 0,
+  insuranceExpired: 0,
 }
 
 export function hasRegisterItem(vehicle: VehicleRecord, item: VehicleMissingFilter) {
   if (item === 'collateral') return Boolean(vehicle.collateral)
+  if (item === 'agreement') return Boolean(vehicle.agreement)
   return vehicle.files[item].length > 0
 }
 
@@ -61,10 +68,29 @@ export function fleetStats(vehicles: VehicleRecord[], previousPlates: string[] =
     certificate: vehicles.filter((vehicle) => vehicle.files.certificate.length).length,
     photo: vehicles.filter((vehicle) => vehicle.files.photo.length).length,
     collateral: vehicles.filter((vehicle) => vehicle.collateral).length,
+    agreement: vehicles.filter((vehicle) => (vehicle.files.agreement || []).length > 0 || Boolean(vehicle.agreement)).length,
     brands,
     unbranded: vehicles.filter((vehicle) => !(vehicle.brand || '').trim()).length,
     newPlates,
+    insuranceWeek: vehicles.filter((vehicle) => vehicle.insurance?.alert === 'week').length,
+    insuranceTwoDays: vehicles.filter((vehicle) => vehicle.insurance?.alert === 'two-days').length,
+    insuranceExpired: vehicles.filter((vehicle) => vehicle.insurance?.alert === 'expired').length,
   }
+}
+
+export function attachInsurance(vehicles: VehicleRecord[], covers: Record<string, InsuranceCover>): VehicleRecord[] {
+  return vehicles.map((vehicle) => {
+    const stored = covers[compactPlate(vehicle.plate)] || covers[vehicle.plate]
+    const cover = {
+      commencement: stored?.commencement || vehicle.insurance?.commencement || null,
+      expiry: stored?.expiry || vehicle.insurance?.expiry || null,
+    }
+    return { ...vehicle, insurance: insuranceState(cover) }
+  })
+}
+
+export function insuranceAlertsFor(covers: Record<string, InsuranceCover>) {
+  return insuranceAlerts(covers)
 }
 
 export function slimVehicle(vehicle: VehicleRecord): VehicleRecord {
@@ -76,13 +102,18 @@ export function slimVehicle(vehicle: VehicleRecord): VehicleRecord {
     status: vehicle.status,
     updated: vehicle.updated,
     files: {
-      logbook: slimFiles(vehicle.files.logbook),
-      certificate: slimFiles(vehicle.files.certificate),
-      photo: slimFiles(vehicle.files.photo),
+      logbook: slimFiles(vehicle.files.logbook || []),
+      certificate: slimFiles(vehicle.files.certificate || []),
+      photo: slimFiles(vehicle.files.photo || []),
+      agreement: slimFiles(vehicle.files.agreement || []),
     },
     collateral: vehicle.collateral
       ? { id: vehicle.collateral.id, name: vehicle.collateral.name, webViewLink: vehicle.collateral.webViewLink }
       : undefined,
+    agreement: vehicle.agreement
+      ? { id: vehicle.agreement.id, name: vehicle.agreement.name, webViewLink: vehicle.agreement.webViewLink }
+      : undefined,
+    insurance: vehicle.insurance,
   }
 }
 

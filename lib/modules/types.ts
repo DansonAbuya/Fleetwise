@@ -3,8 +3,12 @@ import type { DocType, FleetConfig, TypedFile, VehicleRecord } from '@/lib/types
 export type SheetSyncMode = 'auto' | 'full' | 'match'
 
 export type SheetCell = { label: string; uri?: string }
-export type SheetDocKey = DocType | 'collateral'
-export type SheetRowMeta = Partial<Record<SheetDocKey, SheetCell>> & { brand?: string }
+export type SheetDocKey = DocType | 'collateral' | 'agreement'
+export type SheetRowMeta = Partial<Record<SheetDocKey, SheetCell>> & {
+  brand?: string
+  commencement?: string
+  expiry?: string
+}
 export type SheetCells = Map<string, SheetRowMeta>
 
 export type ModuleSyncResult = {

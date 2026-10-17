@@ -2,32 +2,39 @@ import { cookies } from 'next/headers'
 import {
   appendTextFile,
   findFileByName,
+  findFileInFolder,
   findOwnedFileByName,
   getFile,
   listFolderFiles,
+  moveAndRename,
   readJsonFile,
   readTextFile,
   upsertJsonFile,
 } from '@/lib/drive'
 import { stockDocumentsModule } from '@/lib/modules/stock-documents'
 import type { SheetCells } from '@/lib/modules/types'
-import { compactPlate, isKenyanPlate, plateFromText } from '@/lib/plates'
+import { compactPlate, extractKenyanPlate } from '@/lib/plates'
+import { hasCanonicalName, hasUnmatchedMark, plateFromTypedName, stripUnmatchedMark, uniqueSuggestedName } from '@/lib/document-names'
+import type { InsuranceCover } from '@/lib/insurance'
 import type { AuditEvent, DocType, FleetConfig, GmailState, TypedFile } from '@/lib/types'
 
 export const CONFIG_NAME = 'fleetwise-config.json'
 export const AUDIT_NAME = 'fleetwise-audit.jsonl'
 export const GMAIL_STATE_NAME = 'fleetwise-gmail-state.json'
+export const INSURANCE_COVER_NAME = 'fleetwise-insurance-cover.json'
 const CONFIG_COOKIE = 'fleetwise_folders'
 
 export function folderIdForType(config: FleetConfig, type: DocType) {
   if (type === 'logbook') return config.logbooksId
   if (type === 'certificate') return config.certificatesId
+  if (type === 'agreement') return config.agreementsId || ''
   return config.photosId
 }
 
 export function folderNameForType(config: FleetConfig, type: DocType) {
   if (type === 'logbook') return config.logbooksName || 'Logbooks'
   if (type === 'certificate') return config.certificatesName || 'Certificates'
+  if (type === 'agreement') return config.agreementsName || 'Agreements'
   return config.photosName || 'Photos'
 }
 
@@ -61,13 +68,17 @@ function envFolderConfig(): FleetConfig | null {
   const logbooksId = process.env.DRIVE_FOLDER_LOGBOOKS
   const certificatesId = process.env.DRIVE_FOLDER_CERTIFICATES
   const photosId = process.env.DRIVE_FOLDER_PHOTOS
+  const agreementsId = process.env.DRIVE_FOLDER_AGREEMENTS
   if (!logbooksId || !certificatesId || !photosId) return null
   return {
     logbooksId,
     certificatesId,
     photosId,
+    agreementsId,
     collateralId: process.env.DRIVE_FOLDER_COLLATERAL,
     spreadsheetId: process.env.DRIVE_SPREADSHEET_ID,
+    insuranceInboxEmail: process.env.GMAIL_INSURANCE_INBOX || process.env.DRIVE_INSURANCE_INBOX_EMAIL,
+    logbooksInboxEmail: process.env.GMAIL_LOGBOOKS_INBOX || process.env.DRIVE_LOGBOOKS_INBOX_EMAIL,
     autoUploadThreshold: Number(process.env.DRIVE_MATCH_THRESHOLD || 85),
   }
 }
@@ -77,10 +88,12 @@ export async function saveConfig(input: FleetConfig) {
     logbooksId: input.logbooksId,
     certificatesId: input.certificatesId,
     photosId: input.photosId,
+    agreementsId: input.agreementsId,
     collateralId: input.collateralId,
     logbooksName: cleanFolderLabel(input.logbooksName),
     certificatesName: cleanFolderLabel(input.certificatesName),
     photosName: cleanFolderLabel(input.photosName),
+    agreementsName: cleanFolderLabel(input.agreementsName),
     collateralName: cleanFolderLabel(input.collateralName),
     spreadsheetId: input.spreadsheetId,
     spreadsheetName: cleanFolderLabel(input.spreadsheetName),
@@ -88,6 +101,8 @@ export async function saveConfig(input: FleetConfig) {
     certificatesSheet: input.certificatesSheet,
     photosSheet: input.photosSheet,
     autoUploadThreshold: input.autoUploadThreshold ?? 85,
+    insuranceInboxEmail: input.insuranceInboxEmail,
+    logbooksInboxEmail: input.logbooksInboxEmail,
     lastSync: input.lastSync,
   }
   const existing = await findOwnedFileByName(CONFIG_NAME)
@@ -112,14 +127,18 @@ async function writeConfigCookie(config: FleetConfig) {
     logbooksId: config.logbooksId,
     certificatesId: config.certificatesId,
     photosId: config.photosId,
+    agreementsId: config.agreementsId,
     collateralId: config.collateralId,
     logbooksName: config.logbooksName,
     certificatesName: config.certificatesName,
     photosName: config.photosName,
+    agreementsName: config.agreementsName,
     collateralName: config.collateralName,
     spreadsheetId: config.spreadsheetId,
     spreadsheetName: config.spreadsheetName,
     autoUploadThreshold: config.autoUploadThreshold ?? 85,
+    insuranceInboxEmail: config.insuranceInboxEmail,
+    logbooksInboxEmail: config.logbooksInboxEmail,
   })), {
     httpOnly: true,
     sameSite: 'lax',
@@ -158,6 +177,35 @@ export async function saveGmailState(config: FleetConfig, state: GmailState, fil
   await upsertJsonFile(config.certificatesId, GMAIL_STATE_NAME, trimmed, fileId)
 }
 
+async function insuranceCoverFile(config: FleetConfig) {
+  return (config.certificatesId ? await findFileInFolder(config.certificatesId, INSURANCE_COVER_NAME) : null)
+    || await findFileByName(INSURANCE_COVER_NAME)
+}
+
+export async function loadInsuranceCovers(config: FleetConfig): Promise<Record<string, InsuranceCover>> {
+  const existing = await insuranceCoverFile(config)
+  if (!existing) return {}
+  const data = await readJsonFile<Record<string, InsuranceCover>>(existing.id)
+  return data && typeof data === 'object' && !Array.isArray(data) ? data : {}
+}
+
+export async function saveInsuranceCovers(config: FleetConfig, covers: Record<string, InsuranceCover>) {
+  const existing = await insuranceCoverFile(config)
+  await upsertJsonFile(config.certificatesId, INSURANCE_COVER_NAME, covers, existing?.id)
+}
+
+export async function saveInsuranceCover(config: FleetConfig, plate: string, cover: InsuranceCover) {
+  if (!cover.commencement && !cover.expiry) return
+  const covers = await loadInsuranceCovers(config)
+  const key = compactPlate(plate)
+  const previous = covers[key] || { commencement: null, expiry: null }
+  covers[key] = {
+    commencement: cover.commencement || previous.commencement,
+    expiry: cover.expiry || previous.expiry,
+  }
+  await saveInsuranceCovers(config, covers)
+}
+
 export async function appendAudit(config: FleetConfig, user: string, action: string) {
   const existing = await findFileByName(AUDIT_NAME)
   const line = JSON.stringify({ user, action, time: new Date().toISOString() })
@@ -185,15 +233,17 @@ export async function loadAudit(): Promise<AuditEvent[]> {
 }
 
 async function listTypedFiles(config: FleetConfig, fresh = false): Promise<TypedFile[]> {
-  const [logbooks, certificates, photos] = await Promise.all([
+  const [logbooks, certificates, photos, agreements] = await Promise.all([
     listFolderFiles(config.logbooksId, { fresh }),
     listFolderFiles(config.certificatesId, { fresh }),
     listFolderFiles(config.photosId, { fresh }),
+    config.agreementsId ? listFolderFiles(config.agreementsId, { fresh }) : Promise.resolve([]),
   ])
   return [
-    ...logbooks.map((file) => ({ ...file, type: 'logbook' as const, plate: plateFromTypedName(file.name, 'logbook') || plateFromText(file.name) })),
-    ...certificates.map((file) => ({ ...file, type: 'certificate' as const, plate: plateFromTypedName(file.name, 'certificate') || plateFromText(file.name) })),
-    ...photos.map((file) => ({ ...file, type: 'photo' as const, plate: plateFromTypedName(file.name, 'photo') || plateFromText(file.name) })),
+    ...logbooks.map((file) => ({ ...file, type: 'logbook' as const, plate: plateFromTypedName(file.name, 'logbook') || extractKenyanPlate(file.name) })),
+    ...certificates.map((file) => ({ ...file, type: 'certificate' as const, plate: plateFromTypedName(file.name, 'certificate') || extractKenyanPlate(file.name) })),
+    ...photos.map((file) => ({ ...file, type: 'photo' as const, plate: plateFromTypedName(file.name, 'photo') || extractKenyanPlate(file.name) })),
+    ...agreements.map((file) => ({ ...file, type: 'agreement' as const, plate: plateFromTypedName(file.name, 'agreement') || extractKenyanPlate(file.name) })),
   ]
 }
 
@@ -222,34 +272,61 @@ export function formatTime(value?: string) {
   return date.toLocaleString()
 }
 
-export function suggestedName(plate: string, type: DocType, _original: string) {
-  const registration = compactPlate(plateFromText(plate) || plate)
-  if (type === 'photo') return `Photos ${registration}`
-  if (type === 'certificate') return `Insurance - ${registration}`
-  return `${registration} - Logbook`
+export {
+  documentBaseName,
+  hasCanonicalAgreementName,
+  hasCanonicalName,
+  plateFromTypedName,
+  suggestedName,
+  uniqueSuggestedName,
+} from '@/lib/document-names'
+
+const LOGBOOK_RENAME_LIMIT = 40
+const UNMATCHED_MARK_LIMIT = 40
+
+/** Remove leftover Unmatched prefixes from Drive folder names. */
+export async function clearUnmatchedFolderMarks(files: TypedFile[]) {
+  const taken = new Set(files.map((file) => file.name))
+  const renamed: TypedFile[] = []
+  for (const file of files) {
+    if (!hasUnmatchedMark(file.name)) continue
+    const stripped = stripUnmatchedMark(file.name)
+    const plate = plateFromTypedName(stripped, file.type) || extractKenyanPlate(stripped)
+    const name = plate ? uniqueSuggestedName(plate, file.type, stripped, taken) : stripped
+    if (!name || name === file.name) continue
+    try {
+      const updated = await moveAndRename(file.id, { name })
+      taken.delete(file.name)
+      taken.add(name)
+      renamed.push({ ...file, ...updated, name, plate, type: file.type })
+    } catch {
+      // Leave this file for the next scan if Drive rejects the name.
+    }
+    if (renamed.length >= UNMATCHED_MARK_LIMIT) break
+  }
+  return renamed
 }
 
-export function documentBaseName(name: string) {
-  return name.replace(/\.(pdf|jpe?g|png|webp|gif|heic)$/i, '').trim()
-}
-
-/** Plate from Insurance -KMHC335S, Insurance-KMHC335S, Photos KMHC335S, KMHC335S - Logbook. */
-export function plateFromTypedName(name: string, type: DocType) {
-  const base = documentBaseName(name)
-  const body = type === 'certificate'
-    ? base.match(/^insurance\s*-?\s*(.+)$/i)?.[1]
-    : type === 'photo'
-      ? base.match(/^photos\s+(.+)$/i)?.[1]
-      : base.match(/^(.+?)\s*-?\s*logbook$/i)?.[1]
-  if (!body) return null
-  const plate = compactPlate(body)
-  return isKenyanPlate(plate) ? plate : null
-}
-
-export function hasCanonicalName(file: { name: string; type: DocType }) {
-  const plate = plateFromTypedName(file.name, file.type)
-  if (!plate) return false
-  const expected = suggestedName(plate, file.type, file.name)
-  return file.name === expected || documentBaseName(file.name) === expected
+/** Rename logbooks that already have a plate to exactly `{plate} - Logbook`. */
+export async function normalizeLogbookFilenames(files: TypedFile[]) {
+  const taken = new Set(files.map((file) => file.name))
+  const renamed: TypedFile[] = []
+  for (const file of files) {
+    if ((file.type !== 'logbook' && file.type !== 'agreement') || hasCanonicalName(file)) continue
+    const plate = plateFromTypedName(file.name, file.type) || extractKenyanPlate(file.name)
+    if (!plate) continue
+    const name = uniqueSuggestedName(plate, file.type, file.name, taken)
+    if (name === file.name) continue
+    try {
+      const updated = await moveAndRename(file.id, { name })
+      taken.delete(file.name)
+      taken.add(name)
+      renamed.push({ ...file, ...updated, name, plate, type: file.type })
+    } catch {
+      // Leave this file for the next scan if Drive rejects the name.
+    }
+    if (renamed.length >= LOGBOOK_RENAME_LIMIT) break
+  }
+  return renamed
 }
 

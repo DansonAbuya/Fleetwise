@@ -1,4 +1,4 @@
-import { parseKenyanPlate, plateFromCertificateText } from '@/lib/plates'
+import { parseKenyanPlate, plateFromCertificateText, plateFromLogbookText } from '@/lib/plates'
 import { extractPlateText } from '@/lib/read-plate-runner'
 
 export function isPdfBytes(bytes: Buffer) {
@@ -13,5 +13,5 @@ export function isInsurancePdf(bytes: Buffer, mimeType?: string, filename?: stri
 export async function registrationFromPdfjs(bytes: Buffer) {
   if (!bytes.length) return { text: '', plate: null as string | null }
   const text = await extractPlateText(bytes, 'pdfjs')
-  return { text, plate: parseKenyanPlate(plateFromCertificateText(text)) }
+  return { text, plate: parseKenyanPlate(plateFromCertificateText(text) || plateFromLogbookText(text)) }
 }

@@ -1,6 +1,6 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  serverExternalPackages: ['sharp', 'zod', 'tesseract.js', 'tesseract.js-core', 'pdfjs-dist', '@napi-rs/canvas'],
+  serverExternalPackages: ['sharp', 'zod', 'tesseract.js', 'tesseract.js-core', 'pdfjs-dist', '@napi-rs/canvas', '@prisma/client', 'prisma'],
   outputFileTracingIncludes: {
     '/**': ['./scripts/**'],
   },

@@ -1,24 +1,29 @@
 'use server'
 
-import { appendAudit, folderIdForType, folderNameForType, formatTime, hasCanonicalName, loadAudit, loadConfig, loadGmailState, plateFromTypedName, resolveFolderName, saveConfig, saveGmailState, scanFolders, suggestedName } from '@/lib/fleet'
+import { appendAudit, clearUnmatchedFolderMarks, folderIdForType, folderNameForType, formatTime, hasCanonicalName, loadAudit, loadConfig, loadGmailState, loadInsuranceCovers, plateFromTypedName, resolveFolderName, saveConfig, saveGmailState, saveInsuranceCover, saveInsuranceCovers, scanFolders, suggestedName, uniqueSuggestedName } from '@/lib/fleet'
+import { parseInsuranceCover, type InsuranceCover } from '@/lib/insurance'
 import { getAttachment, findAttachments, getMessage, listRecentMessages, messageMeta } from '@/lib/gmail'
 import { downloadBinary, downloadNamedFile, findFleetAssetsWorkbook, listFolders, listSharedDrives, listSpreadsheets as listSpreadsheetFiles, moveAndRename, searchFolders, uploadBinary } from '@/lib/drive'
-import { isOcrImage, ocrConfigured, plateFromImage, resolvePlateFromFile } from '@/lib/ocr'
+import { coverFromCertificate, isOcrImage, ocrConfigured, plateFromImage, resolvePlateFromFile } from '@/lib/ocr'
+import { cleanInboxEmail, isInboxEmail, mailboxSearchQuery } from '@/lib/mailboxes'
+import { warmPlateReader } from '@/lib/read-plate-runner'
 import { SHEET_MODULES, stockDocumentsModule, syncSheetModules } from '@/lib/modules'
-import { readStockRegisterSnapshot } from '@/lib/modules/stock-documents'
+import { driveIdFromUri, readStockRegisterSnapshot, writeInsuranceDates } from '@/lib/modules/stock-documents'
 import type { SheetCells, SheetSyncMode } from '@/lib/modules/types'
-import { compactPlate, listRegistrationNumbers, parseKenyanPlate, pickOcrPlate, plateFromCertificateText, plateFromText } from '@/lib/plates'
-import { attachLastAction, beginProcessJob, endProcessJob, fileMatchesFocus, getProcessJob, isProcessCancelled, isProcessRunning, isStaleProcess, markProcessMatches, processFocusLabel, processGeneration, requestProcessStop, touchProcessItem, type ProcessFocus } from '@/lib/processing'
+import { compactPlate, extractKenyanPlate, listRegistrationNumbers, parseKenyanPlate, parsePhotoPlate, pickOcrPlate, plateFromCertificateText, plateFromLogbookText, plateFromText, printedRegistrationPlate } from '@/lib/plates'
+import { attachLastAction, beginProcessJob, endProcessJob, fileMatchesFocus, getProcessJob, isProcessCancelled, isProcessRunning, isRepairFocus, isStaleProcess, markProcessMatches, processFocusLabel, processGeneration, requestProcessStop, touchProcessItem, type ProcessFocus } from '@/lib/processing'
 import { confirmedPlate, forgetFile, hydrateProcessCursor, isCursorHydrated, lastAction, markConfirmed, markTried, persistProcessCursor, recordLastAction, wasTriedRecently } from '@/lib/process-cursor'
 import { requireSession } from '@/lib/session'
-import { EMPTY_STATS, filterVehicles, fleetStats, slimVehicle, type VehicleQuery } from '@/lib/vehicles'
+import { databaseConfigured, databaseStatus } from '@/lib/prisma'
+import { importVehiclesToDatabase, loadExportedRegister, loadRegisterFromDatabase } from '@/lib/register-db'
+import { attachInsurance, EMPTY_STATS, filterVehicles, fleetStats, insuranceAlertsFor, slimVehicle, type VehicleQuery } from '@/lib/vehicles'
 import type { DocType, FleetConfig, FleetSnapshot, InboxItem, TypedFile, VehicleRecord } from '@/lib/types'
 
 let rememberedPlates: string[] = []
 
 const ON_VERCEL = Boolean(process.env.VERCEL)
-const OCR_BATCH = ON_VERCEL ? 2 : 12
-const OCR_CONCURRENCY = ON_VERCEL ? 1 : 2
+const OCR_BATCH = ON_VERCEL ? 4 : 10
+const OCR_CONCURRENCY = ON_VERCEL ? 2 : 5
 
 async function mapPool<T>(items: T[], limit: number, fn: (item: T) => Promise<void>) {
   const generation = processGeneration()
@@ -35,7 +40,15 @@ async function mapPool<T>(items: T[], limit: number, fn: (item: T) => Promise<vo
 }
 
 function namedPlateOf(file: { name: string; type: DocType }) {
-  return plateFromTypedName(file.name, file.type) || plateFromText(file.name)
+  const typed = plateFromTypedName(file.name, file.type)
+  if (typed) return typed
+  if (file.type === 'photo') return parsePhotoPlate(file.name) || parsePhotoPlate(extractKenyanPlate(file.name) || '')
+  if (file.type === 'logbook' || file.type === 'agreement') return extractKenyanPlate(file.name)
+  return plateFromText(file.name)
+}
+
+function isPlatePdf(type: DocType) {
+  return type === 'certificate' || type === 'logbook' || type === 'agreement'
 }
 
 function nameMatchesDocument(file: { id: string; name: string; type: DocType }) {
@@ -51,6 +64,7 @@ function emptySnapshot(session: { name: string; email: string; image?: string },
     config,
     vehicles: [],
     unmatched: [],
+    insuranceAlerts: [],
     inbox: [],
     audit: [],
     stats: EMPTY_STATS,
@@ -58,6 +72,8 @@ function emptySnapshot(session: { name: string; email: string; image?: string },
     driveConnected: true,
     ocrConfigured: ocrConfigured(),
     sheetsConnected: Boolean(config?.spreadsheetId),
+    databaseConnected: false,
+    databaseVehicles: 0,
     ...extra,
   }
 }
@@ -71,27 +87,83 @@ function statsFor(vehicles: VehicleRecord[]) {
 export async function loadWorkspace(): Promise<FleetSnapshot> {
   const session = await requireSession()
   const config = await loadConfig()
-  return emptySnapshot(session, config, { sheetsConnected: Boolean(config?.spreadsheetId) })
+  const database = await databaseStatus().catch(() => ({ configured: false, connected: false, vehicles: 0 }))
+  return emptySnapshot(session, config, {
+    sheetsConnected: Boolean(config?.spreadsheetId),
+    databaseConnected: database.connected,
+    databaseVehicles: database.vehicles,
+  })
+}
+
+export async function syncRegisterToDatabase() {
+  const session = await requireSession()
+  const config = await requireConfig()
+  if (!databaseConfigured()) {
+    throw new Error('Add DATABASE_URL from Neon to .env, run npx prisma db push, then restart npm run dev.')
+  }
+  if (!config.spreadsheetId) throw new Error('Pick Fleet Assets - KE in Settings first. STOCK DOCUMENTS is a tab on that workbook.')
+  const sheet = await readStockRegisterSnapshot(config, { fresh: true })
+  if (sheet.error) throw new Error(sheet.error)
+  const covers = await loadInsuranceCovers(config).catch(() => ({} as Record<string, InsuranceCover>))
+  const vehicles = attachInsurance(sheet.vehicles, covers)
+  const result = await importVehiclesToDatabase(vehicles)
+  const database = await databaseStatus()
+  return emptySnapshot(session, config, {
+    lastSync: new Date().toISOString(),
+    sheetsConnected: true,
+    databaseConnected: database.connected,
+    databaseVehicles: database.vehicles,
+    ingest: {
+      watching: 'Neon',
+      attempted: vehicles.length,
+      renamed: result.imported,
+      notice: `Imported ${result.imported} rows from the STOCK DOCUMENTS tab on ${config.spreadsheetName || 'Fleet Assets - KE'} into Neon.`,
+    },
+  })
 }
 
 export async function loadVehiclePage(input: VehicleQuery = {}) {
   await requireSession()
   const config = await loadConfig()
+  if (databaseConfigured()) {
+    const database = await databaseStatus().catch(() => ({ connected: false, vehicles: 0 }))
+    if (database.connected && database.vehicles > 0) {
+      try {
+        const fromDb = await loadRegisterFromDatabase(input)
+        return { ...fromDb, error: undefined as string | undefined }
+      } catch (err) {
+        return {
+          vehicles: [] as VehicleRecord[],
+          total: 0,
+          page: 1,
+          pageSize: input.pageSize || 25,
+          stats: EMPTY_STATS,
+          insuranceAlerts: [] as FleetSnapshot['insuranceAlerts'],
+          error: err instanceof Error ? err.message : 'Unable to read the Neon register',
+        }
+      }
+    }
+  }
   if (!config?.spreadsheetId) {
-    return { vehicles: [] as VehicleRecord[], total: 0, page: 1, pageSize: input.pageSize || 25, stats: EMPTY_STATS, error: undefined as string | undefined }
+    return { vehicles: [] as VehicleRecord[], total: 0, page: 1, pageSize: input.pageSize || 25, stats: EMPTY_STATS, insuranceAlerts: [] as FleetSnapshot['insuranceAlerts'], error: undefined as string | undefined }
   }
   const sheet = await readStockRegisterSnapshot(config)
-  const filtered = filterVehicles(sheet.vehicles, input)
+  let covers = await loadInsuranceCovers(config).catch(() => ({} as Record<string, InsuranceCover>))
+  const filtered = filterVehicles(attachInsurance(sheet.vehicles, covers), input)
   const pageSize = Math.min(100, Math.max(10, input.pageSize || 25))
   const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize))
   const page = Math.min(Math.max(1, input.page || 1), totalPages)
   const start = (page - 1) * pageSize
+  const pageVehicles = filtered.slice(start, start + pageSize)
+  covers = await fillMissingCertificateCovers(config, pageVehicles, covers)
+  const withCover = attachInsurance(sheet.vehicles, covers)
   return {
-    vehicles: filtered.slice(start, start + pageSize).map(slimVehicle),
+    vehicles: attachInsurance(pageVehicles, covers).map(slimVehicle),
     total: filtered.length,
     page,
     pageSize,
-    stats: statsFor(sheet.vehicles),
+    stats: statsFor(withCover),
+    insuranceAlerts: insuranceAlertsFor(covers),
     error: sheet.error,
   }
 }
@@ -99,14 +171,20 @@ export async function loadVehiclePage(input: VehicleQuery = {}) {
 export async function exportVehicleRegister(input: VehicleQuery = {}) {
   await requireSession()
   const config = await loadConfig()
-  const vehicles = config?.spreadsheetId ? filterVehicles((await readStockRegisterSnapshot(config)).vehicles, input) : []
-  const rows = [['Plate', 'Brand', 'Logbook', 'Certificate', 'Photo', 'Collateral', 'Status', 'Updated'], ...vehicles.map((vehicle) => [
+  const fromDb = databaseConfigured() ? await databaseStatus().catch(() => ({ connected: false, vehicles: 0 })) : { connected: false, vehicles: 0 }
+  const vehicles = fromDb.connected && fromDb.vehicles
+    ? await loadExportedRegister(input)
+    : config?.spreadsheetId ? filterVehicles(attachInsurance((await readStockRegisterSnapshot(config)).vehicles, await loadInsuranceCovers(config).catch(() => ({}))), input) : []
+  const rows = [['Plate', 'Brand', 'Logbook', 'Agreement', 'Certificate', 'Photo', 'Collateral', 'Commencement', 'Expiry', 'Status', 'Updated'], ...vehicles.map((vehicle) => [
     vehicle.plate,
     vehicle.brand || '',
     vehicle.files.logbook.length ? 'yes' : 'no',
+    vehicle.agreement ? 'yes' : 'no',
     vehicle.files.certificate.length ? 'yes' : 'no',
     vehicle.files.photo.length ? 'yes' : 'no',
     vehicle.collateral ? 'yes' : 'no',
+    vehicle.insurance?.commencement || '',
+    vehicle.insurance?.expiry || '',
     vehicle.status,
     vehicle.updated,
   ])]
@@ -143,6 +221,10 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
       ? { watching: '', attempted: 0, renamed: 0, remaining: 0, more: false, error: undefined, renamedFiles: [] as TypedFile[], started: false, focus: undefined }
       : await ingestIncoming(config, session.name, mode, listed.files, preview.plates, jobFocus || 'all')
     files = mergeTypedFiles(listed.files, ingest.renamedFiles)
+    if (!isProcessRunning()) {
+      const cleared = await clearUnmatchedFolderMarks(files)
+      if (cleared.length) files = mergeTypedFiles(files, cleared)
+    }
   } catch (err) {
     ingest = { watching: '', attempted: 0, renamed: 0, remaining: 0, more: false, error: err instanceof Error ? err.message : 'Drive scan failed', renamedFiles: [], started: ingest.started, focus: jobFocus }
     const ingestGen = processGeneration()
@@ -165,12 +247,21 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
     skipExtras || continuing ? Promise.resolve([] as FleetSnapshot['audit']) : loadAudit().catch(() => [] as FleetSnapshot['audit']),
     skipExtras || continuing ? Promise.resolve(emptyGmail) : loadGmailState().catch(() => emptyGmail),
   ])
-  const registerVehicles = vehicles.length ? vehicles : preview.vehicles
+  const covers = await loadInsuranceCovers(config).catch(() => ({} as Awaited<ReturnType<typeof loadInsuranceCovers>>))
+  if (!skipSheetWrite && Object.keys(covers).length) {
+    await writeInsuranceDates(config, covers, continuing ? 'match' : mode).catch(() => ({ written: 0 }))
+  }
+  const filledCovers = skipOcr && !isProcessRunning()
+    ? await backfillInsuranceCovers(config, files, covers)
+    : covers
+  const registerVehicles = attachInsurance(vehicles.length ? vehicles : preview.vehicles, filledCovers)
+  const database = await databaseStatus().catch(() => ({ configured: false, connected: false, vehicles: 0 }))
   return {
     user: { name: session.name, email: session.email, image: session.image },
     config,
     vehicles: [],
     unmatched,
+    insuranceAlerts: insuranceAlertsFor(filledCovers),
     inbox: gmail.state.items,
     audit,
     stats: statsFor(registerVehicles),
@@ -179,6 +270,8 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
     driveConnected: true,
     ocrConfigured: ocrConfigured(),
     sheetsConnected: Boolean(config.spreadsheetId) && !sheet.error && !preview.error,
+    databaseConnected: database.connected,
+    databaseVehicles: database.vehicles,
     sheetsError: sheet.error || preview.error,
     ingest: {
       ...ingest,
@@ -218,19 +311,24 @@ export async function saveFolderConfig(input: {
   logbooksId: string
   certificatesId: string
   photosId: string
+  agreementsId?: string
   collateralId?: string
   spreadsheetId?: string
   autoUploadThreshold: number
+  insuranceInboxEmail?: string
+  logbooksInboxEmail?: string
 }) {
   const session = await requireSession()
   const previous = await loadConfig()
   const collateralId = input.collateralId || previous?.collateralId
+  const agreementsId = input.agreementsId || previous?.agreementsId
   const names = await Promise.allSettled([
     resolveFolderName(input.logbooksId),
     resolveFolderName(input.certificatesId),
     resolveFolderName(input.photosId),
     collateralId ? resolveFolderName(collateralId) : Promise.resolve(''),
     input.spreadsheetId ? resolveFolderName(input.spreadsheetId) : Promise.resolve(''),
+    agreementsId ? resolveFolderName(agreementsId) : Promise.resolve(''),
   ])
   const settled = (index: number, fallback: string) => names[index].status === 'fulfilled' ? names[index].value : fallback
   const logbooksName = settled(0, previous?.logbooksName || input.logbooksId)
@@ -238,25 +336,31 @@ export async function saveFolderConfig(input: {
   const photosName = settled(2, previous?.photosName || input.photosId)
   const collateralName = settled(3, previous?.collateralName || '')
   const spreadsheetName = settled(4, previous?.spreadsheetName || '')
+  const agreementsName = settled(5, previous?.agreementsName || '')
   const config = await saveConfig({
     ...(previous || { logbooksId: input.logbooksId, certificatesId: input.certificatesId, photosId: input.photosId, autoUploadThreshold: input.autoUploadThreshold }),
     ...input,
     logbooksId: input.logbooksId,
     certificatesId: input.certificatesId,
     photosId: input.photosId,
+    agreementsId,
     logbooksName,
     certificatesName,
     photosName,
+    agreementsName: agreementsName || undefined,
     collateralId,
     collateralName: collateralName || undefined,
     spreadsheetId: input.spreadsheetId || undefined,
     spreadsheetName: spreadsheetName || undefined,
+    insuranceInboxEmail: isInboxEmail(input.insuranceInboxEmail) ? cleanInboxEmail(input.insuranceInboxEmail) : '',
+    logbooksInboxEmail: isInboxEmail(input.logbooksInboxEmail) ? cleanInboxEmail(input.logbooksInboxEmail) : '',
     lastSync: new Date().toISOString(),
   })
   try {
     await appendAudit(config, session.name, 'Updated Drive folder configuration')
   } catch { /* keep the saved folders even if the audit log write fails */ }
   const audit = await loadAudit().catch(() => [] as FleetSnapshot['audit'])
+  const watching = [logbooksName, certificatesName, photosName, agreementsName].filter(Boolean).join(', ')
   return {
     user: { name: session.name, email: session.email, image: session.image },
     config,
@@ -269,7 +373,7 @@ export async function saveFolderConfig(input: {
     driveConnected: true,
     ocrConfigured: ocrConfigured(),
     sheetsConnected: Boolean(config.spreadsheetId),
-    ingest: { watching: [logbooksName, certificatesName, photosName].join(', '), attempted: 0, renamed: 0 },
+    ingest: { watching, attempted: 0, renamed: 0 },
   }
 }
 
@@ -288,82 +392,136 @@ export async function uploadDocument(formData: FormData) {
   }
   const auto = Boolean(match.plate && match.confidence >= (config.autoUploadThreshold ?? 85))
   const name = auto && match.plate ? suggestedName(match.plate, type, file.name) : file.name
-  const uploaded = await uploadBinary(folderIdForType(config, type), name, bytes, file.type || 'application/octet-stream')
+  const folderId = folderIdForType(config, type)
+  if (!folderId) throw new Error(type === 'agreement' ? 'Choose the agreements Drive folder in Settings first.' : 'Choose the Drive folder for that document type in Settings.')
+  const uploaded = await uploadBinary(folderId, name, bytes, file.type || 'application/octet-stream')
   await appendAudit(config, session.name, `Uploaded ${uploaded.name} to ${folderNameForType(config, type)}`)
   await touchSync(config)
   return loadFleet()
 }
 
-export async function assignUnmatched(input: { fileId: string; plate: string; type: DocType; currentType: DocType; name: string }) {
-  const session = await requireSession()
-  const config = await requireConfig()
+type AssignUnmatchedInput = { fileId: string; plate: string; type: DocType; currentType: DocType; name: string }
+
+async function applyManualAssignment(config: FleetConfig, user: string, input: AssignUnmatchedInput) {
   const plate = parseKenyanPlate(input.plate)
-  if (!plate) throw new Error('Enter a Kenyan registration number, for example KMHE520A.')
+  if (!plate) throw new Error(`Enter a Kenyan registration number for ${input.name}, for example KMHE520A.`)
   const currentFolder = folderIdForType(config, input.currentType)
   const nextFolder = folderIdForType(config, input.type)
+  if (!nextFolder) throw new Error(input.type === 'agreement' ? 'Choose the agreements Drive folder in Settings first.' : 'Choose the Drive folder for that document type in Settings.')
   const file = await moveAndRename(input.fileId, {
     name: suggestedName(plate, input.type, input.name),
     addParent: currentFolder !== nextFolder ? nextFolder : undefined,
     removeParent: currentFolder !== nextFolder ? currentFolder : undefined,
   })
-  await appendAudit(config, session.name, `Assigned ${file.name} as ${input.type} for ${plate}`)
+  await appendAudit(config, user, `Assigned ${file.name} as ${input.type} for ${plate}`)
+  return plate
+}
+
+export async function assignUnmatched(input: AssignUnmatchedInput) {
+  const session = await requireSession()
+  const config = await requireConfig()
+  await applyManualAssignment(config, session.name, input)
   await touchSync(config)
   return loadFleet()
+}
+
+export async function assignUnmatchedBatch(inputs: AssignUnmatchedInput[]) {
+  const session = await requireSession()
+  const config = await requireConfig()
+  if (!inputs.length) throw new Error('Enter registration numbers on the files you want to assign, then assign them together.')
+  const failed: string[] = []
+  let assigned = 0
+  for (const input of inputs) {
+    try {
+      await applyManualAssignment(config, session.name, input)
+      assigned += 1
+    } catch (err) {
+      failed.push(err instanceof Error ? err.message : `Could not assign ${input.name}.`)
+    }
+  }
+  await touchSync(config)
+  const fleet = await loadFleet()
+  if (!assigned) throw new Error(failed[0] || 'Could not assign those files.')
+  if (failed.length) {
+    return {
+      ...fleet,
+      ingest: {
+        watching: fleet.ingest?.watching || '',
+        attempted: assigned,
+        renamed: assigned,
+        notice: `Assigned ${assigned}. Could not assign ${failed.length}: ${failed.join(' ')}`,
+      },
+    }
+  }
+  return fleet
 }
 
 export async function syncGmail() {
   const session = await requireSession()
   const config = await requireConfig()
   const { state, fileId } = await loadGmailState()
-  const messages = await listRecentMessages()
   const items: InboxItem[] = [...state.items]
   const processed = new Set(state.processedIds)
+  const insuranceEmail = isInboxEmail(config.insuranceInboxEmail)
+  const logbooksEmail = isInboxEmail(config.logbooksInboxEmail)
+  const mailboxes: { type: DocType; query: string }[] = []
+  if (insuranceEmail) mailboxes.push({ type: 'certificate', query: mailboxSearchQuery(config.insuranceInboxEmail || '') })
+  else if (!logbooksEmail) mailboxes.push({ type: 'certificate', query: 'has:attachment newer_than:21d' })
+  if (logbooksEmail) mailboxes.push({ type: 'logbook', query: mailboxSearchQuery(config.logbooksInboxEmail || '') })
 
-  for (const listed of messages) {
-    if (processed.has(listed.id)) continue
-    const message = await getMessage(listed.id)
-    const meta = messageMeta(message)
-    const attachments = findAttachments(message.payload).filter((item) => /\.(pdf|png|jpe?g|webp|tif?f|heic)$/i.test(item.filename))
-    processed.add(listed.id)
-    if (!attachments.length) continue
-    for (const attachment of attachments) {
-      const bytes = await getAttachment(listed.id, attachment.attachmentId)
-      let match = { plate: null as string | null, confidence: 0 }
-      try {
-        match = await resolvePlateFromFile({
-          filename: attachment.filename,
-          subject: meta.subject,
-          body: `${meta.snippet} ${meta.from}`,
-          bytes,
-          mimeType: attachment.mimeType,
+  for (const mailbox of mailboxes) {
+    const messages = await listRecentMessages(mailbox.query)
+    for (const listed of messages) {
+      if (processed.has(`${mailbox.type}:${listed.id}`)) continue
+      const message = await getMessage(listed.id)
+      const meta = messageMeta(message)
+      const attachments = findAttachments(message.payload).filter((item) => /\.(pdf|png|jpe?g|webp|tif?f|heic)$/i.test(item.filename))
+      processed.add(`${mailbox.type}:${listed.id}`)
+      if (!attachments.length) continue
+      for (const attachment of attachments) {
+        const bytes = await getAttachment(listed.id, attachment.attachmentId)
+        let match = { plate: null as string | null, confidence: 0 }
+        try {
+          match = await resolvePlateFromFile({
+            filename: attachment.filename,
+            subject: meta.subject,
+            body: `${meta.snippet} ${meta.from}`,
+            bytes,
+            mimeType: attachment.mimeType,
+            kind: mailbox.type,
+          })
+        } catch (err) {
+          await appendAudit(config, 'System', `OCR skipped for ${attachment.filename}: ${err instanceof Error ? err.message : 'OCR error'}`)
+        }
+        const auto = Boolean(match.confidence >= (config.autoUploadThreshold ?? 85) && match.plate)
+        const name = auto && match.plate ? suggestedName(match.plate, mailbox.type, attachment.filename) : attachment.filename
+        const uploaded = await uploadBinary(folderIdForType(config, mailbox.type), name, bytes, attachment.mimeType)
+        if (mailbox.type === 'certificate' && auto && match.plate) {
+          await fillInsuranceCover(config, { ...uploaded, type: 'certificate', plate: match.plate }).catch(() => {})
+        }
+        items.unshift({
+          id: `${listed.id}:${attachment.attachmentId}:${mailbox.type}`,
+          sender: meta.from,
+          subject: meta.subject || (mailbox.type === 'logbook' ? 'Logbook attachment' : 'Insurance attachment'),
+          attachment: uploaded.name,
+          received: formatTime(meta.date || new Date(Number(message.internalDate)).toISOString()),
+          vehicle: match.plate || 'No plate detected',
+          confidence: match.confidence,
+          status: auto ? 'Auto-uploaded' : 'Needs review',
+          fileId: uploaded.id,
+          folder: auto ? folderNameForType(config, mailbox.type) : 'Needs plate in filename',
+          type: mailbox.type,
         })
-      } catch (err) {
-        await appendAudit(config, 'System', `OCR skipped for ${attachment.filename}: ${err instanceof Error ? err.message : 'OCR error'}`)
+        await appendAudit(
+          config,
+          auto ? 'System' : session.name,
+          auto ? `Matched ${uploaded.name} to ${match.plate}` : `Stored unmatched ${mailbox.type} attachment ${uploaded.name}`,
+        )
       }
-      const auto = match.confidence >= (config.autoUploadThreshold ?? 85) && match.plate
-      const name = auto && match.plate ? suggestedName(match.plate, 'certificate', attachment.filename) : attachment.filename
-      const uploaded = await uploadBinary(config.certificatesId, name, bytes, attachment.mimeType)
-      items.unshift({
-        id: `${listed.id}:${attachment.attachmentId}`,
-        sender: meta.from,
-        subject: meta.subject || 'Insurance attachment',
-        attachment: uploaded.name,
-        received: formatTime(meta.date || new Date(Number(message.internalDate)).toISOString()),
-        vehicle: match.plate || 'No plate detected',
-        confidence: match.confidence,
-        status: auto ? 'Auto-uploaded' : 'Needs review',
-        fileId: uploaded.id,
-        folder: auto ? folderNameForType(config, 'certificate') : 'Needs plate in filename',
-      })
-      await appendAudit(
-        config,
-        auto ? 'System' : session.name,
-        auto ? `Matched ${uploaded.name} to ${match.plate}` : `Stored unmatched attachment ${uploaded.name}`,
-      )
     }
   }
 
-  const nextState = { lastSync: new Date().toISOString(), processedIds: [...processed], items: items.slice(0, 50) }
+  const nextState = { lastSync: new Date().toISOString(), processedIds: [...processed], items: items.slice(0, 80) }
   await saveGmailState(config, nextState, fileId)
   await touchSync(config, nextState.lastSync)
   return loadFleet()
@@ -406,6 +564,22 @@ export async function runProcessing(focus: ProcessFocus = 'all') {
   return loadFleet('full', false, focus)
 }
 
+export async function continueProcessing() {
+  await requireSession()
+  const live = getProcessJob()
+  const focus = (live.focus || lastAction().focus || 'all') as ProcessFocus
+  if (live.cancelled || lastAction().status === 'paused' || lastAction().status === 'done') {
+    return loadFleet('auto', true, 'off')
+  }
+  recordLastAction({
+    focus,
+    status: 'running',
+    detail: `Starting the next ${processFocusLabel(focus)} batch`,
+  })
+  attachLastAction(lastAction())
+  return loadFleet('full', false, focus)
+}
+
 export async function stopProcessing() {
   await requireSession()
   const config = await loadConfig()
@@ -429,7 +603,8 @@ export async function ocrUnmatchedPhotos(fileId?: string) {
   if (!ocrConfigured()) {
     throw new Error('Photo OCR is not available. Restart the app after installing tesseract.js.')
   }
-  const { unmatched, files } = await scanFolders(config, undefined, undefined, undefined, { fresh: true })
+  const preview = config.spreadsheetId ? await readStockRegisterSnapshot(config) : { plates: new Set<string>() }
+  const { unmatched, files } = await scanFolders(config, preview.plates, undefined, undefined, { fresh: true })
   const target = fileId ? files.find((file) => file.id === fileId) || unmatched.find((file) => file.id === fileId) : undefined
   if (fileId) forgetFile(fileId)
   const readable = unmatched.filter((file) => isOcrImage(file.mimeType, file.name) || plateFromText(file.name))
@@ -437,17 +612,19 @@ export async function ocrUnmatchedPhotos(fileId?: string) {
   const remainingAfter = Math.max(0, waiting.length - OCR_BATCH)
   const candidates = waiting.slice(0, OCR_BATCH)
   if (!candidates.length) {
-    throw new Error(fileId ? 'That file is not a JPEG, PNG, or PDF Fleetwise can OCR.' : 'No unmatched photos or insurance files to OCR.')
+    throw new Error(fileId ? 'That file is not a JPEG, PNG, or PDF Fleetwise can OCR.' : 'No unmatched photos, insurance, logbook, or agreement files to OCR.')
   }
   if (isProcessRunning()) {
     throw new Error('A processing run is already live. Open Processing to watch it.')
   }
   beginProcessJob('Unmatched', candidates, 'repair')
   let renamed = 0
+  const takenNames = new Set(files.map((file) => file.name))
   try {
     await mapPool(candidates, fileId ? 1 : OCR_CONCURRENCY, async (file) => {
       try {
-        const result = await ocrAndRename(config, session.name, file, { verify: true })
+        const result = await ocrMatchFile(config, session.name, file, { sheetPlates: preview.plates, takenNames })
+        if (result.file?.name) takenNames.add(result.file.name)
         renamed += result.renamed
         if (result.plate) markTried(file.id)
         recordLastAction({ focus: 'repair', status: 'running', fileId: file.id, fileName: result.file?.name || file.name, plate: result.plate || undefined })
@@ -474,16 +651,77 @@ export async function ocrUnmatchedPhotos(fileId?: string) {
   return next
 }
 
-async function ocrAndRename(config: FleetConfig, user: string, file: TypedFile, options: { verify?: boolean } = {}) {
+function plateOnRegister(plate: string | null | undefined, sheetPlates?: Set<string>) {
+  if (!plate || !sheetPlates?.size) return false
+  return sheetPlates.has(compactPlate(plate))
+}
+
+async function ocrMatchFile(config: FleetConfig, user: string, file: TypedFile, options: { verify?: boolean; sheetPlates?: Set<string>; focus?: ProcessFocus; takenNames?: Set<string> } = {}) {
+  const certificate = isPlatePdf(file.type)
+  const repair = isRepairFocus(options.focus)
+  if (repair || certificate) forgetFile(file.id)
+  const first = await ocrAndRename(config, user, file, { ...options, verify: false, forceRaster: false, reopen: repair || certificate })
+  if (certificate) {
+    const printed = (file.type === 'logbook' || file.type === 'agreement'
+      ? plateFromLogbookText(first.text || '') || printedRegistrationPlate(first.text || '')
+      : printedRegistrationPlate(first.text || '')) || first.plate
+    const named = plateFromTypedName(first.file?.name || file.name, file.type) || plateFromText(first.file?.name || file.name)
+    const filenameWrong = Boolean(printed && named && compactPlate(named) !== compactPlate(printed))
+    if (!repair && !filenameWrong && (plateOnRegister(printed, options.sheetPlates) || !options.sheetPlates?.size)) return first
+    forgetFile(file.id)
+    const retry = first.file || file
+    touchProcessItem(file.id, {
+      stage: 'opening',
+      detail: filenameWrong
+        ? `Filename has ${named} but the PDF reads ${printed}. Reopening to rename from REGISTRATION No`
+        : first.plate
+          ? `${first.plate} did not match STOCK DOCUMENTS. Reopening ${file.name} to confirm REGISTRATION No`
+          : `Reopening ${file.name} to confirm REGISTRATION No`,
+      plate: printed,
+      name: retry.name,
+      type: file.type,
+      mimeType: file.mimeType,
+    })
+    return ocrAndRename(config, user, retry, {
+      verify: true,
+      forceRaster: true,
+      reopen: true,
+      sheetPlates: options.sheetPlates,
+    })
+  }
+  if (first.plate || options.verify || file.type === 'photo') return first
+  forgetFile(file.id)
+  const retry = first.file || file
+  touchProcessItem(file.id, {
+    stage: 'opening',
+    detail: `No plate yet. Reopening ${file.name} to read the registration number`,
+    name: retry.name,
+    type: file.type,
+    mimeType: file.mimeType,
+  })
+  return ocrAndRename(config, user, retry, { verify: true, sheetPlates: options.sheetPlates, reopen: true })
+}
+
+async function ocrAndRename(config: FleetConfig, user: string, file: TypedFile, options: { verify?: boolean; sheetPlates?: Set<string>; forceRaster?: boolean; reopen?: boolean; takenNames?: Set<string> } = {}) {
   const typedPlate = plateFromTypedName(file.name, file.type)
-  const named = typedPlate || plateFromText(file.name)
+  const named = typedPlate || (file.type === 'logbook' || file.type === 'agreement' ? extractKenyanPlate(file.name) : plateFromText(file.name))
   const readable = isOcrImage(file.mimeType, file.name)
-  const usesRegistrationField = file.type === 'certificate' || file.type === 'logbook'
-  if (hasCanonicalName(file) && !options.verify) {
+  const usesRegistrationField = isPlatePdf(file.type)
+  if (hasCanonicalName(file) && !options.verify && !options.forceRaster && plateOnRegister(typedPlate || named, options.sheetPlates)) {
     const plate = typedPlate || named
     const name = file.name
     touchProcessItem(file.id, { stage: 'matching', detail: `Already named ${name}`, plate, name, type: file.type, mimeType: file.mimeType })
+    if (file.type === 'certificate' && plate) await fillInsuranceCover(config, { ...file, plate })
     return { renamed: 0, text: '', name, plate, file: { ...file, name, plate, type: file.type } }
+  }
+  if ((file.type === 'logbook' || file.type === 'agreement') && named && !hasCanonicalName(file) && !options.verify && !options.forceRaster) {
+    const name = uniqueSuggestedName(named, file.type, file.name, options.takenNames)
+    touchProcessItem(file.id, { stage: 'renaming', detail: `Renaming to ${name}`, plate: named, name: file.name, type: file.type, mimeType: file.mimeType })
+    if (name === file.name) return { renamed: 0, text: '', name, plate: named, file: { ...file, name, plate: named, type: file.type } }
+    const updated = await moveAndRename(file.id, { name })
+    await appendAudit(config, user, `Normalized ${file.name} to ${name}`)
+    touchProcessItem(file.id, { stage: 'renaming', detail: `Renamed to ${name}`, plate: named, name })
+    return { renamed: 1, text: '', name, plate: named, file: { ...file, ...updated, name, plate: named, type: file.type } }
   }
   if (typedPlate && !readable && !usesRegistrationField) {
     const name = suggestedName(typedPlate, file.type, file.name)
@@ -496,7 +734,9 @@ async function ocrAndRename(config: FleetConfig, user: string, file: TypedFile, 
   }
   touchProcessItem(file.id, {
     stage: 'opening',
-    detail: usesRegistrationField ? `Opening the PDF to read REGISTRATION No on ${file.name}` : 'Downloading from Drive',
+    detail: options.verify
+      ? (usesRegistrationField ? `Reopening the PDF to correct REGISTRATION No on ${file.name}` : `Reopening ${file.name} to correct the registration number`)
+      : usesRegistrationField ? `Opening the PDF to read REGISTRATION No on ${file.name}` : 'Downloading from Drive',
     plate: named,
     name: file.name,
     type: file.type,
@@ -507,20 +747,24 @@ async function ocrAndRename(config: FleetConfig, user: string, file: TypedFile, 
     : { bytes: await downloadBinary(file.id), mime: file.mimeType, filename: file.name }
   touchProcessItem(file.id, {
     stage: 'reading',
-    detail: usesRegistrationField ? 'Reading REGISTRATION No inside the certificate' : named ? `Re-reading the registration number on ${file.name}` : 'Reading the registration number',
+    detail: usesRegistrationField
+      ? 'Reading REGISTRATION No inside the certificate'
+      : named
+        ? `Re-reading the plate on the photo ${file.name}`
+        : 'Reading the plate on the photo',
   })
-  const ocr = await plateFromImage(downloaded.bytes, downloaded.mime || file.mimeType, downloaded.filename || file.name, usesRegistrationField ? 'certificate' : file.type)
-  const labeled = usesRegistrationField ? plateFromCertificateText(ocr.text) : null
+  const ocrKind = usesRegistrationField ? (options.forceRaster ? 'pdf-confirm' : file.type === 'certificate' ? 'certificate' : 'logbook') : file.type
+  const ocr = await plateFromImage(downloaded.bytes, downloaded.mime || file.mimeType, downloaded.filename || file.name, ocrKind)
+  const labeled = usesRegistrationField
+    ? (file.type === 'certificate'
+      ? (printedRegistrationPlate(ocr.text) || plateFromCertificateText(ocr.text))
+      : (plateFromLogbookText(ocr.text) || printedRegistrationPlate(ocr.text) || plateFromCertificateText(ocr.text)))
+    : null
   const documentPlate = parseKenyanPlate(labeled || (usesRegistrationField ? pickOcrPlate(ocr.text, 'certificate') : ocr.plate) || '')
   if (documentPlate) markConfirmed(file.id, documentPlate)
-  let plate = usesRegistrationField ? documentPlate : (documentPlate || parseKenyanPlate(named || ''))
+  let plate = documentPlate
   if (usesRegistrationField) {
-    if (documentPlate) {
-      if (named && compactPlate(named) !== compactPlate(documentPlate)) {
-        await appendAudit(config, user, `Certificate ${file.name} was named ${named} but REGISTRATION No on the PDF reads ${documentPlate}; renaming from the document`)
-      }
-      plate = documentPlate
-    } else {
+    if (!documentPlate) {
       const error = `Couldn't read REGISTRATION No inside ${file.name}. Open the PDF, or type the plate on Unmatched if you can see it.`
       touchProcessItem(file.id, { stage: 'unmatched', detail: error })
       return {
@@ -531,51 +775,160 @@ async function ocrAndRename(config: FleetConfig, user: string, file: TypedFile, 
         error,
       }
     }
+    if (named && compactPlate(named) !== compactPlate(documentPlate)) {
+      await appendAudit(config, user, `Certificate ${file.name} was named ${named} but REGISTRATION No on the PDF reads ${documentPlate}; renaming from the document`)
+    }
+    plate = documentPlate
   }
-  if (!plate) {
-    touchProcessItem(file.id, { stage: 'unmatched', detail: `Couldn't read a Kenyan plate on ${file.name}.` })
+  if (!plate || /^UNREADABLE$/i.test(plate)) {
+    const namedBike = file.type === 'photo'
+      ? (parsePhotoPlate(named) || parsePhotoPlate(file.name) || parsePhotoPlate(extractKenyanPlate(file.name) || ''))
+      : null
+    if (namedBike) plate = namedBike
+  }
+  if (!plate || /^UNREADABLE$/i.test(plate)) {
+    touchProcessItem(file.id, { stage: 'unmatched', detail: usesRegistrationField ? `Couldn't read REGISTRATION No inside ${file.name}.` : `Couldn't read a plate on the photo ${file.name}.` })
     return { renamed: 0, text: ocr.text, name: file.name, plate: null as string | null }
   }
-  const name = suggestedName(plate, file.type, file.name)
+  if (file.type === 'certificate') await rememberInsuranceCover(config, plate, ocr.text)
+  const name = uniqueSuggestedName(plate, file.type, file.name, options.takenNames)
+  const source = usesRegistrationField ? 'REGISTRATION No on the PDF' : 'the plate on the photo'
   if (named && documentPlate && compactPlate(named) === compactPlate(documentPlate) && name === file.name) {
-    touchProcessItem(file.id, { stage: 'renaming', detail: `Checked ${plate} — the filename already matches REGISTRATION No`, plate, name: file.name })
+    touchProcessItem(file.id, { stage: 'renaming', detail: `Checked ${plate} — the filename already matches ${source}`, plate, name: file.name })
     return { renamed: 0, text: ocr.text, name, plate, file: { ...file, name, plate, type: file.type } }
   }
   touchProcessItem(file.id, {
     stage: 'renaming',
-    detail: `REGISTRATION No ${plate} — renaming to ${name}`,
+    detail: usesRegistrationField ? `REGISTRATION No ${plate} — renaming to ${name}` : `Plate ${plate} on the photo — renaming to ${name}`,
     plate,
     name: file.name,
   })
   if (name === file.name) {
-    touchProcessItem(file.id, { stage: 'matching', detail: `Named ${name} from REGISTRATION No on the PDF. Matching on STOCK DOCUMENTS`, plate, name })
+    touchProcessItem(file.id, { stage: 'matching', detail: `Named ${name} from ${source}. Matching on STOCK DOCUMENTS`, plate, name })
     return { renamed: 0, text: ocr.text, name, plate, file: { ...file, name, plate, type: file.type } }
   }
   const updated = await moveAndRename(file.id, { name })
-  await appendAudit(config, user, `Opened ${file.name} and renamed to ${name} from REGISTRATION No`)
-  touchProcessItem(file.id, { stage: 'matching', detail: `Renamed to ${name} from REGISTRATION No on the PDF`, plate, name })
+  await appendAudit(config, user, `Opened ${file.name} and renamed to ${name} from ${source}`)
+  touchProcessItem(file.id, { stage: 'matching', detail: `Renamed to ${name} from ${source}`, plate, name })
   return { renamed: 1, text: ocr.text, name, plate, file: { ...file, ...updated, name, plate, type: file.type } }
 }
 
-function watchingLabel(config: FleetConfig, focus: ProcessFocus) {
-  if (focus === 'photos') return config.photosName || 'photos'
-  if (focus === 'certificates') return config.certificatesName || 'certificates'
-  if (focus === 'repair') return 'wrong matches'
-  return [config.photosName || 'photos', config.certificatesName || 'certificates', config.logbooksName || 'logbooks'].join(', ')
+async function rememberInsuranceCover(config: FleetConfig, plate: string, text: string) {
+  const cover = parseInsuranceCover(text)
+  if (!cover.commencement && !cover.expiry) return
+  await saveInsuranceCover(config, plate, cover)
 }
 
-function pendingForFocus(file: TypedFile, focus: ProcessFocus, sheetPlates?: Set<string>) {
+function certificateFileId(file?: { id?: string; webViewLink?: string }) {
+  if (!file) return ''
+  if (file.id && !file.id.startsWith('sheet:')) return file.id
+  return driveIdFromUri(file.webViewLink || '') || ''
+}
+
+async function readCoverFromDriveFile(file: { id?: string; name?: string; mimeType?: string; webViewLink?: string }, ocr = false) {
+  const id = certificateFileId(file)
+  if (!id) return { commencement: null, expiry: null } as InsuranceCover
+  const downloaded = (file.mimeType || '').startsWith('application/vnd.google-apps.')
+    ? await downloadNamedFile(id)
+    : { bytes: await downloadBinary(id), mime: file.mimeType, filename: file.name }
+  return coverFromCertificate(downloaded.bytes, downloaded.mime || file.mimeType, downloaded.filename || file.name, ocr)
+}
+
+async function fillMissingCertificateCovers(config: FleetConfig, vehicles: VehicleRecord[], covers: Record<string, InsuranceCover>) {
+  const next = { ...covers }
+  const missing = vehicles.filter((vehicle) => {
+    const plate = compactPlate(vehicle.plate)
+    const stored = next[plate]
+    return certificateFileId(vehicle.files.certificate[0]) && (!stored?.commencement || !stored?.expiry)
+  }).slice(0, 8)
+  if (!missing.length) return next
+  let changed = false
+  await mapPool(missing, 3, async (vehicle) => {
+    const plate = compactPlate(vehicle.plate)
+    try {
+      const cover = await Promise.race([
+        readCoverFromDriveFile(vehicle.files.certificate[0], false),
+        new Promise<InsuranceCover>((_, reject) => setTimeout(() => reject(new Error('timeout')), 12_000)),
+      ])
+      if (!cover.commencement && !cover.expiry) return
+      const previous = next[plate] || { commencement: null, expiry: null }
+      next[plate] = {
+        commencement: cover.commencement || previous.commencement,
+        expiry: cover.expiry || previous.expiry,
+      }
+      changed = true
+    } catch {
+      // Leave this row as Not read if the PDF cannot be opened on this pass.
+    }
+  })
+  if (changed) {
+    await saveInsuranceCovers(config, next).catch(() => {})
+    await writeInsuranceDates(config, next, 'auto').catch(() => {})
+  }
+  return next
+}
+
+async function fillInsuranceCover(config: FleetConfig, file: TypedFile) {
+  const plate = compactPlate(file.plate || '')
+  if (!plate) return
+  const existing = await loadInsuranceCovers(config).catch(() => ({} as Awaited<ReturnType<typeof loadInsuranceCovers>>))
+  if (existing[plate]?.commencement && existing[plate]?.expiry) return
+  try {
+    const cover = await readCoverFromDriveFile(file, true)
+    await saveInsuranceCover(config, plate, cover)
+  } catch {
+    // Keep the existing cover if this PDF cannot be opened on this pass.
+  }
+}
+
+async function backfillInsuranceCovers(config: FleetConfig, files: TypedFile[], covers: Awaited<ReturnType<typeof loadInsuranceCovers>>) {
+  const next = { ...covers }
+  const missing = files.filter((file) => {
+    if (file.type !== 'certificate') return false
+    const plate = compactPlate(file.plate || plateFromTypedName(file.name, 'certificate') || plateFromText(file.name) || '')
+    if (!plate) return false
+    return !next[plate]?.expiry || !next[plate]?.commencement
+  }).slice(0, 3)
+  for (const file of missing) {
+    const plate = compactPlate(file.plate || plateFromTypedName(file.name, 'certificate') || plateFromText(file.name) || '')
+    await fillInsuranceCover(config, { ...file, plate })
+    const updated = await loadInsuranceCovers(config).catch(() => next)
+    Object.assign(next, updated)
+  }
+  return next
+}
+
+function watchingLabel(config: FleetConfig, focus: ProcessFocus) {
+  if (focus === 'photos' || focus === 'repair-photos') return config.photosName || 'photos'
+  if (focus === 'certificates' || focus === 'repair-certificates') return config.certificatesName || 'certificates'
+  if (focus === 'logbooks' || focus === 'repair-logbooks') return config.logbooksName || 'logbooks'
+  if (focus === 'agreements' || focus === 'repair-agreements') return config.agreementsName || 'agreements'
+  if (focus === 'repair') return 'wrong matches'
+  return [config.photosName || 'photos', config.certificatesName || 'certificates', config.logbooksName || 'logbooks', config.agreementsName || 'agreements'].join(', ')
+}
+
+function pendingForFocus(file: TypedFile, focus: ProcessFocus, sheetPlates?: Set<string>, missingDates?: Set<string>) {
   if (!fileMatchesFocus(file, focus)) return false
-  if (focus !== 'repair' && hasCanonicalName(file)) return false
   const named = namedPlateOf(file)
+  const matched = plateOnRegister(named, sheetPlates)
+  const repair = isRepairFocus(focus)
+  const plate = named ? compactPlate(named) : ''
+  const needsDates = file.type === 'certificate' && Boolean(plate && missingDates?.has(plate))
+  if ((file.type === 'logbook' || file.type === 'agreement') && !hasCanonicalName(file) && named) return true
+  if (file.type === 'photo') {
+    if (repair) return isOcrImage(file.mimeType, file.name)
+    if (hasCanonicalName(file) && matched) return false
+    if (!repair && wasTriedRecently(file.id)) return false
+    return isOcrImage(file.mimeType, file.name)
+  }
+  if (matched && !needsDates) return false
+  if (!repair && wasTriedRecently(file.id) && !needsDates) return false
   const readable = isOcrImage(file.mimeType, file.name)
-  if (file.type === 'certificate') {
+  if (isPlatePdf(file.type)) {
     return readable || /\.pdf$/i.test(file.name) || (file.mimeType || '').includes('pdf') || (file.mimeType || '').startsWith('application/vnd.google-apps.')
   }
-  if (wasTriedRecently(file.id) || nameMatchesDocument(file)) return false
+  if (!repair && nameMatchesDocument(file)) return false
   if (!named && !readable) return false
-  const onSheet = Boolean(named && sheetPlates?.has(compactPlate(named)))
-  if (onSheet) return false
   return true
 }
 
@@ -584,10 +937,10 @@ function orderForResume(files: TypedFile[], focus: ProcessFocus) {
   const unnamed = files
     .filter((file) => !hasCanonicalName(file))
     .sort((a, b) => (b.modifiedTime || '').localeCompare(a.modifiedTime || '') || a.id.localeCompare(b.id) || a.name.localeCompare(b.name))
-  if (focus !== 'repair') return unnamed
   const named = files
     .filter((file) => hasCanonicalName(file))
     .sort((a, b) => (a.modifiedTime || '').localeCompare(b.modifiedTime || '') || a.id.localeCompare(b.id) || a.name.localeCompare(b.name))
+  if (!isRepairFocus(focus)) return [...unnamed, ...named]
   if (!lastId) return [...unnamed, ...named]
   const index = named.findIndex((file) => file.id === lastId)
   const rotated = index < 0 ? named : [...named.slice(index + 1), ...named.slice(0, index + 1)]
@@ -597,10 +950,27 @@ function orderForResume(files: TypedFile[], focus: ProcessFocus) {
 async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 'full' = 'auto', files?: TypedFile[], sheetPlates?: Set<string>, focus: ProcessFocus = 'all') {
   const watching = watchingLabel(config, focus)
   const listed = files || (await scanFolders(config)).files
-  const toNormalize = listed.filter((file) => fileMatchesFocus(file, focus) && plateFromTypedName(file.name, file.type) && !hasCanonicalName(file) && !isOcrImage(file.mimeType, file.name))
-  const pending = orderForResume(listed.filter((file) => pendingForFocus(file, focus, sheetPlates)), focus)
-  const remainingAfter = Math.max(0, pending.length - OCR_BATCH)
+  for (const file of listed) {
+    if (file.type !== 'photo') continue
+    if (focus === 'repair-photos' || focus === 'repair' || !hasCanonicalName(file)) forgetFile(file.id)
+  }
+  const covers = await loadInsuranceCovers(config).catch(() => ({} as Record<string, InsuranceCover>))
+  const missingDates = new Set(
+    listed.flatMap((file) => {
+      if (file.type !== 'certificate') return []
+      const plate = compactPlate(file.plate || plateFromTypedName(file.name, 'certificate') || plateFromText(file.name) || '')
+      if (!plate || (covers[plate]?.commencement && covers[plate]?.expiry)) return []
+      return [plate]
+    }),
+  )
+  const toNormalize = listed.filter((file) => {
+    if (!fileMatchesFocus(file, focus) || hasCanonicalName(file)) return false
+    if (file.type === 'logbook' || file.type === 'agreement') return Boolean(plateFromTypedName(file.name, file.type) || extractKenyanPlate(file.name))
+    return Boolean(plateFromTypedName(file.name, file.type)) && !isOcrImage(file.mimeType, file.name)
+  })
+  const pending = orderForResume(listed.filter((file) => pendingForFocus(file, focus, sheetPlates, missingDates)), focus)
   const ocrCandidates = pending.slice(0, OCR_BATCH)
+  const candidates = uniqueTypedFiles([...toNormalize, ...(ocrConfigured() ? ocrCandidates : [])])
   if (!ocrConfigured() && ocrCandidates.length && !toNormalize.length) {
     return {
       watching,
@@ -611,88 +981,110 @@ async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 
       renamedFiles: [] as TypedFile[],
       started: false,
       focus,
-      error: 'Photos or insurance files are waiting, but local OCR is not ready. Restart the Next.js server after installing tesseract.js.',
+      error: 'Photos, insurance, logbook, or agreement files are waiting, but local OCR is not ready. Restart the Next.js server after installing tesseract.js.',
     }
   }
-  const candidates = [...toNormalize, ...(ocrConfigured() ? ocrCandidates : [])]
+  const emptyIngest = { watching, attempted: 0, renamed: 0, remaining: pending.length, more: false, renamedFiles: [] as TypedFile[], started: false, focus }
   if (candidates.length && isProcessRunning()) {
-    return { watching, attempted: 0, renamed: 0, remaining: pending.length, more: false, renamedFiles: [] as TypedFile[], started: false, focus }
+    return { ...emptyIngest, remaining: pending.length }
   }
-  if (candidates.length) beginProcessJob(watching, candidates, focus)
+  if (!candidates.length) {
+    recordLastAction({ focus, status: 'done', remaining: 0, detail: `${processFocusLabel(focus)} caught up.` })
+    attachLastAction(lastAction())
+    return { ...emptyIngest, remaining: 0, lastAction: lastAction() }
+  }
+  await warmPlateReader().catch(() => {})
+  let working = listed
   let renamed = 0
+  let attempted = 0
   let error: string | undefined
   const renamedFiles: TypedFile[] = []
-  const generation = processGeneration()
-  const concurrency = focus === 'certificates' ? 1 : OCR_CONCURRENCY
-  await mapPool(candidates, concurrency, async (file) => {
-    if (isStaleProcess(generation)) return
-    try {
-      const result = await ocrAndRename(config, user, file, { verify: focus === 'repair' && Boolean(namedPlateOf(file)) })
-      renamed += result.renamed
-      if (result.file) renamedFiles.push(result.file)
-      if (result.error && !error) error = result.error
-      if (result.plate) markTried(file.id)
-      recordLastAction({
-        focus,
-        status: 'running',
-        fileId: file.id,
-        fileName: result.file?.name || file.name,
-        plate: result.plate || undefined,
-        detail: result.plate ? `Read ${result.plate} on ${result.file?.name || file.name}` : `Finished ${file.name}`,
-        done: (lastAction().done || 0) + 1,
-      })
-    } catch (err) {
-      error = err instanceof Error ? err.message : 'OCR error'
-      recordLastAction({ focus, status: 'running', fileId: file.id, fileName: file.name, detail: error })
-      touchProcessItem(file.id, { stage: 'error', detail: error, name: file.name, type: file.type, mimeType: file.mimeType })
-      await appendAudit(config, 'System', `OCR failed for ${file.name}: ${error}`)
+  const takenNames = new Set(listed.map((file) => file.name))
+  const processedIds = new Set<string>()
+  let remaining = pending.length
+  let stopped = false
+  const maxBatches = ON_VERCEL ? 1 : 40
+  for (let batch = 0; batch < maxBatches; batch++) {
+    if (isProcessCancelled()) {
+      stopped = true
+      break
     }
-  })
-  const processedIds = new Set(candidates.map((file) => file.id))
-  const recheck = focus === 'repair' ? mergeTypedFiles(listed, renamedFiles).filter((file) => {
-    if (!processedIds.has(file.id) || !isOcrImage(file.mimeType, file.name) || hasCanonicalName(file)) return false
-    const named = namedPlateOf(file)
-    if (!named || sheetPlates?.has(compactPlate(named))) return false
-    return true
-  }) : []
-  if (recheck.length && !isStaleProcess(generation)) {
-    await mapPool(recheck, OCR_CONCURRENCY, async (file) => {
+    working = mergeTypedFiles(working, renamedFiles)
+    const pendingNow = orderForResume(working.filter((file) => pendingForFocus(file, focus, sheetPlates, missingDates)), focus)
+    const normalizeNow = batch === 0 ? toNormalize : []
+    const ocrSlice = pendingNow.slice(0, OCR_BATCH)
+    const batchFiles = uniqueTypedFiles([...normalizeNow, ...(ocrConfigured() ? ocrSlice : [])])
+    remaining = Math.max(0, pendingNow.length - ocrSlice.length)
+    if (!batchFiles.length) {
+      remaining = 0
+      break
+    }
+    if (batch > 0 && isProcessRunning()) endProcessJob(undefined, { remaining: remaining + batchFiles.length, renamed })
+    beginProcessJob(watching, batchFiles, focus)
+    const generation = processGeneration()
+    attempted += batchFiles.length
+    await mapPool(batchFiles, OCR_CONCURRENCY, async (file) => {
       if (isStaleProcess(generation)) return
       try {
-        const named = namedPlateOf(file)
-        touchProcessItem(file.id, { stage: 'reading', detail: `Rechecking unmatched ${named} against the document`, plate: named, name: file.name, type: file.type, mimeType: file.mimeType })
-        const result = await ocrAndRename(config, user, file, { verify: true })
+        const result = await ocrMatchFile(config, user, file, { sheetPlates, focus, takenNames })
         renamed += result.renamed
-        if (result.file) renamedFiles.push(result.file)
+        if (result.file) {
+          renamedFiles.push(result.file)
+          if (result.file.name) takenNames.add(result.file.name)
+        }
         if (result.error && !error) error = result.error
+        markTried(file.id)
+        processedIds.add(file.id)
+        recordLastAction({
+          focus,
+          status: 'running',
+          fileId: file.id,
+          fileName: result.file?.name || file.name,
+          plate: result.plate || undefined,
+          detail: result.plate ? `Read ${result.plate} on ${result.file?.name || file.name}` : `Finished ${file.name}`,
+          done: (lastAction().done || 0) + 1,
+          remaining,
+        })
       } catch (err) {
         error = err instanceof Error ? err.message : 'OCR error'
+        markTried(file.id)
+        processedIds.add(file.id)
+        recordLastAction({ focus, status: 'running', fileId: file.id, fileName: file.name, detail: error, remaining })
         touchProcessItem(file.id, { stage: 'error', detail: error, name: file.name, type: file.type, mimeType: file.mimeType })
         await appendAudit(config, 'System', `OCR failed for ${file.name}: ${error}`)
       }
     })
+    stopped = isStaleProcess(generation) || isProcessCancelled()
+    if (stopped || remaining === 0) break
   }
   if (renamedFiles.length && !config.spreadsheetId && !error) {
     error = 'Renamed in Drive, but no Fleet Assets workbook is selected in Settings, so Sheets was not updated.'
   }
-  if (ocrConfigured() && ocrCandidates.length && renamed === 0 && !error) {
+  if (ocrConfigured() && attempted && renamed === 0 && !error) {
     error = unreadPlateMessage(ocrCandidates, watching)
   }
-  const stopped = isStaleProcess(generation) || isProcessCancelled()
   recordLastAction({
     focus,
-    status: stopped ? 'paused' : remainingAfter > 0 ? 'running' : 'done',
-    remaining: stopped ? pending.length : remainingAfter,
+    status: stopped ? 'paused' : remaining > 0 ? 'running' : 'done',
+    remaining: stopped ? remaining + OCR_BATCH : remaining,
     done: lastAction().done,
     detail: stopped
       ? `Paused ${processFocusLabel(focus)} after ${lastAction().fileName || 'the last file'}. Start again to continue.`
-      : remainingAfter > 0
-        ? `${processFocusLabel(focus)} batch finished. ${remainingAfter} still need a plate.`
+      : remaining > 0
+        ? `${processFocusLabel(focus)} batch finished. ${remaining} still need a plate.`
         : `${processFocusLabel(focus)} caught up.`,
   })
   await persistProcessCursor(config).catch(() => {})
   attachLastAction(lastAction())
-  return { watching, attempted: candidates.length, renamed, remaining: stopped ? lastAction().remaining || pending.length : remainingAfter, more: !stopped && remainingAfter > 0, error: stopped ? undefined : error, renamedFiles, started: candidates.length > 0, focus, lastAction: lastAction() }
+  return { watching, attempted, renamed, remaining: stopped ? lastAction().remaining || remaining : remaining, more: !stopped && remaining > 0, error: stopped ? undefined : error, renamedFiles, started: attempted > 0, focus, lastAction: lastAction() }
+}
+
+function uniqueTypedFiles(files: TypedFile[]) {
+  const byId = new Map<string, TypedFile>()
+  for (const file of files) {
+    if (!byId.has(file.id)) byId.set(file.id, file)
+  }
+  return [...byId.values()]
 }
 
 function mergeTypedFiles(files: TypedFile[], updates: TypedFile[]) {

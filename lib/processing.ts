@@ -2,7 +2,7 @@ import { compactPlate } from '@/lib/plates'
 import type { ProcessLastAction } from '@/lib/process-cursor'
 import type { DocType } from '@/lib/types'
 
-export type ProcessFocus = 'all' | 'photos' | 'certificates' | 'repair'
+export type ProcessFocus = 'all' | 'photos' | 'certificates' | 'logbooks' | 'agreements' | 'repair' | 'repair-photos' | 'repair-certificates' | 'repair-logbooks' | 'repair-agreements'
 export type ProcessStage = 'queued' | 'opening' | 'reading' | 'renaming' | 'matching' | 'matched' | 'unmatched' | 'error'
 
 export type ProcessItem = {
@@ -76,7 +76,7 @@ export function isStaleProcess(startedAt: number) {
   return cancelRequested || startedAt !== generation
 }
 
-export function requestProcessStop(message = 'Stopped. Choose photos, insurance, or match repair to start the next job.') {
+export function requestProcessStop(message = 'Stopped. Choose photos, insurance, logbooks, or a fix-wrong-plates job to start next.') {
   cancelRequested = true
   generation += 1
   recount()
@@ -92,9 +92,19 @@ export function requestProcessStop(message = 'Stopped. Choose photos, insurance,
   }
 }
 
+export function isRepairFocus(focus?: ProcessFocus) {
+  return focus === 'repair' || focus === 'repair-photos' || focus === 'repair-certificates' || focus === 'repair-logbooks' || focus === 'repair-agreements'
+}
+
 export function processFocusLabel(focus?: ProcessFocus) {
   if (focus === 'photos') return 'Photos'
   if (focus === 'certificates') return 'Insurance'
+  if (focus === 'logbooks') return 'Logbooks'
+  if (focus === 'agreements') return 'Agreements'
+  if (focus === 'repair-photos') return 'Wrong photos'
+  if (focus === 'repair-certificates') return 'Wrong insurance'
+  if (focus === 'repair-logbooks') return 'Wrong logbooks'
+  if (focus === 'repair-agreements') return 'Wrong agreements'
   if (focus === 'repair') return 'Wrong matches'
   if (focus === 'all') return 'All files'
   return 'Processing'
@@ -108,7 +118,17 @@ function canPreview(file: { name: string; mimeType?: string }) {
   return /image\/(jpeg|png|gif|webp)/i.test(file.mimeType || '') || /\.(jpe?g|png|gif|webp)$/i.test(file.name)
 }
 
+function uniqueByFileId<T extends { fileId: string }>(items: T[]) {
+  const seen = new Set<string>()
+  return items.filter((item) => {
+    if (seen.has(item.fileId)) return false
+    seen.add(item.fileId)
+    return true
+  })
+}
+
 function recount() {
+  job.items = uniqueByFileId(job.items)
   job.done = job.items.filter((item) => TERMINAL.includes(item.stage)).length
   job.matched = job.items.filter((item) => item.stage === 'matched').length
   job.failed = job.items.filter((item) => item.stage === 'error' || item.stage === 'unmatched').length
@@ -116,10 +136,12 @@ function recount() {
 }
 
 export function fileMatchesFocus(file: { type: DocType }, focus: ProcessFocus) {
-  if (focus === 'all') return true
-  if (focus === 'photos') return file.type === 'photo'
-  if (focus === 'certificates') return file.type === 'certificate'
-  return file.type === 'photo' || file.type === 'certificate'
+  if (focus === 'all' || focus === 'repair') return true
+  if (focus === 'photos' || focus === 'repair-photos') return file.type === 'photo'
+  if (focus === 'certificates' || focus === 'repair-certificates') return file.type === 'certificate'
+  if (focus === 'logbooks' || focus === 'repair-logbooks') return file.type === 'logbook'
+  if (focus === 'agreements' || focus === 'repair-agreements') return file.type === 'agreement'
+  return true
 }
 
 export function getProcessJob(): ProcessJob {
@@ -152,7 +174,7 @@ export function beginProcessJob(watching: string, files: Array<{ id: string; nam
   if (job.running) return false
   cancelRequested = false
   generation += 1
-  const incoming = files.map(asQueued)
+  const incoming = uniqueByFileId(files.map(asQueued))
   const continueMs = job.finishedAt ? Date.now() - Date.parse(job.finishedAt) : Number.POSITIVE_INFINITY
   const continuing = Boolean(!job.cancelled && job.focus === focus && job.items.length && job.finishedAt && continueMs < 5 * 60_000)
   if (continuing) {

@@ -1,4 +1,4 @@
-export const DOC_TYPES = ['logbook', 'certificate', 'photo'] as const
+export const DOC_TYPES = ['logbook', 'certificate', 'photo', 'agreement'] as const
 export type DocType = (typeof DOC_TYPES)[number]
 export const DEFAULT_COLLATERAL_PARENT_ID = '1adoj_LXvsAXcke0mzgLENQdqusDLT08-'
 
@@ -18,13 +18,27 @@ export type TypedFile = DriveItem & {
   plate: string | null
 }
 
+export type InsuranceCoverView = {
+  commencement: string | null
+  expiry: string | null
+  daysLeft: number | null
+  alert: 'week' | 'two-days' | 'expired' | null
+}
+
+export type InsuranceAlert = InsuranceCoverView & {
+  plate: string
+  kind: 'week' | 'two-days' | 'expired'
+}
+
 export type VehicleRecord = {
   plate: string
   brand?: string
   files: Record<DocType, TypedFile[]>
   collateral?: { id: string; name: string; webViewLink?: string }
+  agreement?: { id: string; name: string; webViewLink?: string }
+  insurance?: InsuranceCoverView
   present: number
-  total: 4
+  total: 5
   status: 'Complete' | 'Needs attention'
   updated: string
 }
@@ -33,10 +47,12 @@ export type FleetConfig = {
   logbooksId: string
   certificatesId: string
   photosId: string
+  agreementsId?: string
   collateralId?: string
   logbooksName?: string
   certificatesName?: string
   photosName?: string
+  agreementsName?: string
   collateralName?: string
   spreadsheetId?: string
   spreadsheetName?: string
@@ -44,6 +60,8 @@ export type FleetConfig = {
   certificatesSheet?: string
   photosSheet?: string
   autoUploadThreshold: number
+  insuranceInboxEmail?: string
+  logbooksInboxEmail?: string
   lastSync?: string
   configFileId?: string
 }
@@ -59,6 +77,7 @@ export type InboxItem = {
   status: 'Auto-uploaded' | 'Needs review'
   fileId?: string
   folder: string
+  type?: DocType
 }
 
 export type AuditEvent = {
@@ -81,9 +100,13 @@ export type FleetStats = {
   certificate: number
   photo: number
   collateral: number
+  agreement: number
   brands: string[]
   unbranded: number
   newPlates: string[]
+  insuranceWeek: number
+  insuranceTwoDays: number
+  insuranceExpired: number
 }
 
 export type FleetSnapshot = {
@@ -91,6 +114,7 @@ export type FleetSnapshot = {
   config: FleetConfig | null
   vehicles: VehicleRecord[]
   unmatched: TypedFile[]
+  insuranceAlerts?: InsuranceAlert[]
   inbox: InboxItem[]
   audit: AuditEvent[]
   stats?: FleetStats
@@ -99,6 +123,8 @@ export type FleetSnapshot = {
   driveConnected: boolean
   ocrConfigured: boolean
   sheetsConnected: boolean
+  databaseConnected?: boolean
+  databaseVehicles?: number
   sheetsError?: string
   ingest?: {
     watching: string
@@ -106,11 +132,11 @@ export type FleetSnapshot = {
     renamed: number
     remaining?: number
     more?: boolean
-    focus?: 'all' | 'photos' | 'certificates' | 'repair'
+    focus?: 'all' | 'photos' | 'certificates' | 'logbooks' | 'agreements' | 'repair' | 'repair-photos' | 'repair-certificates' | 'repair-logbooks' | 'repair-agreements'
     error?: string
     notice?: string
     lastAction?: {
-      focus?: 'all' | 'photos' | 'certificates' | 'repair'
+      focus?: 'all' | 'photos' | 'certificates' | 'logbooks' | 'agreements' | 'repair' | 'repair-photos' | 'repair-certificates' | 'repair-logbooks' | 'repair-agreements'
       status?: string
       fileName?: string
       plate?: string

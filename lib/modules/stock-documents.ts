@@ -19,15 +19,20 @@ import {
   type GridCell,
   type SheetMerge,
 } from '@/lib/sheets/client'
+import { insuranceState, parseCoverDate, sheetCoverDate, type InsuranceCover } from '@/lib/insurance'
 import { compactPlate, extractKenyanPlate, plateFromText } from '@/lib/plates'
+import { hasCanonicalName } from '@/lib/document-names'
+import { isUnmatchedFile, onRegister } from '@/lib/unmatched-files'
 import { DEFAULT_COLLATERAL_PARENT_ID, type DocType, type FleetConfig, type TypedFile, type VehicleRecord } from '@/lib/types'
 import type { ModuleSyncResult, SheetCell, SheetCells, SheetDocKey, SheetModule, SheetSyncMode } from '@/lib/modules/types'
 
 export const STOCK_TAB = 'STOCK DOCUMENTS'
 export const COLLATERAL_HEADER = 'Collateral Files'
+export const COMMENCEMENT_HEADER = 'Commencement'
+export const EXPIRY_HEADER = 'Expiry'
 export const FLEET_WORKBOOK_NAMES = ['Fleet Assets - KE', 'Fleet Assets'] as const
 
-type ColumnKey = DocType | 'photoBranded' | 'collateral'
+type ColumnKey = DocType | 'photoBranded' | 'collateral' | 'agreement'
 
 type StockRow = {
   row: number
@@ -35,6 +40,8 @@ type StockRow = {
   rawPlate: string
   brand: string
   columns: Partial<Record<ColumnKey, { col: number; value: string; uri?: string }>>
+  commencement?: { col: number; value: string }
+  expiry?: { col: number; value: string }
 }
 
 type StockRegister = {
@@ -58,12 +65,12 @@ export function collateralParentId(config: FleetConfig) {
   return config.collateralId || process.env.DRIVE_FOLDER_COLLATERAL || DEFAULT_COLLATERAL_PARENT_ID
 }
 
-export async function readStockRegisterSnapshot(config: FleetConfig) {
+export async function readStockRegisterSnapshot(config: FleetConfig, options?: { fresh?: boolean }) {
   if (!config.spreadsheetId) {
     return { vehicles: [] as VehicleRecord[], unmatched: [] as TypedFile[], plates: new Set<string>(), cells: new Map() as SheetCells, error: undefined as string | undefined }
   }
   try {
-    const register = await loadStockRegister(config)
+    const register = await loadStockRegister(config, options)
     const cells = cellsFromRegister(register)
     const built = buildRegister([], { keys: register.plates, cells })
     return { ...built, plates: register.plates, cells, error: register.rows.size ? undefined : `Tab '${register.title}' in ${config.spreadsheetName || 'the workbook'} had no readable Registration Number plates.` }
@@ -86,7 +93,7 @@ export async function loadStockRegister(config: FleetConfig, options?: { fresh?:
   const cached = registerCache.get(cacheKey)
   if (!options?.fresh && cached && Date.now() - cached.at < CACHE_MS) return cached.register
   const tabs = await listTabs(config.spreadsheetId)
-  const preferred = pickTab(tabs, stockTabTitle(config), [/stock document/i, /stock/i, /register/i, /fleet/i])
+  const preferred = pickTab(tabs, STOCK_TAB, [/stock documents?/i]) || pickTab(tabs, stockTabTitle(config), [/stock document/i, /stock/i, /register/i])
   const fallbacks = tabs.filter((tab) => /stock|register|fleet/i.test(tab.title) && tab.title !== preferred?.title)
   const toRead = preferred || fallbacks.length ? [...(preferred ? [preferred] : []), ...fallbacks] : tabs
   let lastError = ''
@@ -114,6 +121,7 @@ async function writeSheetMatches(config: FleetConfig, files: TypedFile[], mode: 
   const filesById = new Map(files.map((file) => [file.id, file]))
   const bestForRow = new Map<string, TypedFile>()
   for (const file of files) {
+    if ((file.type === 'logbook' || file.type === 'agreement') && !hasCanonicalName(file)) continue
     const plate = filePlate(file)
     if (!plate) continue
     const key = `${columnKeyForFile(file.type, file.name)}:${plate}`
@@ -134,7 +142,7 @@ async function writeSheetMatches(config: FleetConfig, files: TypedFile[], mode: 
   }
 
   for (const row of register.rows.values()) {
-    for (const key of ['certificate', 'photo', 'photoBranded'] as ColumnKey[]) {
+    for (const key of ['logbook', 'agreement', 'certificate', 'photo', 'photoBranded'] as ColumnKey[]) {
       const column = row.columns[key]
       if (!column || chipRequests.length >= writeLimit) continue
       const correct = bestForRow.get(`${key}:${row.plate}`)
@@ -151,6 +159,18 @@ async function writeSheetMatches(config: FleetConfig, files: TypedFile[], mode: 
         if (!already) queueChip(row, column, correct)
         continue
       }
+      if (key === 'logbook' && hasChip && linked && !hasCanonicalName(linked)) {
+        chipRequests.push(clearChipRequest(register.sheetId, row.row, column.col))
+        column.value = ''
+        column.uri = undefined
+        continue
+      }
+      if (key === 'agreement' && hasChip && linked?.type === 'agreement' && !hasCanonicalName(linked)) {
+        chipRequests.push(clearChipRequest(register.sheetId, row.row, column.col))
+        column.value = ''
+        column.uri = undefined
+        continue
+      }
       if (hasChip && !currentPlate && linkedId && !linked) continue
       if (hasChip && currentPlate && currentPlate !== row.plate) {
         chipRequests.push(clearChipRequest(register.sheetId, row.row, column.col))
@@ -161,7 +181,7 @@ async function writeSheetMatches(config: FleetConfig, files: TypedFile[], mode: 
   }
 
   for (const file of files) {
-    if (file.type === 'certificate' || file.type === 'photo') continue
+    if (file.type === 'logbook' || file.type === 'certificate' || file.type === 'photo' || file.type === 'agreement') continue
     const plate = filePlate(file)
     if (!plate) continue
     const link = driveViewLink(file)
@@ -181,7 +201,7 @@ async function writeSheetMatches(config: FleetConfig, files: TypedFile[], mode: 
   }
 
   for (const file of files) {
-    if (file.type !== 'certificate' && file.type !== 'photo') continue
+    if (file.type !== 'logbook' && file.type !== 'certificate' && file.type !== 'photo' && file.type !== 'agreement') continue
     const plate = filePlate(file)
     if (plate && !register.rows.has(plate) && !rowByLoosePlate(register, plate) && !seenMissing.has(plate)) {
       seenMissing.add(plate)
@@ -212,11 +232,12 @@ function chipTitle(file: { name?: string }) {
 }
 
 function filePlate(file: TypedFile) {
-  const raw = file.plate || plateFromText(file.name)
+  const raw = file.plate || extractKenyanPlate(file.name)
   return raw ? compactPlate(raw) : ''
 }
 
 function canonicalFileName(file: TypedFile) {
+  if (file.type === 'logbook' || file.type === 'agreement') return hasCanonicalName(file)
   const plate = filePlate(file)
   if (!plate) return false
   if (file.type === 'photo') return /^photos\s+/i.test(file.name) && file.name.toUpperCase().includes(plate)
@@ -309,7 +330,10 @@ function cellsFromRegister(register: StockRegister): SheetCells {
       certificate: sheetCell(row.columns.certificate),
       photo: sheetCell(row.columns.photo) || sheetCell(row.columns.photoBranded),
       collateral: sheetCell(row.columns.collateral),
+      agreement: sheetCell(row.columns.agreement),
       brand: row.brand || undefined,
+      commencement: row.commencement?.value || undefined,
+      expiry: row.expiry?.value || undefined,
     })
   }
   return cells
@@ -324,6 +348,10 @@ function sheetCell(column?: { value: string; uri?: string }): SheetCell | undefi
 
 function rowByLoosePlate(register: StockRegister, plate: string) {
   return [...register.rows.values()].find((row) => compactPlate(row.plate) === plate) || null
+}
+
+function emptyVehicleFiles(): VehicleRecord['files'] {
+  return { logbook: [], certificate: [], photo: [], agreement: [] }
 }
 
 function columnKeyForFile(type: DocType, name?: string): ColumnKey {
@@ -361,12 +389,17 @@ async function readStockTab(spreadsheetId: string, title: string, sheetId: numbe
         photo: columnFromCell(header.photoIndex, cells[header.photoIndex]),
         ...(header.brandedIndex >= 0 ? { photoBranded: columnFromCell(header.brandedIndex, cells[header.brandedIndex]) } : {}),
         ...(header.collateralIndex >= 0 ? { collateral: columnFromCell(header.collateralIndex, cells[header.collateralIndex]) } : {}),
+        ...(header.agreementIndex >= 0 ? { agreement: columnFromCell(header.agreementIndex, cells[header.agreementIndex]) } : {}),
       },
+      commencement: dateColumnFromCell(header.commencementIndex, cells[header.commencementIndex]),
+      expiry: dateColumnFromCell(header.expiryIndex, cells[header.expiryIndex]),
     }
     const existing = rows.get(plate)
     if (existing) {
       if (!existing.brand && stockRow.brand) existing.brand = stockRow.brand
       existing.columns = mergeStockColumns(existing.columns, stockRow.columns)
+      if (!existing.commencement?.value && stockRow.commencement?.value) existing.commencement = stockRow.commencement
+      if (!existing.expiry?.value && stockRow.expiry?.value) existing.expiry = stockRow.expiry
     } else {
       rows.set(plate, stockRow)
     }
@@ -381,22 +414,55 @@ function columnFromCell(index: number, cell?: GridCell) {
   return { col: index + 1, value: contents.value, uri: contents.uri }
 }
 
+function dateColumnFromCell(index: number, cell?: GridCell) {
+  if (index < 0) return undefined
+  return { col: index + 1, value: cellContents(cell).value }
+}
+
+function isCommencementHeader(cell: string) {
+  if (!cell) return false
+  if (cell.includes('expir')) return false
+  return cell.includes('commencement') || cell.includes('cover start') || cell.includes('inception') || (cell.includes('period') && cell.includes('from'))
+}
+
+function isExpiryHeader(cell: string) {
+  if (!cell) return false
+  if (cell.includes('commencement')) return false
+  return cell.includes('expir') || cell.includes('cover end') || (cell.includes('period') && (cell.includes('to') || cell.includes('until')))
+}
+
 function findHeader(values: string[][]) {
   for (let index = 0; index < Math.min(values.length, 25); index++) {
     const header = values[index].map(normalizeHeader)
     const next = (values[index + 1] || []).map(normalizeHeader)
     const plateIndex = header.findIndex(isPlateHeader)
     const logbookIndex = header.findIndex((cell) => cell.includes('logbook'))
+    const agreementIndex = headerIndex(header, next, isAgreementHeader)
     const insuranceIndex = header.findIndex((cell) => cell.includes('insurance') || cell.includes('psv'))
     const brandedIndex = header.findIndex((cell) => (cell.includes('asset photo') || cell.includes('photo')) && cell.includes('branded'))
     const photoIndex = header.findIndex((cell, col) => isPhotoHeader(cell) && col !== brandedIndex)
     const collateralIndex = header.findIndex((cell) => cell.includes('collateral'))
+    const commencementIndex = header.findIndex(isCommencementHeader)
+    const expiryIndex = header.findIndex(isExpiryHeader)
     const brandIndexes = brandColumnIndexes(header, next.some((cell) => extractKenyanPlate(cell)) ? [] : next)
     if (plateIndex >= 0) {
-      return { index, plateIndex, logbookIndex, insuranceIndex, photoIndex, brandedIndex, collateralIndex, brandIndexes }
+      return { index, plateIndex, logbookIndex, agreementIndex, insuranceIndex, photoIndex, brandedIndex, collateralIndex, commencementIndex, expiryIndex, brandIndexes }
     }
   }
   return null
+}
+
+function isAgreementHeader(cell: string) {
+  if (!cell) return false
+  if (cell.includes('logbook')) return false
+  return cell.includes('agreement')
+}
+
+function headerIndex(header: string[], next: string[], match: (cell: string) => boolean) {
+  const top = header.findIndex(match)
+  if (top >= 0) return top
+  if (next.some((cell) => extractKenyanPlate(cell))) return -1
+  return next.findIndex(match)
 }
 
 function isPlateHeader(cell: string) {
@@ -410,7 +476,7 @@ function isPhotoHeader(cell: string) {
 
 function isBrandHeader(cell: string) {
   if (!cell) return false
-  if (cell.includes('photo') || cell.includes('branded') || cell.includes('collateral')) return false
+  if (cell.includes('photo') || cell.includes('branded') || cell.includes('collateral') || cell.includes('commencement') || cell.includes('expir')) return false
   if (/\bbrand\b/.test(cell)) return true
   return cell === 'make' || cell === 'oem' || cell === 'manufacturer'
 }
@@ -491,28 +557,29 @@ function sheetMeta(cells: SheetCells | undefined, plate: string) {
 function buildRegister(files: TypedFile[], sync: Pick<ModuleSyncResult, 'keys' | 'cells'>) {
   const sheetPlates = sync.keys
   const sheetCells = sync.cells
-  const onSheet = (plate: string | null) => Boolean(plate && (!sheetPlates?.size || sheetPlates.has(plate) || sheetPlates.has(compactPlate(plate))))
-  const unmatched = files.filter((file) => !onSheet(file.plate))
+  const onSheet = (plate: string | null) => onRegister(plate, sheetPlates)
+  const unmatched = files.filter((file) => isUnmatchedFile(file, sheetPlates))
   const byPlate = new Map<string, VehicleRecord>()
   for (const plate of sheetPlates || []) {
     byPlate.set(plate, {
       plate,
       brand: sheetMeta(sheetCells, plate)?.brand || '',
-      files: { logbook: [], certificate: [], photo: [] },
+      files: emptyVehicleFiles(),
       present: 0,
-      total: 4 as const,
+      total: 5 as const,
       status: 'Needs attention' as const,
       updated: '',
     })
   }
   for (const file of files) {
+    if ((file.type === 'logbook' || file.type === 'agreement') && !hasCanonicalName(file)) continue
     if (!onSheet(file.plate) || !file.plate) continue
     const current = byPlate.get(file.plate) || {
       plate: file.plate,
       brand: sheetMeta(sheetCells, file.plate)?.brand || '',
-      files: { logbook: [], certificate: [], photo: [] },
+      files: emptyVehicleFiles(),
       present: 0,
-      total: 4 as const,
+      total: 5 as const,
       status: 'Needs attention' as const,
       updated: file.modifiedTime || '',
     }
@@ -525,15 +592,27 @@ function buildRegister(files: TypedFile[], sync: Pick<ModuleSyncResult, 'keys' |
       const cells = sheetMeta(sheetCells, vehicle.plate)
       if (cells?.brand) vehicle.brand = cells.brand
       else vehicle.brand = vehicle.brand || ''
-      for (const type of ['logbook', 'certificate', 'photo'] as DocType[]) {
+      for (const type of ['logbook', 'certificate', 'photo', 'agreement'] as DocType[]) {
         const cell = cells?.[type]
         if (!cell?.uri || !isDriveDocumentUri(cell.uri)) {
           vehicle.files[type] = []
           continue
         }
         const targetId = driveIdFromUri(cell.uri)
-        const linked = files.find((file) => file.type === type && (file.id === targetId || file.parents?.includes(targetId || '')))
-        const linkedPlate = linked ? compactPlate(linked.plate || plateFromText(linked.name) || '') : ''
+        const linked = files.find((file) => (
+          type === 'agreement'
+            ? file.id === targetId || file.parents?.includes(targetId || '')
+            : file.type === type && (file.id === targetId || file.parents?.includes(targetId || ''))
+        ))
+        const linkedPlate = linked ? compactPlate(linked.plate || extractKenyanPlate(linked.name) || '') : ''
+        if (type === 'logbook' && linked && !hasCanonicalName(linked)) {
+          vehicle.files[type] = []
+          continue
+        }
+        if (type === 'agreement' && linked?.type === 'agreement' && !hasCanonicalName(linked)) {
+          vehicle.files[type] = []
+          continue
+        }
         if (linked && linkedPlate && linkedPlate !== compactPlate(vehicle.plate)) {
           vehicle.files[type] = []
           continue
@@ -556,16 +635,24 @@ function buildRegister(files: TypedFile[], sync: Pick<ModuleSyncResult, 'keys' |
             webViewLink: collateral.uri,
           }
         : undefined
+      const commencement = parseCoverDate(cells?.commencement || '')
+      const expiry = parseCoverDate(cells?.expiry || '')
+      if (commencement || expiry) vehicle.insurance = insuranceState({ commencement, expiry })
     }
   }
   const vehicles = [...byPlate.values()].map((vehicle) => {
-    const present = (['logbook', 'certificate', 'photo'] as DocType[]).filter((type) => vehicle.files[type].length > 0).length
+    const linkedAgreement = vehicle.files.agreement[0]
+    const agreement = linkedAgreement
+      ? { id: linkedAgreement.id, name: linkedAgreement.name, webViewLink: linkedAgreement.webViewLink }
+      : undefined
+    const present = (['logbook', 'certificate', 'photo', 'agreement'] as DocType[]).filter((type) => vehicle.files[type].length > 0).length
       + (vehicle.collateral ? 1 : 0)
     return {
       ...vehicle,
+      agreement,
       present,
-      total: 4 as const,
-      status: present === 4 ? 'Complete' as const : 'Needs attention' as const,
+      total: 5 as const,
+      status: present === 5 ? 'Complete' as const : 'Needs attention' as const,
       updated: formatSheetTime(vehicle.updated),
     }
   }).sort((a, b) => a.plate.localeCompare(b.plate))
@@ -590,6 +677,50 @@ async function sync(config: FleetConfig, files: TypedFile[], mode: SheetSyncMode
     cells: collateral.cells || matches.cells,
     more: Boolean(matches.more || collateral.more),
   }
+}
+
+export async function writeInsuranceDates(config: FleetConfig, covers: Record<string, InsuranceCover>, mode: SheetSyncMode = 'auto') {
+  if (mode === 'match' || !config.spreadsheetId || !Object.keys(covers).length) return { written: 0, cells: new Map() as SheetCells }
+  const register = await loadStockRegister(config)
+  if (!register.rows.size) return { written: 0, cells: cellsFromRegister(register) }
+  const requests: object[] = []
+  let nextColumn = register.nextColumn
+  let commencementCol = [...register.rows.values()].find((row) => row.commencement)?.commencement?.col
+  let expiryCol = [...register.rows.values()].find((row) => row.expiry)?.expiry?.col
+  if (!commencementCol) {
+    commencementCol = nextColumn
+    nextColumn += 1
+    requests.push(headerRequest(register.sheetId, register.headerRow, commencementCol, COMMENCEMENT_HEADER))
+    for (const row of register.rows.values()) row.commencement = { col: commencementCol, value: row.commencement?.value || '' }
+  }
+  if (!expiryCol) {
+    expiryCol = nextColumn
+    nextColumn += 1
+    requests.push(headerRequest(register.sheetId, register.headerRow, expiryCol, EXPIRY_HEADER))
+    for (const row of register.rows.values()) row.expiry = { col: expiryCol, value: row.expiry?.value || '' }
+  }
+  register.nextColumn = Math.max(register.nextColumn, nextColumn)
+  const writeLimit = mode === 'full' ? 400 : 80
+  for (const [plate, cover] of Object.entries(covers)) {
+    if (requests.length >= writeLimit) break
+    const row = register.rows.get(compactPlate(plate)) || rowByLoosePlate(register, compactPlate(plate))
+    if (!row) continue
+    const start = sheetCoverDate(cover.commencement)
+    const end = sheetCoverDate(cover.expiry)
+    if (start && row.commencement && parseCoverDate(row.commencement.value) !== cover.commencement) {
+      requests.push(headerRequest(register.sheetId, row.row, row.commencement.col, start))
+      row.commencement.value = start
+    }
+    if (end && row.expiry && parseCoverDate(row.expiry.value) !== cover.expiry) {
+      requests.push(headerRequest(register.sheetId, row.row, row.expiry.col, end))
+      row.expiry.value = end
+    }
+  }
+  if (requests.length) {
+    await applyChipBatches(config.spreadsheetId, requests)
+    registerCache.set(`${config.spreadsheetId}:stock-documents`, { at: Date.now(), register })
+  }
+  return { written: requests.length, cells: cellsFromRegister(register) }
 }
 
 export const stockDocumentsModule: SheetModule = {

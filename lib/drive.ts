@@ -275,6 +275,18 @@ export async function findFileByName(name: string): Promise<DriveItem | null> {
   return (await findOwnedFileByName(name)) || newestFile(await listNamedFiles(name, false))
 }
 
+export async function findFileInFolder(folderId: string, name: string): Promise<DriveItem | null> {
+  if (!folderId) return null
+  const escaped = name.replace(/'/g, "\\'")
+  const q = `name = '${escaped}' and '${folderId}' in parents and trashed = false`
+  const fields = 'files(id,name,modifiedTime,parents)'
+  const [mine, shared] = await Promise.all([
+    driveGet<{ files?: DriveItem[] }>('/files', { q, fields, pageSize: '5', corpora: 'user' }).catch(() => ({ files: [] as DriveItem[] })),
+    driveGet<{ files?: DriveItem[] }>('/files', { q, fields, pageSize: '5', corpora: 'allDrives' }).catch(() => ({ files: [] as DriveItem[] })),
+  ])
+  return newestFile([...(mine.files || []), ...(shared.files || [])])
+}
+
 export async function findOwnedFileByName(name: string): Promise<DriveItem | null> {
   return newestFile(await listNamedFiles(name, true))
 }
