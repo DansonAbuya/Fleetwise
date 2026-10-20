@@ -3,12 +3,12 @@
 import { FormEvent, ReactNode, Suspense, useEffect, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { signOut, useSession } from '@/lib/auth-client'
-import { assignUnmatched, assignUnmatchedBatch, continueProcessing, exportVehicleRegister, getProcessingJob, listDriveFolders, listSpreadsheets, loadFleet, loadVehiclePage, loadWorkspace, loadWorkspacePanels, ocrUnmatchedPhotos, runProcessing, saveFolderConfig, stopProcessing, syncGmail, syncRegisterToDatabase, uploadDocument } from '@/app/actions/fleet'
+import { assignUnmatched, assignUnmatchedBatch, continueProcessing, exportVehicleRegister, getProcessingJob, linkPerceivedMatches, listDriveFolders, listSpreadsheets, loadFleet, loadVehiclePage, loadWorkspace, loadWorkspacePanels, ocrUnmatchedPhotos, runProcessing, saveFolderConfig, stopProcessing, syncGmail, syncRegisterToDatabase, uploadDocument } from '@/app/actions/fleet'
 import { coverAlertLabel, formatCoverDate } from '@/lib/insurance'
 import { listRegistrationNumbers, parseKenyanPlate } from '@/lib/plates'
 import { processFocusLabel, type ProcessFocus, type ProcessJob } from '@/lib/processing'
 import { EMPTY_STATS } from '@/lib/vehicles'
-import { DEFAULT_COLLATERAL_PARENT_ID, type DocType, type DriveItem, type FleetSnapshot, type InboxItem, type TypedFile, type VehicleRecord } from '@/lib/types'
+import { DEFAULT_COLLATERAL_PARENT_ID, type DocType, type DriveItem, type DuplicateFile, type FleetSnapshot, type InboxItem, type TypedFile, type VehicleRecord } from '@/lib/types'
 import {
   AlertCircle,
   ArrowDownToLine,
@@ -21,6 +21,7 @@ import {
   CircleHelp,
   ClipboardCheck,
   Clock,
+  Copy,
   Database,
   Download,
   FileSpreadsheet,
@@ -46,8 +47,8 @@ import {
   X,
 } from 'lucide-react'
 
-type NavKey = 'Overview' | 'Vehicles' | 'Insurance inbox' | 'Logbook inbox' | 'Processing' | 'Unmatched' | 'Audit log' | 'Settings'
-type ViewSlug = 'overview' | 'vehicles' | 'inbox' | 'logbook-inbox' | 'processing' | 'unmatched' | 'audit' | 'settings'
+type NavKey = 'Overview' | 'Vehicles' | 'Insurance inbox' | 'Logbook inbox' | 'Processing' | 'Unmatched' | 'Duplicates' | 'Audit log' | 'Settings'
+type ViewSlug = 'overview' | 'vehicles' | 'inbox' | 'logbook-inbox' | 'processing' | 'unmatched' | 'duplicates' | 'audit' | 'settings'
 type StatusFilter = 'all' | 'Complete' | 'Needs attention'
 type MissingFilter = 'logbook' | 'certificate' | 'photo' | 'collateral' | 'agreement'
 
@@ -61,7 +62,7 @@ const MISSING_FILTERS: { id: MissingFilter; label: string }[] = [
 
 const PROCESS_TASKS: { id: ProcessFocus; label: string; detail: string }[] = [
   { id: 'photos', label: 'Photos only', detail: 'Read bike plates with Tesseract.js and rename Photos {plate}.' },
-  { id: 'certificates', label: 'Insurance only', detail: 'Rename new insurance PDFs from REGISTRATION No, read commencement and expiry, then write chips on the sheet.' },
+  { id: 'certificates', label: 'Insurance only', detail: 'Rename new insurance PDFs from REGISTRATION No, save commencement and expiry on the vehicle register, then write the insurance chip on the sheet.' },
   { id: 'logbooks', label: 'Logbooks only', detail: 'Rename new logbook PDFs from REGISTRATION No to {plate} - Logbook, then write chips on the sheet.' },
   { id: 'agreements', label: 'Agreements only', detail: 'Rename files in the agreements folder to {plate} - Agreement, then write chips on Agreement Link.' },
   { id: 'all', label: 'All waiting files', detail: 'Photos, insurance, logbooks, agreements, and other waiting documents.' },
@@ -78,6 +79,7 @@ const SLUGS: Record<ViewSlug, NavKey> = {
   'logbook-inbox': 'Logbook inbox',
   processing: 'Processing',
   unmatched: 'Unmatched',
+  duplicates: 'Duplicates',
   audit: 'Audit log',
   settings: 'Settings',
 }
@@ -89,6 +91,7 @@ const TO_SLUG: Record<NavKey, ViewSlug> = {
   'Logbook inbox': 'logbook-inbox',
   Processing: 'processing',
   Unmatched: 'unmatched',
+  Duplicates: 'duplicates',
   'Audit log': 'audit',
   Settings: 'settings',
 }
@@ -100,6 +103,7 @@ const nav = [
   { label: 'Logbook inbox' as const, icon: FileText },
   { label: 'Processing' as const, icon: RefreshCw },
   { label: 'Unmatched' as const, icon: AlertCircle },
+  { label: 'Duplicates' as const, icon: Copy },
   { label: 'Audit log' as const, icon: History },
   { label: 'Settings' as const, icon: Settings },
 ]
@@ -164,6 +168,17 @@ function readSavedFolders() {
 }
 
 function keepVehicles(current: FleetSnapshot | null, next: FleetSnapshot) {
+  if (next.ingest?.preserve && current) {
+    return {
+      ...current,
+      config: next.config || current.config,
+      inbox: next.inbox.length ? next.inbox : current.inbox,
+      gmailConnected: next.gmailConnected || current.gmailConnected,
+      lastSync: next.lastSync || current.lastSync,
+      ingest: next.ingest,
+      sheetsError: next.sheetsError || current.sheetsError,
+    }
+  }
   return {
     ...next,
     config: next.config || current?.config || null,
@@ -219,6 +234,7 @@ function stubFleet(user: { name: string; email: string; image?: string }, folder
     } : null,
     vehicles: [],
     unmatched: [],
+    duplicates: [],
     inbox: [],
     audit: [],
     stats: EMPTY_STATS,
@@ -255,7 +271,7 @@ function isPhotoFile(file: TypedFile) {
   return /\.(png|jpe?g|webp|gif|bmp|tif?f|pdf)$/i.test(file.name)
 }
 
-function splitUnmatched(files: TypedFile[]) {
+function splitUnmatched<T extends TypedFile>(files: T[]) {
   return {
     photos: files.filter((file) => file.type === 'photo'),
     insurance: files.filter((file) => file.type === 'certificate'),
@@ -462,11 +478,19 @@ function FleetApp() {
     setError('')
     try {
       let next = await loader
+      let failures = 0
       while (true) {
         applySnapshot(next, ok)
         ok = undefined
         if (!next.ingest?.more) break
-        next = await continueProcessing()
+        try {
+          next = next.ingest?.follow === 'gmail' ? await syncGmail() : await continueProcessing()
+          failures = 0
+        } catch (err) {
+          failures += 1
+          if (failures > 2) throw err
+          await new Promise((resolve) => setTimeout(resolve, 2000))
+        }
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to load Drive')
@@ -583,6 +607,7 @@ function FleetApp() {
   }, [profileMenu])
   const vehicles = fleet?.vehicles || []
   const unmatched = fleet?.unmatched || []
+  const duplicates = fleet?.duplicates || []
   const unmatchedParts = splitUnmatched(unmatched)
   const inbox = fleet?.inbox || []
   const stats = fleet?.stats
@@ -702,6 +727,8 @@ function FleetApp() {
     ? 'New Drive files are detected, renamed with the plate, and matched to registration rows in Sheets.'
     : active === 'Unmatched'
       ? 'Photos, insurance, and logbook files still in their Drive folders that are not matched to a Registration Number on STOCK DOCUMENTS.'
+      : active === 'Duplicates'
+        ? 'Shown only when one registration number has more than one logbook, insurance file, or photo. The file matched on the sheet is not a duplicate.'
       : active === 'Insurance inbox'
         ? 'Insurance PDFs from the insurance mailbox are downloaded, renamed Insurance - {plate}, and stored in the certificates folder.'
         : active === 'Logbook inbox'
@@ -737,7 +764,7 @@ function FleetApp() {
         <div className="workspace-card"><div className="workspace-avatar">{initials}</div><div><span>Google Drive</span><small>{sessionUser.email}</small></div></div>
       <nav className="nav-list" aria-label="Primary navigation">{nav.map(({ label, icon: Icon }) => {
         const remaining = processJob?.running ? Math.max(0, processJob.attempted - processJob.done) : 0
-        const count = label === 'Unmatched' ? unmatched.length : label === 'Insurance inbox' ? insuranceReviewCount : label === 'Logbook inbox' ? logbookReviewCount : label === 'Processing' ? remaining : 0
+        const count = label === 'Unmatched' ? unmatched.length : label === 'Duplicates' ? duplicates.length : label === 'Insurance inbox' ? insuranceReviewCount : label === 'Logbook inbox' ? logbookReviewCount : label === 'Processing' ? remaining : 0
         return <button key={label} className={`nav-item ${active === label ? 'active' : ''}`} onClick={() => go(label)}><Icon size={18} /><span>{label}</span>{count ? <b>{count}</b> : null}</button>
       })}</nav>
       <div className="sidebar-bottom">
@@ -793,6 +820,7 @@ function FleetApp() {
                 </button>
               </div>
               <div className="attention-list">
+                <button type="button" className="attention-item" onClick={() => go('Duplicates')}><div className="attention-icon blue"><Copy size={17} /></div><div><strong>{duplicates.length} extra file{duplicates.length === 1 ? '' : 's'}</strong><span>Registration numbers with more than one logbook, insurance file, or photo. The sheet match is not counted.</span></div><ArrowUpRight size={16} /></button>
                 <button type="button" className="attention-item" onClick={() => { setStatusFilter('Needs attention'); setVehiclePage(1); go('Vehicles') }}><div className="attention-icon yellow"><FileText size={17} /></div><div><strong>{attention} vehicles incomplete ({shareParts(complete, vehicleCount).missingPct}%)</strong><span>{shareLabel(attention, vehicleCount)} missing logbook, agreement, certificate, photo, or collateral</span></div><ArrowUpRight size={16} /></button>
                 <button type="button" className="attention-item" onClick={() => go('Vehicles')}><div className="attention-icon yellow"><Clock size={17} /></div><div><strong>{(stats?.insuranceWeek || 0) + (stats?.insuranceTwoDays || 0) + (stats?.insuranceExpired || 0)} insurance covers need a date check</strong><span>{stats?.insuranceTwoDays || 0} in the last 2 days · {stats?.insuranceWeek || 0} in the next week{stats?.insuranceExpired ? ` · ${stats.insuranceExpired} expired` : ''}</span></div><ArrowUpRight size={16} /></button>
                 <button type="button" className="attention-item" onClick={() => go('Insurance inbox')}><div className="attention-icon blue"><Mail size={17} /></div><div><strong>{insuranceReviewCount} certificates need review</strong><span>{fleet?.config?.insuranceInboxEmail || 'Insurance mailbox'} · Gmail attachments below the match threshold</span></div><ArrowUpRight size={16} /></button>
@@ -805,8 +833,9 @@ function FleetApp() {
         {active === 'Vehicles' && <section className="panel table-panel standalone"><div className="panel-heading"><div><h2>All vehicles</h2><p>{fleet?.databaseConnected && fleet.databaseVehicles ? `Read from Neon (${fleet.databaseVehicles} plates). Import again in Settings after a full sheet scan.` : fleet?.config?.spreadsheetId ? `Matched to Registration Number rows on STOCK DOCUMENTS in ${fleet.config.spreadsheetName || 'Fleet Assets'}.` : 'Vehicles come from STOCK DOCUMENTS on Fleet Assets or Fleet Assets - KE once Sheets access is granted.'}</p></div><button className="button primary" onClick={() => openUpload()} disabled={!configured}><Plus size={16} /> Upload document</button></div><div className="table-toolbar"><div className="search-box"><Search size={16} /><input value={query} onChange={(e) => { setQuery(e.target.value); setVehiclePage(1) }} placeholder="Search plate or brand..." aria-label="Search plate or brand" /></div><label className="field-label">Status<select className="assign-input" value={statusFilter} onChange={(e) => { setStatusFilter(e.target.value as StatusFilter); setVehiclePage(1) }}><option value="all">All</option><option value="Complete">Complete</option><option value="Needs attention">Needs attention</option></select></label><BrandFilter value={brandFilter} brands={brands} unbrandedCount={unbrandedCount} onChange={(next) => { setBrandFilter(next); setVehiclePage(1) }} /><MissingFilters value={missingFilters} onChange={(next) => { setMissingFilters(next); setVehiclePage(1) }} /></div><VehicleTable vehicles={vehicles} total={vehicleTotal} page={vehiclePage} pageSize={vehiclePageSize} pageSizes={[25, 50, 100]} loading={tableBusy} onPageChange={setVehiclePage} onPageSizeChange={(size) => { setVehiclePageSize(size); setVehiclePage(1) }} onSelect={setSelected} /></section>}
         {active === 'Insurance inbox' && <InboxView kind="certificate" inbox={insuranceInbox} config={fleet?.config ?? null} gmailConnected={Boolean(fleet?.gmailConnected)} ocrConfigured={Boolean(fleet?.ocrConfigured)} busy={Boolean(busy)} onSync={() => refresh(syncGmail(), 'Insurance and logbook mailboxes checked.')} onAssign={(input) => refresh(assignUnmatched(input), `Assigned ${input.plate}.`)} />}
         {active === 'Logbook inbox' && <InboxView kind="logbook" inbox={logbookInbox} config={fleet?.config ?? null} gmailConnected={Boolean(fleet?.gmailConnected)} ocrConfigured={Boolean(fleet?.ocrConfigured)} busy={Boolean(busy)} onSync={() => refresh(syncGmail(), 'Insurance and logbook mailboxes checked.')} onAssign={(input) => refresh(assignUnmatched(input), `Assigned ${input.plate}.`)} />}
-        {active === 'Processing' && <ProcessingView lastSync={fleet?.lastSync} vehicles={vehicleCount} unmatched={unmatched} busy={Boolean(busy)} configured={configured} ocrConfigured={Boolean(fleet?.ocrConfigured)} ingest={fleet?.ingest} job={processJob} photosFolder={fleet?.config?.photosName} certificatesFolder={fleet?.config?.certificatesName} logbooksFolder={fleet?.config?.logbooksName} agreementsFolder={fleet?.config?.agreementsName} onScan={() => refresh(loadFleet('full', false, 'off'), 'Folders scanned. No OCR ran — start photos, insurance, logbooks, agreements, or fix wrong plates below.')} onGmail={() => refresh(syncGmail(), 'Insurance and logbook mailboxes checked.')} onOcr={() => refresh(ocrUnmatchedPhotos(), 'Read plates from unmatched photos, insurance, logbook, and agreement files.', false)} onStart={async (focus) => { if ((processJob?.running || processJob?.advancing) && processJob.focus && processJob.focus !== focus) await stopProcessing(); const prior = processJob?.lastAction || fleet?.ingest?.lastAction; const resume = prior?.focus === focus && (prior.status === 'paused' || prior.status === 'running'); setProcessJob((current) => ({ running: true, watching: current?.watching || '', attempted: current?.attempted || 0, done: current?.done || 0, matched: current?.matched || 0, failed: current?.failed || 0, batch: current?.batch || 1, remaining: current?.remaining || 0, lastRenamed: current?.lastRenamed || 0, advancing: false, focus, items: current?.items || [], lastAction: current?.lastAction || prior })); return refresh(runProcessing(focus), resume ? `Continuing ${processFocusLabel(focus)} from ${prior?.fileName || 'the last file'}.` : `Started ${processFocusLabel(focus)}. Stop to pause; start the same job to continue from there.`, false) }} onStop={async () => { const next = await stopProcessing(); setProcessJob(next); moreWorkRef.current = false; setFleet((current) => current?.ingest ? { ...current, ingest: { ...current.ingest, more: false, remaining: next.lastAction?.remaining || current.ingest.remaining, lastAction: next.lastAction } } : current); setBusy(''); setBatchNotice(''); setSuccess(next.lastAction?.fileName ? `Paused after ${next.lastAction.fileName}. Start the same job to continue.` : 'Paused. Start the same job to continue from this point.') }} />}
+        {active === 'Processing' && <ProcessingView lastSync={fleet?.lastSync} vehicles={vehicleCount} unmatched={unmatched} busy={Boolean(busy)} configured={configured} ocrConfigured={Boolean(fleet?.ocrConfigured)} ingest={fleet?.ingest} job={processJob} photosFolder={fleet?.config?.photosName} certificatesFolder={fleet?.config?.certificatesName} logbooksFolder={fleet?.config?.logbooksName} agreementsFolder={fleet?.config?.agreementsName} onScan={() => refresh(loadFleet('full', false, 'off'), 'Folders scanned. No OCR ran — start photos, insurance, logbooks, agreements, or fix wrong plates below.')} onGmail={() => refresh(syncGmail(), 'Insurance and logbook mailboxes checked.')} onOcr={() => refresh(ocrUnmatchedPhotos(), 'Read plates from unmatched photos, insurance, logbook, and agreement files.', false)} onStart={async (focus) => { if ((processJob?.running || processJob?.advancing) && processJob.focus && processJob.focus !== focus) await stopProcessing(); const prior = processJob?.lastAction || fleet?.ingest?.lastAction; const resume = prior?.focus === focus && (prior.status === 'paused' || prior.status === 'running'); setProcessJob((current) => ({ running: true, watching: current?.watching || '', attempted: current?.attempted || 0, done: current?.done || 0, matched: current?.matched || 0, failed: current?.failed || 0, batch: current?.batch || 1, remaining: current?.remaining || 0, lastRenamed: current?.lastRenamed || 0, advancing: false, focus, items: current?.items || [], lastAction: current?.lastAction || prior })); return refresh(runProcessing(focus), resume ? `Continuing ${processFocusLabel(focus)} from ${prior?.fileName || 'the last file'}.` : `Started ${processFocusLabel(focus)}. Stop to pause; start the same job to continue from there.`, false) }} onStop={async () => { const next = await stopProcessing(); setProcessJob(next); moreWorkRef.current = false; setFleet((current) => current?.ingest ? { ...current, ingest: { ...current.ingest, more: false, remaining: next.lastAction?.remaining || current.ingest.remaining, lastAction: next.lastAction } } : current); setBusy(''); setBatchNotice(''); setSuccess(next.lastAction?.fileName ? `Paused after ${next.lastAction.fileName}. Start the same job to continue.` : 'Paused. Start the same job to continue from this point.') }} onLinkSheet={(type) => refresh(linkPerceivedMatches(type))} />}
         {active === 'Unmatched' && <UnmatchedView files={unmatched} category={unmatchedKind} onCategory={setUnmatchedKind} busy={Boolean(busy)} ocrConfigured={Boolean(fleet?.ocrConfigured)} onAssign={(input) => refresh(assignUnmatched(input), `Assigned ${input.plate}.`)} onAssignMany={(inputs) => refresh(assignUnmatchedBatch(inputs), `Assigned ${inputs.length} registration number${inputs.length === 1 ? '' : 's'}.`)} onOcr={(fileId) => refresh(ocrUnmatchedPhotos(fileId), fileId ? 'Read plate from file.' : 'Read plates from unmatched photos, insurance, logbook, and agreement files.', false)} />}
+        {active === 'Duplicates' && <DuplicatesView files={duplicates} />}
         {active === 'Audit log' && <AuditView events={fleet?.audit || []} onExport={() => exportAudit(fleet?.audit || [])} />}
         {active === 'Settings' && <SettingsView fleet={fleet} firstRun={!configured} busy={Boolean(busy)} onSave={(input) => { writeSavedFolders(input); return refresh(saveFolderConfig(input), 'Folder and sheet configuration saved.') }} onImportDatabase={() => refresh(syncRegisterToDatabase(), 'STOCK DOCUMENTS tab on Fleet Assets - KE copied into Neon.')} onBrowse={listDriveFolders} onBrowseSheets={listSpreadsheets} />}
       </div>
@@ -919,14 +948,18 @@ function InboxView({ kind, inbox, config, gmailConnected, ocrConfigured, busy, o
 
 const PROCESS_STEPS = ['queued', 'opening', 'reading', 'renaming', 'matching', 'matched'] as const
 
-function processStageLabel(stage: string, plate?: string | null) {
+function processStageLabel(stage: string, plate?: string | null, detail?: string) {
   if (stage === 'queued') return 'Queued'
   if (stage === 'opening') return 'Opening'
   if (stage === 'reading') return 'Reading plate'
   if (stage === 'renaming') return 'Renaming'
   if (stage === 'matching') return 'Matching sheet'
   if (stage === 'matched') return 'Matched'
-  if (stage === 'unmatched') return plate ? 'Not on register' : 'Needs a plate'
+  if (stage === 'unmatched') {
+    if (!plate) return 'Needs a plate'
+    if (/not linked/i.test(detail || '')) return 'Not linked'
+    return 'Not on register'
+  }
   if (stage === 'error') return 'Could not process'
   return stage
 }
@@ -940,7 +973,7 @@ function ProcessThumb({ item }: { item: { fileId: string; name: string; preview:
   return item.type === 'photo' ? <ImageIcon size={22} /> : <FileText size={22} />
 }
 
-function ProcessingView({ lastSync, vehicles, unmatched, busy, configured, ocrConfigured, ingest, job, photosFolder, certificatesFolder, logbooksFolder, agreementsFolder, onScan, onGmail, onOcr, onStart, onStop }: { lastSync?: string; vehicles: number; unmatched: TypedFile[]; busy: boolean; configured: boolean; ocrConfigured: boolean; ingest?: FleetSnapshot['ingest']; job: ProcessJob | null; photosFolder?: string; certificatesFolder?: string; logbooksFolder?: string; agreementsFolder?: string; onScan: () => void; onGmail: () => void; onOcr: () => void; onStart: (focus: ProcessFocus) => void | Promise<void>; onStop: () => void | Promise<void> }) {
+function ProcessingView({ lastSync, vehicles, unmatched, busy, configured, ocrConfigured, ingest, job, photosFolder, certificatesFolder, logbooksFolder, agreementsFolder, onScan, onGmail, onOcr, onStart, onStop, onLinkSheet }: { lastSync?: string; vehicles: number; unmatched: TypedFile[]; busy: boolean; configured: boolean; ocrConfigured: boolean; ingest?: FleetSnapshot['ingest']; job: ProcessJob | null; photosFolder?: string; certificatesFolder?: string; logbooksFolder?: string; agreementsFolder?: string; onScan: () => void; onGmail: () => void; onOcr: () => void; onStart: (focus: ProcessFocus) => void | Promise<void>; onStop: () => void | Promise<void>; onLinkSheet: (type: 'photo' | 'certificate' | 'logbook') => void | Promise<void> }) {
   const percent = job?.attempted ? Math.round((job.done / job.attempted) * 100) : 0
   const liveItems: typeof job.items = []
   const liveIds = new Set<string>()
@@ -994,6 +1027,23 @@ function ProcessingView({ lastSync, vehicles, unmatched, busy, configured, ocrCo
         <button className="button secondary" onClick={onGmail} disabled={busy || !configured}><Mail size={15} /> Check inboxes</button>
         <button className="button secondary" onClick={onOcr} disabled={busy || !configured || !ocrConfigured}><ScanLine size={15} /> Read plates</button>
       </div>
+      <div className="process-tasks" role="group" aria-label="Link documents onto the sheet">
+        <button type="button" className="process-task" onClick={() => onLinkSheet('certificate')} disabled={busy || live || !configured}>
+          <strong>Link all insurance</strong>
+          <span>Write every insurance file that is not on its STOCK DOCUMENTS row yet. Rows that already have insurance are left alone.</span>
+          <em>Link all</em>
+        </button>
+        <button type="button" className="process-task" onClick={() => onLinkSheet('logbook')} disabled={busy || live || !configured}>
+          <strong>Link all logbooks</strong>
+          <span>Write every logbook that is not on its STOCK DOCUMENTS row yet. Rows that already have a logbook are left alone.</span>
+          <em>Link all</em>
+        </button>
+        <button type="button" className="process-task" onClick={() => onLinkSheet('photo')} disabled={busy || live || !configured}>
+          <strong>Link all photos</strong>
+          <span>Write every photo that is not on its STOCK DOCUMENTS row yet. Rows that already have a photo are left alone.</span>
+          <em>Link all</em>
+        </button>
+      </div>
     </section>
     <section className="panel table-panel standalone">
       <div className="panel-heading"><div><h2>{advancing ? `Starting batch ${(job?.batch || 1) + 1}` : job?.running ? `Now processing · batch ${batch}` : 'Processing queue'} {(job?.items.length || waiting.length) ? <span className="count-pill">{(job?.items.length || 0) + waiting.length}</span> : null}</h2><p>{advancing ? 'This batch is complete. The next files are being opened, read, and matched.' : job?.running ? 'Each card updates as the file is opened, read, renamed, and matched. The next batch starts when this one finishes.' : 'Drop files in the photos, insurance, logbooks, or agreements folders, then watch them here until they match a Registration Number.'}</p></div>{job?.running ? <span className="live-pill"><LoaderCircle size={14} className="spin-icon" /> Live</span> : advancing ? <span className="live-pill"><LoaderCircle size={14} className="spin-icon" /> Next batch</span> : ingest?.more ? <span className="live-pill">Next batch</span> : null}</div>
@@ -1018,7 +1068,7 @@ function ProcessingView({ lastSync, vehicles, unmatched, busy, configured, ocrCo
                 })}
               </ol>
             </div>
-            <span className={`process-flag stage-${item.stage}`}>{item.stage === 'opening' || item.stage === 'reading' || item.stage === 'renaming' || item.stage === 'matching' ? <LoaderCircle size={14} className="spin-icon" /> : null}{processStageLabel(item.stage, item.plate)}</span>
+            <span className={`process-flag stage-${item.stage}`}>{item.stage === 'opening' || item.stage === 'reading' || item.stage === 'renaming' || item.stage === 'matching' ? <LoaderCircle size={14} className="spin-icon" /> : null}{processStageLabel(item.stage, item.plate, item.detail)}</span>
           </article>
         })}
         {waiting.map((file) => <article className="process-card stage-unmatched" key={file.id}>
@@ -1029,6 +1079,65 @@ function ProcessingView({ lastSync, vehicles, unmatched, busy, configured, ocrCo
       </div>
     </section>
   </div>
+}
+
+function surplusGroups(files: DuplicateFile[]) {
+  const groups = new Map<string, { key: string; plate: string; type: DocType; uploadedName: string; uploadedLink?: string; surplus: DuplicateFile[] }>()
+  for (const file of files) {
+    const plate = file.plate || ''
+    const key = `${plate}:${file.type}:${file.uploadedId}`
+    const current = groups.get(key)
+    if (current) current.surplus.push(file)
+    else groups.set(key, { key, plate, type: file.type, uploadedName: file.uploadedName, uploadedLink: file.uploadedLink, surplus: [file] })
+  }
+  return [...groups.values()].sort((a, b) => a.plate.localeCompare(b.plate) || a.type.localeCompare(b.type))
+}
+
+function DuplicatesView({ files }: { files: DuplicateFile[] }) {
+  const [category, setCategory] = useState<UnmatchedKind>('all')
+  const split = splitUnmatched(files)
+  const visible = category === 'all' ? files : files.filter((file) => file.type === category)
+  const groups = surplusGroups(visible)
+  return <section className="panel table-panel standalone">
+    <div className="panel-heading">
+      <div>
+        <h2>Duplicates <span className="count-pill">{files.length}</span></h2>
+        <p>{files.length ? `${split.photos.length} extra photo${split.photos.length === 1 ? '' : 's'} · ${split.insurance.length} extra insurance · ${split.logbooks.length} extra logbook${split.logbooks.length === 1 ? '' : 's'}` : 'No extra files.'} A registration number appears here only when it has more than one logbook, insurance file, or photo. Three logbooks show as one matched file and two extras. The matched file is not a duplicate.</p>
+      </div>
+    </div>
+    <div className="unmatched-filters" role="tablist" aria-label="Duplicate file type">
+      <button type="button" className={`filter-chip ${category === 'all' ? 'active' : ''}`} aria-pressed={category === 'all'} onClick={() => setCategory('all')}>All {files.length}</button>
+      <button type="button" className={`filter-chip ${category === 'photo' ? 'active' : ''}`} aria-pressed={category === 'photo'} onClick={() => setCategory('photo')}>Photos {split.photos.length}</button>
+      <button type="button" className={`filter-chip ${category === 'certificate' ? 'active' : ''}`} aria-pressed={category === 'certificate'} onClick={() => setCategory('certificate')}>Insurance {split.insurance.length}</button>
+      <button type="button" className={`filter-chip ${category === 'logbook' ? 'active' : ''}`} aria-pressed={category === 'logbook'} onClick={() => setCategory('logbook')}>Logbooks {split.logbooks.length}</button>
+    </div>
+    <div className="duplicate-list">
+      {groups.length === 0 ? <div className="empty-row">Nothing to show. This list stays empty until one registration number has two or more logbooks, insurance files, or photos, and one of them is the file linked on STOCK DOCUMENTS.</div> : groups.map((group) => (
+        <article className="duplicate-card" key={group.key}>
+          <header className="duplicate-card-head">
+            <strong>{group.plate || 'No plate'}</strong>
+            <span>{labelFor(group.type)}</span>
+          </header>
+          <div className="duplicate-pair">
+            <div className="duplicate-side uploaded">
+              <span className="eyebrow">Matched on the sheet</span>
+              <strong>{group.uploadedName}</strong>
+              {group.uploadedLink && <a href={group.uploadedLink} target="_blank" rel="noreferrer">Open matched file</a>}
+            </div>
+            <div className="duplicate-side surplus">
+              <span className="eyebrow">Extra {group.surplus.length === 1 ? 'file' : 'files'} · not the sheet match</span>
+              {group.surplus.map((file) => (
+                <div className="surplus-file" key={file.id}>
+                  <strong>{file.name}</strong>
+                  {file.webViewLink && <a href={file.webViewLink} target="_blank" rel="noreferrer">Open extra file</a>}
+                </div>
+              ))}
+            </div>
+          </div>
+        </article>
+      ))}
+    </div>
+  </section>
 }
 
 function UnmatchedView({ files, category, onCategory, busy, ocrConfigured, onAssign, onAssignMany, onOcr }: {

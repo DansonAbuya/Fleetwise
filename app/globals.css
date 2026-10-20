@@ -434,6 +434,21 @@ td strong, .muted-cell { display: block; }
 .unmatched-group-head h3 { font-size: 13px; margin: 0; letter-spacing: -.02em; }
 .unmatched-list { padding: 0 21px 15px; }
 .unmatched-row { display: flex; align-items: center; gap: 13px; border-top: 1px solid var(--line); padding: 16px 0; }
+.process-link-note { margin: 10px 0 0; color: #84909d; font-size: 12px; line-height: 1.45; }
+.duplicate-list { display: flex; flex-direction: column; gap: 12px; padding: 0 21px 18px; }
+.duplicate-card { border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; }
+.duplicate-card-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 12px; }
+.duplicate-card-head strong { font-size: 16px; letter-spacing: -.03em; }
+.duplicate-card-head span { color: #84909d; font-size: 12px; }
+.duplicate-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.duplicate-side { display: flex; flex-direction: column; gap: 6px; min-width: 0; border-radius: 12px; padding: 12px; }
+.duplicate-side.uploaded { background: var(--gold-soft); }
+.duplicate-side.surplus { background: var(--warn-soft); }
+.duplicate-side .eyebrow { font-size: 10px; }
+.duplicate-side strong { font-size: 13px; word-break: break-word; }
+.duplicate-side a { font-size: 12px; font-weight: 700; }
+.surplus-file { display: flex; flex-direction: column; gap: 4px; padding-top: 8px; border-top: 1px solid rgba(0, 0, 0, .06); }
+.surplus-file:first-of-type { padding-top: 0; border-top: 0; }
 .file-icon { width: 36px; height: 36px; border-radius: 10px; background: var(--gold-soft); color: var(--gold-deep); display: grid; place-items: center; }
 .file-info { width: 245px; }
 .file-info strong, .file-info span, .reason span, .reason strong, .confidence span, .confidence strong { display: block; }
@@ -696,6 +711,7 @@ td strong, .muted-cell { display: block; }
   .process-flag { grid-column: 1 / -1; justify-self: start; }
   .batch-percent { right: 20px; }
   .unmatched-row { align-items: flex-start; flex-wrap: wrap; }
+  .duplicate-pair { grid-template-columns: 1fr; }
   .file-info { width: calc(100% - 48px); }
   .reason, .confidence { width: auto; margin-left: 47px; }
   .unmatched-row .button { margin-left: auto; }

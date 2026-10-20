@@ -26,7 +26,7 @@ try {
   corePath = ''
 }
 
-const MAX_WORKERS = 5
+const MAX_WORKERS = process.env.VERCEL ? 1 : 5
 const DETECT_MAX_EDGE = 1280
 const pool = []
 const waiters = []

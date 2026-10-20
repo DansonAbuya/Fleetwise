@@ -1,9 +1,9 @@
 import type { DocKind, Document, Vehicle } from '@prisma/client'
-import { insuranceAlerts, insuranceState } from '@/lib/insurance'
+import { insuranceAlerts, insuranceState, type InsuranceCover } from '@/lib/insurance'
 import { compactPlate } from '@/lib/plates'
-import { prisma } from '@/lib/prisma'
+import { databaseConfigured, prisma } from '@/lib/prisma'
 import type { DocType, TypedFile, VehicleRecord } from '@/lib/types'
-import { fleetStats, slimVehicle, type VehicleQuery } from '@/lib/vehicles'
+import { attachInsurance, fleetStats, slimVehicle, type VehicleQuery } from '@/lib/vehicles'
 
 type VehicleWithDocs = Vehicle & { documents: Document[] }
 
@@ -61,7 +61,32 @@ export async function importVehiclesToDatabase(vehicles: VehicleRecord[]) {
   return { imported: unique.length }
 }
 
-export async function loadRegisterFromDatabase(input: VehicleQuery = {}) {
+/** Write commencement and expiry onto existing vehicle rows. Does not touch Fleet Assets. */
+export async function saveCoverDates(covers: Record<string, InsuranceCover>) {
+  if (!databaseConfigured()) return { updated: 0 }
+  const entries = Object.entries(covers).flatMap(([plate, cover]) => {
+    const key = compactPlate(plate)
+    if (!key || (!cover?.commencement && !cover?.expiry)) return []
+    return [[key, cover] as const]
+  })
+  if (!entries.length) return { updated: 0 }
+  const db = prisma()
+  let updated = 0
+  for (let index = 0; index < entries.length; index += 20) {
+    const batch = entries.slice(index, index + 20)
+    const results = await Promise.all(batch.map(([plate, cover]) => db.vehicle.updateMany({
+      where: { plate },
+      data: {
+        ...(cover.commencement ? { commencement: cover.commencement } : {}),
+        ...(cover.expiry ? { expiry: cover.expiry } : {}),
+      },
+    })))
+    updated += results.reduce((sum, result) => sum + result.count, 0)
+  }
+  return { updated }
+}
+
+export async function loadRegisterFromDatabase(input: VehicleQuery = {}, covers: Record<string, InsuranceCover> = {}) {
   const db = prisma()
   const pageSize = Math.min(100, Math.max(10, input.pageSize || 25))
   const where = registerWhere(input)
@@ -92,8 +117,8 @@ export async function loadRegisterFromDatabase(input: VehicleQuery = {}) {
   ])
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
   const page = Math.min(Math.max(1, input.page || 1), totalPages)
-  const vehicles = rows.map(toVehicleRecord).map(slimVehicle)
-  const statsSource: VehicleRecord[] = all.map((row) => ({
+  const vehicles = attachInsurance(rows.map(toVehicleRecord), covers).map(slimVehicle)
+  const statsSource = attachInsurance(all.map((row) => ({
     plate: row.plate,
     brand: row.brand,
     files: {
@@ -109,15 +134,18 @@ export async function loadRegisterFromDatabase(input: VehicleQuery = {}) {
     status: row.status === 'Complete' ? 'Complete' as const : 'Needs attention' as const,
     updated: '',
     insurance: insuranceState({ commencement: row.commencement, expiry: row.expiry }),
-  }))
-  const covers = Object.fromEntries(all.map((row) => [row.plate, { commencement: row.commencement, expiry: row.expiry }]))
+  })), covers)
+  const merged = Object.fromEntries(statsSource.map((vehicle) => [vehicle.plate, {
+    commencement: vehicle.insurance?.commencement || null,
+    expiry: vehicle.insurance?.expiry || null,
+  }]))
   return {
     vehicles,
     total,
     page,
     pageSize,
     stats: fleetStats(statsSource),
-    insuranceAlerts: insuranceAlerts(covers),
+    insuranceAlerts: insuranceAlerts(merged),
   }
 }
 

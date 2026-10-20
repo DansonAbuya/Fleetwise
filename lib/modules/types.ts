@@ -1,4 +1,4 @@
-import type { DocType, FleetConfig, TypedFile, VehicleRecord } from '@/lib/types'
+import type { DocType, DuplicateFile, FleetConfig, TypedFile, VehicleRecord } from '@/lib/types'
 
 export type SheetSyncMode = 'auto' | 'full' | 'match'
 
@@ -26,6 +26,7 @@ export type ModuleSyncResult = {
 export type ModuleRegister = {
   vehicles: VehicleRecord[]
   unmatched: TypedFile[]
+  duplicates: DuplicateFile[]
 }
 
 export type SheetModule = {

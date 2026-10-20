@@ -45,7 +45,7 @@ export async function driveGet<T>(path: string, params: Record<string, string> =
 
 const FOLDER_MIME = 'application/vnd.google-apps.folder'
 const MAX_NESTED_FOLDERS = 80
-const FOLDER_LIST_CACHE_MS = 20_000
+const FOLDER_LIST_CACHE_MS = process.env.VERCEL ? 10 * 60 * 1000 : 20_000
 const FOLDER_LIST_CONCURRENCY = 5
 const folderFilesCache = new Map<string, { at: number; files: DriveItem[] }>()
 

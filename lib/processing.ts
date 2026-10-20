@@ -238,17 +238,12 @@ export function touchProcessItem(fileId: string, patch: Partial<Omit<ProcessItem
   recount()
 }
 
-export function markProcessMatches(matched: string[] = [], missing: string[] = [], register?: Set<string>) {
+export function markProcessMatches(matched: string[] = [], missing: string[] = [], register?: Set<string>, linked?: Set<string>) {
   const matchedSet = new Set(matched.map((plate) => compactPlate(plate)).filter(Boolean))
   const missingSet = new Set(missing.map((plate) => compactPlate(plate)).filter(Boolean))
-  const onSheet = (key: string) => {
-    if (matchedSet.has(key)) return true
-    if (missingSet.has(key)) return false
-    if (register?.size) return register.has(key)
-    return false
-  }
+  const onRegister = (key: string) => Boolean(register?.has(key) || matchedSet.has(key))
   for (const item of job.items) {
-    if (item.stage === 'error') continue
+    if (item.stage === 'error' || item.stage === 'queued' || item.stage === 'opening' || item.stage === 'reading') continue
     const key = compactPlate(item.plate || '')
     if (!key) {
       if (item.stage === 'queued' || item.stage === 'opening' || item.stage === 'reading' || item.stage === 'renaming' || item.stage === 'matching') continue
@@ -257,19 +252,25 @@ export function markProcessMatches(matched: string[] = [], missing: string[] = [
       }
       continue
     }
-    if (onSheet(key)) {
+    if (missingSet.has(key) || !onRegister(key)) {
+      touchProcessItem(item.fileId, {
+        stage: 'unmatched',
+        detail: `Named ${key} from the document. Add this Registration Number on STOCK DOCUMENTS, then scan again.`,
+        plate: key,
+      })
+      continue
+    }
+    if (linked?.has(item.fileId)) {
       touchProcessItem(item.fileId, {
         stage: 'matched',
-        detail: matchedSet.has(key)
-          ? `Matched ${key} on STOCK DOCUMENTS`
-          : `Matched ${key} on STOCK DOCUMENTS. The sheet row already had this document.`,
+        detail: `Linked this file on the ${key} row in STOCK DOCUMENTS.`,
         plate: key,
       })
       continue
     }
     touchProcessItem(item.fileId, {
       stage: 'unmatched',
-      detail: `Named ${key} from the document. Add this Registration Number on STOCK DOCUMENTS, then scan again.`,
+      detail: `${key} is on STOCK DOCUMENTS, but this file is not linked on that row yet.`,
       plate: key,
     })
   }

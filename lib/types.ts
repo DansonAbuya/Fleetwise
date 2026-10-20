@@ -18,6 +18,14 @@ export type TypedFile = DriveItem & {
   plate: string | null
 }
 
+/** A folder file left over after this plate and document type were already uploaded to STOCK DOCUMENTS. */
+export type DuplicateFile = TypedFile & {
+  sheetLabel: string
+  uploadedId: string
+  uploadedName: string
+  uploadedLink?: string
+}
+
 export type InsuranceCoverView = {
   commencement: string | null
   expiry: string | null
@@ -114,6 +122,7 @@ export type FleetSnapshot = {
   config: FleetConfig | null
   vehicles: VehicleRecord[]
   unmatched: TypedFile[]
+  duplicates: DuplicateFile[]
   insuranceAlerts?: InsuranceAlert[]
   inbox: InboxItem[]
   audit: AuditEvent[]
@@ -135,6 +144,8 @@ export type FleetSnapshot = {
     focus?: 'all' | 'photos' | 'certificates' | 'logbooks' | 'agreements' | 'repair' | 'repair-photos' | 'repair-certificates' | 'repair-logbooks' | 'repair-agreements'
     error?: string
     notice?: string
+    follow?: 'gmail' | 'files'
+    preserve?: boolean
     lastAction?: {
       focus?: 'all' | 'photos' | 'certificates' | 'logbooks' | 'agreements' | 'repair' | 'repair-photos' | 'repair-certificates' | 'repair-logbooks' | 'repair-agreements'
       status?: string

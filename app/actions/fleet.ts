@@ -8,22 +8,23 @@ import { coverFromCertificate, isOcrImage, ocrConfigured, plateFromImage, resolv
 import { cleanInboxEmail, isInboxEmail, mailboxSearchQuery } from '@/lib/mailboxes'
 import { warmPlateReader } from '@/lib/read-plate-runner'
 import { SHEET_MODULES, stockDocumentsModule, syncSheetModules } from '@/lib/modules'
-import { driveIdFromUri, readStockRegisterSnapshot, writeInsuranceDates } from '@/lib/modules/stock-documents'
+import { driveIdFromUri, linkUnlinkedDocuments, readStockRegisterSnapshot } from '@/lib/modules/stock-documents'
+import { surplusCopies } from '@/lib/unmatched-files'
 import type { SheetCells, SheetSyncMode } from '@/lib/modules/types'
 import { compactPlate, extractKenyanPlate, listRegistrationNumbers, parseKenyanPlate, parsePhotoPlate, pickOcrPlate, plateFromCertificateText, plateFromLogbookText, plateFromText, printedRegistrationPlate } from '@/lib/plates'
 import { attachLastAction, beginProcessJob, endProcessJob, fileMatchesFocus, getProcessJob, isProcessCancelled, isProcessRunning, isRepairFocus, isStaleProcess, markProcessMatches, processFocusLabel, processGeneration, requestProcessStop, touchProcessItem, type ProcessFocus } from '@/lib/processing'
-import { confirmedPlate, forgetFile, hydrateProcessCursor, isCursorHydrated, lastAction, markConfirmed, markTried, persistProcessCursor, recordLastAction, wasTriedRecently } from '@/lib/process-cursor'
+import { confirmedPlate, forgetFile, hydrateProcessCursor, isCursorHydrated, lastAction, markConfirmed, markTried, persistProcessCursor, recordLastAction, wasTriedRecently, canResumeProcessQueue, processQueueItems, replaceProcessQueue, takeProcessQueueItem, type ProcessQueueItem } from '@/lib/process-cursor'
 import { requireSession } from '@/lib/session'
 import { databaseConfigured, databaseStatus } from '@/lib/prisma'
-import { importVehiclesToDatabase, loadExportedRegister, loadRegisterFromDatabase } from '@/lib/register-db'
+import { importVehiclesToDatabase, loadExportedRegister, loadRegisterFromDatabase, saveCoverDates } from '@/lib/register-db'
 import { attachInsurance, EMPTY_STATS, filterVehicles, fleetStats, insuranceAlertsFor, slimVehicle, type VehicleQuery } from '@/lib/vehicles'
 import type { DocType, FleetConfig, FleetSnapshot, InboxItem, TypedFile, VehicleRecord } from '@/lib/types'
 
 let rememberedPlates: string[] = []
 
 const ON_VERCEL = Boolean(process.env.VERCEL)
-const OCR_BATCH = ON_VERCEL ? 4 : 10
-const OCR_CONCURRENCY = ON_VERCEL ? 2 : 5
+const OCR_BATCH = ON_VERCEL ? 1 : 10
+const OCR_CONCURRENCY = ON_VERCEL ? 1 : 5
 
 async function mapPool<T>(items: T[], limit: number, fn: (item: T) => Promise<void>) {
   const generation = processGeneration()
@@ -64,6 +65,7 @@ function emptySnapshot(session: { name: string; email: string; image?: string },
     config,
     vehicles: [],
     unmatched: [],
+    duplicates: [],
     insuranceAlerts: [],
     inbox: [],
     audit: [],
@@ -129,7 +131,9 @@ export async function loadVehiclePage(input: VehicleQuery = {}) {
     const database = await databaseStatus().catch(() => ({ connected: false, vehicles: 0 }))
     if (database.connected && database.vehicles > 0) {
       try {
-        const fromDb = await loadRegisterFromDatabase(input)
+        const covers = config ? await loadInsuranceCovers(config).catch(() => ({} as Record<string, InsuranceCover>)) : {}
+        if (Object.keys(covers).length) await saveCoverDates(covers).catch(() => {})
+        const fromDb = await loadRegisterFromDatabase(input, covers)
         return { ...fromDb, error: undefined as string | undefined }
       } catch (err) {
         return {
@@ -210,20 +214,28 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
   const jobFocus: ProcessFocus | undefined = requested || (!live.cancelled && (live.running || live.advancing) ? live.focus : undefined)
   const skipOcr = focus === 'off' || (!requested && (isProcessCancelled() || live.cancelled || !jobFocus))
   const watchPass = focus === 'off'
-  const skipSheetWrite = watchPass && mode === 'auto'
   const skipExtras = watchPass && mode === 'auto'
-  const preview = config.spreadsheetId ? await readStockRegisterSnapshot(config) : { vehicles: [], unmatched: [], plates: new Set<string>(), cells: new Map() as SheetCells, error: undefined as string | undefined }
-  let ingest = { watching: '', attempted: 0, renamed: 0, remaining: 0, more: false, error: undefined as string | undefined, renamedFiles: [] as TypedFile[], started: false, focus: jobFocus }
+  const preview = config.spreadsheetId ? await readStockRegisterSnapshot(config) : { vehicles: [], unmatched: [], duplicates: [], plates: new Set<string>(), cells: new Map() as SheetCells, error: undefined as string | undefined }
+  let ingest = { watching: '', attempted: 0, renamed: 0, remaining: 0, more: false, error: undefined as string | undefined, renamedFiles: [] as TypedFile[], started: false, focus: jobFocus, notice: undefined as string | undefined }
   let files: TypedFile[] = []
+  const warming = !skipOcr ? warmPlateReader().catch(() => {}) : Promise.resolve()
+  const resumeQueue = ON_VERCEL && !skipOcr && canResumeProcessQueue(jobFocus || 'all')
   try {
-    const listed = await scanFolders(config, preview.plates, preview.cells, undefined, { fresh: !skipOcr || mode === 'full' })
-    ingest = skipOcr
-      ? { watching: '', attempted: 0, renamed: 0, remaining: 0, more: false, error: undefined, renamedFiles: [] as TypedFile[], started: false, focus: undefined }
-      : await ingestIncoming(config, session.name, mode, listed.files, preview.plates, jobFocus || 'all')
-    files = mergeTypedFiles(listed.files, ingest.renamedFiles)
-    if (!isProcessRunning()) {
-      const cleared = await clearUnmatchedFolderMarks(files)
-      if (cleared.length) files = mergeTypedFiles(files, cleared)
+    if (resumeQueue) {
+      await warming
+      ingest = await ingestQueued(config, session.name, jobFocus || 'all', preview.plates)
+      files = [...processQueueItems().map(queueItemToFile), ...ingest.renamedFiles]
+    } else {
+      const listed = await scanFolders(config, preview.plates, preview.cells, undefined, { fresh: ON_VERCEL ? false : !skipOcr || mode === 'full' })
+      await warming
+      ingest = skipOcr
+        ? { watching: '', attempted: 0, renamed: 0, remaining: 0, more: false, error: undefined, renamedFiles: [] as TypedFile[], started: false, focus: undefined }
+        : await ingestIncoming(config, session.name, mode, listed.files, preview.plates, jobFocus || 'all', preview.cells)
+      files = mergeTypedFiles(listed.files, ingest.renamedFiles)
+      if (!isProcessRunning() && !(ON_VERCEL && !skipOcr)) {
+        const cleared = await clearUnmatchedFolderMarks(files)
+        if (cleared.length) files = mergeTypedFiles(files, cleared)
+      }
     }
   } catch (err) {
     ingest = { watching: '', attempted: 0, renamed: 0, remaining: 0, more: false, error: err instanceof Error ? err.message : 'Drive scan failed', renamedFiles: [], started: ingest.started, focus: jobFocus }
@@ -232,35 +244,42 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
   }
   const ingestGen = processGeneration()
   const continuing = Boolean(ingest.more)
-  const sheet = skipSheetWrite && !ingest.renamed
+  const deferSheet = ON_VERCEL && !skipOcr && (ingest.started || Boolean(ingest.more))
+  let sheet = deferSheet || !files.length
     ? { plates: preview.plates, error: preview.error, missing: [] as string[], matched: [] as string[], hint: '', cells: preview.cells, more: false }
     : await syncSheetIndex(config, continuing ? 'match' : mode, files)
+  for (let round = 0; !deferSheet && sheet.more && !sheet.error && round < 5; round += 1) {
+    const next = await syncSheetIndex(config, continuing ? 'match' : mode, files)
+    sheet = { ...next, matched: [...new Set([...(sheet.matched || []), ...(next.matched || [])])] }
+  }
+  const linkCells = sheet.cells?.size ? sheet.cells : preview.cells
+  if (getProcessJob().items.length && linkCells?.size) {
+    markProcessMatches(sheet.matched, sheet.missing, sheet.plates || preview.plates, linkedSheetFileIds(linkCells))
+  }
   if ((ingest.started || closeLive) && isProcessRunning() && !isStaleProcess(ingestGen)) {
-    markProcessMatches(sheet.matched, sheet.missing, sheet.plates)
     endProcessJob(ingest.error || sheet.error, { remaining: ingest.remaining || 0, renamed: ingest.renamed })
   }
   const emptyGmail = { state: { processedIds: [] as string[], items: [] as InboxItem[] } }
   const plates = sheet.plates?.size ? sheet.plates : preview.plates
   const cells = sheet.cells?.size ? sheet.cells : preview.cells
-  const [{ vehicles, unmatched }, audit, gmail] = await Promise.all([
+  const [{ vehicles, unmatched, duplicates }, audit, gmail] = await Promise.all([
     scanFolders(config, plates, cells, files),
     skipExtras || continuing ? Promise.resolve([] as FleetSnapshot['audit']) : loadAudit().catch(() => [] as FleetSnapshot['audit']),
     skipExtras || continuing ? Promise.resolve(emptyGmail) : loadGmailState().catch(() => emptyGmail),
   ])
   const covers = await loadInsuranceCovers(config).catch(() => ({} as Awaited<ReturnType<typeof loadInsuranceCovers>>))
-  if (!skipSheetWrite && Object.keys(covers).length) {
-    await writeInsuranceDates(config, covers, continuing ? 'match' : mode).catch(() => ({ written: 0 }))
-  }
   const filledCovers = skipOcr && !isProcessRunning()
     ? await backfillInsuranceCovers(config, files, covers)
     : covers
   const registerVehicles = attachInsurance(vehicles.length ? vehicles : preview.vehicles, filledCovers)
+  if (Object.keys(filledCovers).length) await saveCoverDates(filledCovers).catch(() => {})
   const database = await databaseStatus().catch(() => ({ configured: false, connected: false, vehicles: 0 }))
   return {
     user: { name: session.name, email: session.email, image: session.image },
     config,
     vehicles: [],
     unmatched,
+    duplicates,
     insuranceAlerts: insuranceAlertsFor(filledCovers),
     inbox: gmail.state.items,
     audit,
@@ -279,7 +298,7 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
       remaining: ingest.remaining || lastAction().remaining || 0,
       focus: ingest.focus || jobFocus,
       lastAction: lastAction(),
-      notice: sheetMatchNotice(sheet.matched, ingest.renamedFiles),
+      notice: ingest.notice || sheetMatchNotice(sheet.matched, ingest.renamedFiles),
       error: ingest.error || (sheet.missing.length
         ? `These files were renamed in Drive, but STOCK DOCUMENTS has no Registration Number for ${listRegistrationNumbers(sheet.missing)}. Add that plate on the sheet, then scan again.`
         : undefined),
@@ -366,6 +385,7 @@ export async function saveFolderConfig(input: {
     config,
     vehicles: [],
     unmatched: [],
+    duplicates: [],
     inbox: [],
     audit,
     lastSync: config.lastSync,
@@ -469,16 +489,31 @@ export async function syncGmail() {
   else if (!logbooksEmail) mailboxes.push({ type: 'certificate', query: 'has:attachment newer_than:21d' })
   if (logbooksEmail) mailboxes.push({ type: 'logbook', query: mailboxSearchQuery(config.logbooksInboxEmail || '') })
 
+  let handled = 0
+  let moreMail = false
   for (const mailbox of mailboxes) {
+    if (moreMail) break
     const messages = await listRecentMessages(mailbox.query)
     for (const listed of messages) {
-      if (processed.has(`${mailbox.type}:${listed.id}`)) continue
+      if (moreMail) break
+      const messageKey = `${mailbox.type}:${listed.id}`
+      if (processed.has(messageKey)) continue
       const message = await getMessage(listed.id)
       const meta = messageMeta(message)
       const attachments = findAttachments(message.payload).filter((item) => /\.(pdf|png|jpe?g|webp|tif?f|heic)$/i.test(item.filename))
-      processed.add(`${mailbox.type}:${listed.id}`)
-      if (!attachments.length) continue
+      if (!attachments.length) {
+        processed.add(messageKey)
+        continue
+      }
+      let messageOpen = false
       for (const attachment of attachments) {
+        const attachmentKey = `${messageKey}:${attachment.attachmentId}`
+        if (processed.has(attachmentKey)) continue
+        if (ON_VERCEL && handled >= 1) {
+          messageOpen = true
+          moreMail = true
+          break
+        }
         const bytes = await getAttachment(listed.id, attachment.attachmentId)
         let match = { plate: null as string | null, confidence: 0 }
         try {
@@ -515,15 +550,34 @@ export async function syncGmail() {
         await appendAudit(
           config,
           auto ? 'System' : session.name,
-          auto ? `Matched ${uploaded.name} to ${match.plate}` : `Stored unmatched ${mailbox.type} attachment ${uploaded.name}`,
+          auto ? `Renamed ${attachment.filename} to ${uploaded.name} for ${match.plate}` : `Stored unmatched ${mailbox.type} attachment ${uploaded.name}`,
         )
+        processed.add(attachmentKey)
+        handled += 1
       }
+      if (!messageOpen) processed.add(messageKey)
     }
   }
 
   const nextState = { lastSync: new Date().toISOString(), processedIds: [...processed], items: items.slice(0, 80) }
   await saveGmailState(config, nextState, fileId)
   await touchSync(config, nextState.lastSync)
+  if (ON_VERCEL && moreMail) {
+    return emptySnapshot(session, config, {
+      inbox: items.slice(0, 80),
+      gmailConnected: true,
+      lastSync: nextState.lastSync,
+      ingest: {
+        watching: 'Gmail',
+        attempted: handled,
+        renamed: handled,
+        more: true,
+        follow: 'gmail',
+        preserve: true,
+        notice: 'Renamed the latest inbox file. The next insurance or logbook attachment starts on its own. Leave this page open.',
+      },
+    })
+  }
   return loadFleet()
 }
 
@@ -551,10 +605,50 @@ export async function loadWorkspacePanels() {
   }
 }
 
+export async function linkPerceivedMatches(type: 'photo' | 'certificate' | 'logbook') {
+  await requireSession()
+  const config = await requireConfig()
+  if (!config.spreadsheetId) throw new Error('Choose the Fleet Assets workbook in Settings first.')
+  const label = type === 'certificate' ? 'insurance' : type === 'logbook' ? 'logbooks' : 'photos'
+  const preview = await readStockRegisterSnapshot(config, { fresh: true })
+  if (preview.error) throw new Error(preview.error)
+  const listed = await scanFolders(config, preview.plates, preview.cells, undefined, { fresh: true })
+  const waiting = listed.files.filter((file) => file.type === type)
+  if (!waiting.length) throw new Error(`No ${label} files were found in the configured folders.`)
+  const linked = await linkUnlinkedDocuments(config, type, waiting)
+  if (!linked.written) {
+    if (linked.unnamed) {
+      throw new Error(`${linked.unnamed} logbook${linked.unnamed === 1 ? ' is' : 's are'} not linked because the file is not named {plate} - Logbook yet.`)
+    }
+    if (linked.missing.length) {
+      const plates = listRegistrationNumbers(linked.missing)
+      throw new Error(`${linked.missing.length} ${label} registration number${linked.missing.length === 1 ? ' is' : 's are'} not on STOCK DOCUMENTS${plates ? ` (${plates})` : ''}, so those files cannot be linked.`)
+    }
+    throw new Error(`Every ${label} file that has a registration number is already linked on its STOCK DOCUMENTS row.`)
+  }
+  const plates = listRegistrationNumbers(linked.matched)
+  await appendAudit(config, 'System', `Linked ${linked.written} ${label} file${linked.written === 1 ? '' : 's'} onto STOCK DOCUMENTS${plates ? ` for ${plates}` : ''}`)
+  const fleet = await loadFleet('auto', false, 'off')
+  const skipped = [
+    linked.missing.length ? `${linked.missing.length} registration number${linked.missing.length === 1 ? ' is' : 's are'} not on the sheet, so those files were left in the folder.` : '',
+    linked.unnamed ? `${linked.unnamed} logbook${linked.unnamed === 1 ? ' still needs' : 's still need'} the name {plate} - Logbook before it can be linked.` : '',
+  ].filter(Boolean).join(' ')
+  return {
+    ...fleet,
+    ingest: {
+      watching: label,
+      attempted: waiting.length,
+      renamed: linked.written,
+      notice: `Linked ${linked.written} ${label} file${linked.written === 1 ? '' : 's'} onto the empty STOCK DOCUMENTS cells${plates ? ` for ${plates}` : ''}.${skipped ? ` ${skipped}` : ''}`,
+    },
+  }
+}
+
 export async function runProcessing(focus: ProcessFocus = 'all') {
   await requireSession()
   const config = await requireConfig()
   await hydrateProcessCursor(config).catch(() => lastAction())
+  replaceProcessQueue([], focus)
   recordLastAction({
     focus,
     status: 'running',
@@ -566,9 +660,12 @@ export async function runProcessing(focus: ProcessFocus = 'all') {
 
 export async function continueProcessing() {
   await requireSession()
+  const config = await loadConfig()
+  if (config) await hydrateProcessCursor(config).catch(() => lastAction())
   const live = getProcessJob()
-  const focus = (live.focus || lastAction().focus || 'all') as ProcessFocus
-  if (live.cancelled || lastAction().status === 'paused' || lastAction().status === 'done') {
+  const stored = lastAction()
+  const focus = (live.focus || stored.focus || 'all') as ProcessFocus
+  if (live.cancelled || stored.status === 'paused' || (stored.status === 'done' && !stored.remaining)) {
     return loadFleet('auto', true, 'off')
   }
   recordLastAction({
@@ -603,17 +700,42 @@ export async function ocrUnmatchedPhotos(fileId?: string) {
   if (!ocrConfigured()) {
     throw new Error('Photo OCR is not available. Restart the app after installing tesseract.js.')
   }
-  const preview = config.spreadsheetId ? await readStockRegisterSnapshot(config) : { plates: new Set<string>() }
-  const { unmatched, files } = await scanFolders(config, preview.plates, undefined, undefined, { fresh: true })
+  const preview = config.spreadsheetId ? await readStockRegisterSnapshot(config) : { plates: new Set<string>(), cells: new Map() as SheetCells }
+  const { unmatched, files } = await scanFolders(config, preview.plates, preview.cells, undefined, { fresh: true })
   const target = fileId ? files.find((file) => file.id === fileId) || unmatched.find((file) => file.id === fileId) : undefined
   if (fileId) forgetFile(fileId)
   const readable = unmatched.filter((file) => isOcrImage(file.mimeType, file.name) || plateFromText(file.name))
   const waiting = fileId ? (target ? [target] : []) : readable.filter((file) => !hasCanonicalName(file) && !nameMatchesDocument(file) && !wasTriedRecently(file.id))
-  const remainingAfter = Math.max(0, waiting.length - OCR_BATCH)
-  const candidates = waiting.slice(0, OCR_BATCH)
-  if (!candidates.length) {
+  if (!waiting.length) {
     throw new Error(fileId ? 'That file is not a JPEG, PNG, or PDF Fleetwise can OCR.' : 'No unmatched photos, insurance, logbook, or agreement files to OCR.')
   }
+  if (ON_VERCEL) {
+    replaceProcessQueue(waiting.map(toQueueItem), 'repair')
+    recordLastAction({
+      focus: 'repair',
+      status: 'running',
+      remaining: waiting.length,
+      detail: `Reading plates on ${waiting.length} unmatched file${waiting.length === 1 ? '' : 's'}, one at a time.`,
+    })
+    await persistProcessCursor(config).catch(() => {})
+    attachLastAction(lastAction())
+    return emptySnapshot(session, config, {
+      gmailConnected: false,
+      ingest: {
+        watching: 'Unmatched',
+        attempted: 0,
+        renamed: 0,
+        remaining: waiting.length,
+        more: true,
+        focus: 'repair',
+        follow: 'files',
+        preserve: true,
+        notice: `Queued ${waiting.length} unmatched file${waiting.length === 1 ? '' : 's'}. Photos, insurance, logbooks, and agreements are renamed one at a time. Leave this page open.`,
+      },
+    })
+  }
+  const remainingAfter = Math.max(0, waiting.length - OCR_BATCH)
+  const candidates = waiting.slice(0, OCR_BATCH)
   if (isProcessRunning()) {
     throw new Error('A processing run is already live. Open Processing to watch it.')
   }
@@ -863,7 +985,7 @@ async function fillMissingCertificateCovers(config: FleetConfig, vehicles: Vehic
   })
   if (changed) {
     await saveInsuranceCovers(config, next).catch(() => {})
-    await writeInsuranceDates(config, next, 'auto').catch(() => {})
+    await saveCoverDates(next).catch(() => {})
   }
   return next
 }
@@ -907,7 +1029,8 @@ function watchingLabel(config: FleetConfig, focus: ProcessFocus) {
   return [config.photosName || 'photos', config.certificatesName || 'certificates', config.logbooksName || 'logbooks', config.agreementsName || 'agreements'].join(', ')
 }
 
-function pendingForFocus(file: TypedFile, focus: ProcessFocus, sheetPlates?: Set<string>, missingDates?: Set<string>) {
+function pendingForFocus(file: TypedFile, focus: ProcessFocus, sheetPlates?: Set<string>, missingDates?: Set<string>, extraIds?: Set<string>) {
+  if (extraIds?.has(file.id)) return false
   if (!fileMatchesFocus(file, focus)) return false
   const named = namedPlateOf(file)
   const matched = plateOnRegister(named, sheetPlates)
@@ -947,11 +1070,86 @@ function orderForResume(files: TypedFile[], focus: ProcessFocus) {
   return [...unnamed, ...rotated]
 }
 
-async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 'full' = 'auto', files?: TypedFile[], sheetPlates?: Set<string>, focus: ProcessFocus = 'all') {
+function toQueueItem(file: TypedFile): ProcessQueueItem {
+  return {
+    id: file.id,
+    name: file.name,
+    mimeType: file.mimeType,
+    type: file.type,
+    plate: file.plate,
+    modifiedTime: file.modifiedTime,
+    webViewLink: file.webViewLink,
+    parents: file.parents,
+  }
+}
+
+function queueItemToFile(item: ProcessQueueItem): TypedFile {
+  return { ...item, plate: item.plate || null }
+}
+
+async function ingestQueued(config: FleetConfig, user: string, focus: ProcessFocus, sheetPlates?: Set<string>) {
+  const watching = watchingLabel(config, focus)
+  const next = takeProcessQueueItem()
+  if (!next) {
+    replaceProcessQueue([], focus)
+    recordLastAction({ focus, status: 'done', remaining: 0, detail: `${processFocusLabel(focus)} caught up.` })
+    await persistProcessCursor(config).catch(() => {})
+    attachLastAction(lastAction())
+    return { watching, attempted: 0, renamed: 0, remaining: 0, more: false, error: undefined as string | undefined, renamedFiles: [] as TypedFile[], started: false, focus, notice: undefined as string | undefined, lastAction: lastAction() }
+  }
+  const file = queueItemToFile(next)
+  const remaining = processQueueItems().length
+  await warmPlateReader().catch(() => {})
+  beginProcessJob(watching, [file], focus)
+  let renamed = 0
+  let error: string | undefined
+  const renamedFiles: TypedFile[] = []
+  let plate: string | null = null
+  let fileName = file.name
+  try {
+    const result = await ocrMatchFile(config, user, file, { sheetPlates, focus, takenNames: new Set(processQueueItems().map((item) => item.name)) })
+    renamed = result.renamed
+    plate = result.plate
+    fileName = result.file?.name || file.name
+    if (result.file) renamedFiles.push(result.file)
+    if (result.error) error = result.error
+    markTried(file.id)
+  } catch (err) {
+    error = err instanceof Error ? err.message : 'OCR error'
+    markTried(file.id)
+    await appendAudit(config, 'System', `OCR failed for ${file.name}: ${error}`).catch(() => {})
+  }
+  if (!remaining) replaceProcessQueue([], focus)
+  recordLastAction({
+    focus,
+    status: remaining ? 'running' : 'done',
+    fileId: file.id,
+    fileName,
+    plate: plate || undefined,
+    remaining,
+    done: (lastAction().done || 0) + 1,
+    detail: error
+      ? error
+      : remaining
+        ? `${processFocusLabel(focus)} finished ${fileName}. ${remaining} still waiting.`
+        : `${processFocusLabel(focus)} caught up.`,
+  })
+  await persistProcessCursor(config).catch(() => {})
+  attachLastAction(lastAction())
+  const notice = error
+    ? `${error} ${remaining} file${remaining === 1 ? '' : 's'} still waiting.`
+    : remaining
+      ? `${renamed ? `Renamed ${fileName}. ` : ''}${remaining} ${processFocusLabel(focus).toLowerCase()} file${remaining === 1 ? '' : 's'} still waiting. Leave this page open.`
+      : renamed ? `Renamed ${fileName}.` : `${processFocusLabel(focus)} caught up.`
+  return { watching, attempted: 1, renamed, remaining, more: remaining > 0, error: undefined, renamedFiles, started: true, focus, follow: 'files' as const, notice, lastAction: lastAction() }
+}
+
+async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 'full' = 'auto', files?: TypedFile[], sheetPlates?: Set<string>, focus: ProcessFocus = 'all', cells?: SheetCells) {
   const watching = watchingLabel(config, focus)
   const listed = files || (await scanFolders(config)).files
+  const extraIds = new Set(surplusCopies(listed, cells).map((file) => file.id))
   for (const file of listed) {
-    if (file.type !== 'photo') continue
+    if (file.type !== 'photo' || extraIds.has(file.id)) continue
     if (focus === 'repair-photos' || focus === 'repair' || !hasCanonicalName(file)) forgetFile(file.id)
   }
   const covers = await loadInsuranceCovers(config).catch(() => ({} as Record<string, InsuranceCover>))
@@ -964,11 +1162,41 @@ async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 
     }),
   )
   const toNormalize = listed.filter((file) => {
-    if (!fileMatchesFocus(file, focus) || hasCanonicalName(file)) return false
+    if (extraIds.has(file.id) || !fileMatchesFocus(file, focus) || hasCanonicalName(file)) return false
     if (file.type === 'logbook' || file.type === 'agreement') return Boolean(plateFromTypedName(file.name, file.type) || extractKenyanPlate(file.name))
     return Boolean(plateFromTypedName(file.name, file.type)) && !isOcrImage(file.mimeType, file.name)
   })
-  const pending = orderForResume(listed.filter((file) => pendingForFocus(file, focus, sheetPlates, missingDates)), focus)
+  const pending = orderForResume(listed.filter((file) => pendingForFocus(file, focus, sheetPlates, missingDates, extraIds)), focus)
+  if (ON_VERCEL) {
+    const queued = uniqueTypedFiles([...toNormalize, ...pending])
+    replaceProcessQueue(queued.map(toQueueItem), focus)
+    const waiting = queued.length
+    recordLastAction({
+      focus,
+      status: waiting ? 'running' : 'done',
+      remaining: waiting,
+      detail: waiting
+        ? `Found ${waiting} ${processFocusLabel(focus).toLowerCase()} file${waiting === 1 ? '' : 's'} to rename.`
+        : `${processFocusLabel(focus)} caught up.`,
+    })
+    await persistProcessCursor(config).catch(() => {})
+    attachLastAction(lastAction())
+    return {
+      watching,
+      attempted: 0,
+      renamed: 0,
+      remaining: waiting,
+      more: waiting > 0,
+      renamedFiles: [] as TypedFile[],
+      started: false,
+      focus,
+      follow: 'files' as const,
+      notice: waiting
+        ? `Queued ${waiting} ${processFocusLabel(focus).toLowerCase()} file${waiting === 1 ? '' : 's'}. Photos, insurance, logbooks, and agreements rename one at a time. Leave this page open.`
+        : undefined,
+      lastAction: lastAction(),
+    }
+  }
   const ocrCandidates = pending.slice(0, OCR_BATCH)
   const candidates = uniqueTypedFiles([...toNormalize, ...(ocrConfigured() ? ocrCandidates : [])])
   if (!ocrConfigured() && ocrCandidates.length && !toNormalize.length) {
@@ -1147,6 +1375,18 @@ function unreadPlateMessage(files: { name: string }[], folders: string) {
   const shown = names.slice(0, 3).join(', ')
   const extra = names.length > 3 ? ` and ${names.length - 3} more` : ''
   return `Couldn't read a Kenyan registration number from ${shown}${extra} in ${folders}. Open Unmatched and type the plate if you can see it in the file, or use a closer photo of the plate.`
+}
+
+function linkedSheetFileIds(cells?: SheetCells) {
+  const ids = new Set<string>()
+  if (!cells?.size) return ids
+  for (const row of cells.values()) {
+    for (const type of ['logbook', 'certificate', 'photo', 'agreement'] as const) {
+      const id = driveIdFromUri(row[type]?.uri)
+      if (id) ids.add(id)
+    }
+  }
+  return ids
 }
 
 function sheetMatchNotice(matched?: string[], renamedFiles?: TypedFile[]) {

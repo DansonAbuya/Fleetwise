@@ -1,5 +1,5 @@
 import { findFileByName, readJsonFile, upsertJsonFile } from '@/lib/drive'
-import type { FleetConfig } from '@/lib/types'
+import type { DocType, FleetConfig } from '@/lib/types'
 import type { ProcessFocus } from '@/lib/processing'
 
 export const PROCESS_NAME = 'fleetwise-process.json'
@@ -18,15 +18,30 @@ export type ProcessLastAction = {
   done?: number
 }
 
+export type ProcessQueueItem = {
+  id: string
+  name: string
+  mimeType?: string
+  type: DocType
+  plate: string | null
+  modifiedTime?: string
+  webViewLink?: string
+  parents?: string[]
+}
+
 type CursorFile = ProcessLastAction & {
   tried?: Record<string, number>
   confirmed?: Record<string, { plate: string; at: number }>
+  queue?: ProcessQueueItem[]
+  queueFocus?: ProcessFocus
   fileId?: string
 }
 
 let cursor: ProcessLastAction = { status: 'idle' }
 const tried = new Map<string, number>()
 const confirmed = new Map<string, { plate: string; at: number }>()
+let queue: ProcessQueueItem[] = []
+let queueFocus: ProcessFocus | undefined
 let storedFileId: string | undefined
 let hydrated = false
 
@@ -82,6 +97,23 @@ export function forgetFile(fileId: string) {
   confirmed.delete(fileId)
 }
 
+export function canResumeProcessQueue(focus: ProcessFocus) {
+  return queue.length > 0 && queueFocus === focus
+}
+
+export function processQueueItems() {
+  return queue.slice()
+}
+
+export function replaceProcessQueue(items: ProcessQueueItem[], focus: ProcessFocus) {
+  queue = items
+  queueFocus = focus
+}
+
+export function takeProcessQueueItem() {
+  return queue.shift()
+}
+
 export function recordLastAction(patch: Partial<ProcessLastAction>) {
   cursor = {
     ...cursor,
@@ -113,6 +145,8 @@ export async function hydrateProcessCursor(config: FleetConfig) {
     remaining: stored.remaining || 0,
     done: stored.done || 0,
   }
+  queue = Array.isArray(stored.queue) ? stored.queue.filter((item) => item?.id && item?.name && item?.type) : []
+  queueFocus = stored.queueFocus
   for (const [id, at] of Object.entries(stored.tried || {})) {
     if (typeof at === 'number') tried.set(id, at)
   }
@@ -129,6 +163,8 @@ export async function persistProcessCursor(config: FleetConfig) {
     ...cursor,
     tried: Object.fromEntries(tried),
     confirmed: Object.fromEntries(confirmed),
+    queue,
+    queueFocus,
   }
   try {
     const file = await upsertJsonFile(config.certificatesId, PROCESS_NAME, payload, storedFileId)

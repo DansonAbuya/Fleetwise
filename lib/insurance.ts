@@ -75,13 +75,6 @@ export function parseCoverDate(value: string | null | undefined) {
   return null
 }
 
-export function sheetCoverDate(iso: string | null | undefined) {
-  if (!iso) return ''
-  const [year, month, day] = iso.split('-')
-  if (!year || !month || !day) return iso
-  return `${day}/${month}/${year}`
-}
-
 export function formatCoverDate(iso: string | null | undefined) {
   if (!iso) return 'Not read'
   const [year, month, day] = iso.split('-').map(Number)

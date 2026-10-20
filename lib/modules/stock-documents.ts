@@ -19,17 +19,15 @@ import {
   type GridCell,
   type SheetMerge,
 } from '@/lib/sheets/client'
-import { insuranceState, parseCoverDate, sheetCoverDate, type InsuranceCover } from '@/lib/insurance'
+import { insuranceState, parseCoverDate } from '@/lib/insurance'
 import { compactPlate, extractKenyanPlate, plateFromText } from '@/lib/plates'
 import { hasCanonicalName } from '@/lib/document-names'
-import { isUnmatchedFile, onRegister } from '@/lib/unmatched-files'
+import { isUnmatchedFile, onRegister, surplusCopies } from '@/lib/unmatched-files'
 import { DEFAULT_COLLATERAL_PARENT_ID, type DocType, type FleetConfig, type TypedFile, type VehicleRecord } from '@/lib/types'
 import type { ModuleSyncResult, SheetCell, SheetCells, SheetDocKey, SheetModule, SheetSyncMode } from '@/lib/modules/types'
 
 export const STOCK_TAB = 'STOCK DOCUMENTS'
 export const COLLATERAL_HEADER = 'Collateral Files'
-export const COMMENCEMENT_HEADER = 'Commencement'
-export const EXPIRY_HEADER = 'Expiry'
 export const FLEET_WORKBOOK_NAMES = ['Fleet Assets - KE', 'Fleet Assets'] as const
 
 type ColumnKey = DocType | 'photoBranded' | 'collateral' | 'agreement'
@@ -67,7 +65,7 @@ export function collateralParentId(config: FleetConfig) {
 
 export async function readStockRegisterSnapshot(config: FleetConfig, options?: { fresh?: boolean }) {
   if (!config.spreadsheetId) {
-    return { vehicles: [] as VehicleRecord[], unmatched: [] as TypedFile[], plates: new Set<string>(), cells: new Map() as SheetCells, error: undefined as string | undefined }
+    return { vehicles: [] as VehicleRecord[], unmatched: [] as TypedFile[], duplicates: [], plates: new Set<string>(), cells: new Map() as SheetCells, error: undefined as string | undefined }
   }
   try {
     const register = await loadStockRegister(config, options)
@@ -78,6 +76,7 @@ export async function readStockRegisterSnapshot(config: FleetConfig, options?: {
     return {
       vehicles: [] as VehicleRecord[],
       unmatched: [] as TypedFile[],
+      duplicates: [],
       plates: new Set<string>(),
       cells: new Map() as SheetCells,
       error: err instanceof Error ? err.message : 'Unable to read STOCK DOCUMENTS',
@@ -225,6 +224,85 @@ async function writeSheetMatches(config: FleetConfig, files: TypedFile[], mode: 
     cells: cellsFromRegister(register),
     more: chipRequests.length >= writeLimit,
   }
+}
+
+export async function linkUnlinkedDocuments(config: FleetConfig, type: 'photo' | 'certificate' | 'logbook', files: TypedFile[]) {
+  if (!config.spreadsheetId) return { written: 0, matched: [] as string[], missing: [] as string[], cells: new Map() as SheetCells }
+  const register = await loadStockRegister(config, { fresh: true })
+  const byPlate = new Map<string, TypedFile[]>()
+  for (const file of files) {
+    if (file.type !== type) continue
+    const plate = filePlate(file)
+    if (!plate || !driveViewLink(file)) continue
+    const list = byPlate.get(plate) || []
+    list.push(file)
+    byPlate.set(plate, list)
+  }
+  const missing: string[] = []
+  for (const plate of byPlate.keys()) {
+    if (!register.rows.has(plate) && !rowByLoosePlate(register, plate)) missing.push(plate)
+  }
+  const chipRequests: object[] = []
+  const matched: string[] = []
+  const seen = new Set<string>()
+  let unnamed = 0
+
+  function queue(row: StockRow, column: { col: number; value: string; uri?: string }, file: TypedFile) {
+    const link = driveViewLink(file)
+    if (!link || isDriveDocumentUri(column.uri)) return
+    chipRequests.push(chipRequest(register.sheetId, row.row, column.col, link))
+    column.value = chipTitle(file)
+    column.uri = link
+    if (!seen.has(row.plate)) {
+      seen.add(row.plate)
+      matched.push(row.plate)
+    }
+  }
+
+  function take(pool: TypedFile[], prefer: (file: TypedFile) => boolean) {
+    const index = pool.findIndex(prefer)
+    const chosen = index >= 0 ? pool.splice(index, 1)[0] : pool.shift()
+    return chosen
+  }
+
+  for (const row of register.rows.values()) {
+    const pool = [...(byPlate.get(row.plate) || [])]
+    if (!pool.length) continue
+    if (type === 'certificate') {
+      const column = row.columns.certificate
+      if (column && !isDriveDocumentUri(column.uri)) {
+        const file = take(pool, (file) => canonicalFileName(file))
+        if (file) queue(row, column, file)
+      }
+      continue
+    }
+    if (type === 'logbook') {
+      const column = row.columns.logbook
+      if (column && !isDriveDocumentUri(column.uri)) {
+        const canonical = pool.find((file) => hasCanonicalName(file))
+        if (canonical) queue(row, column, canonical)
+        else unnamed += 1
+      }
+      continue
+    }
+    const brandedColumn = row.columns.photoBranded
+    if (brandedColumn && !isDriveDocumentUri(brandedColumn.uri)) {
+      const brandedIndex = pool.findIndex((file) => /branded/i.test(file.name))
+      if (brandedIndex >= 0) queue(row, brandedColumn, pool.splice(brandedIndex, 1)[0])
+    }
+    const photoColumn = row.columns.photo
+    if (photoColumn && !isDriveDocumentUri(photoColumn.uri)) {
+      const normal = brandedColumn ? pool.filter((file) => !/branded/i.test(file.name)) : pool
+      const file = take(normal, (file) => canonicalFileName(file) && !/branded/i.test(file.name))
+      if (file) queue(row, photoColumn, file)
+    }
+  }
+
+  if (chipRequests.length) {
+    await applyChipBatches(config.spreadsheetId, chipRequests)
+    registerCache.set(`${config.spreadsheetId}:stock-documents`, { at: Date.now(), register })
+  }
+  return { written: chipRequests.length, matched, missing, unnamed, cells: cellsFromRegister(register) }
 }
 
 function chipTitle(file: { name?: string }) {
@@ -558,7 +636,9 @@ function buildRegister(files: TypedFile[], sync: Pick<ModuleSyncResult, 'keys' |
   const sheetPlates = sync.keys
   const sheetCells = sync.cells
   const onSheet = (plate: string | null) => onRegister(plate, sheetPlates)
-  const unmatched = files.filter((file) => isUnmatchedFile(file, sheetPlates))
+  const duplicates = surplusCopies(files, sheetCells)
+  const duplicateIds = new Set(duplicates.map((file) => file.id))
+  const unmatched = files.filter((file) => !duplicateIds.has(file.id) && isUnmatchedFile(file, sheetPlates))
   const byPlate = new Map<string, VehicleRecord>()
   for (const plate of sheetPlates || []) {
     byPlate.set(plate, {
@@ -656,7 +736,7 @@ function buildRegister(files: TypedFile[], sync: Pick<ModuleSyncResult, 'keys' |
       updated: formatSheetTime(vehicle.updated),
     }
   }).sort((a, b) => a.plate.localeCompare(b.plate))
-  return { vehicles, unmatched }
+  return { vehicles, unmatched, duplicates }
 }
 
 async function sync(config: FleetConfig, files: TypedFile[], mode: SheetSyncMode): Promise<ModuleSyncResult> {
@@ -677,50 +757,6 @@ async function sync(config: FleetConfig, files: TypedFile[], mode: SheetSyncMode
     cells: collateral.cells || matches.cells,
     more: Boolean(matches.more || collateral.more),
   }
-}
-
-export async function writeInsuranceDates(config: FleetConfig, covers: Record<string, InsuranceCover>, mode: SheetSyncMode = 'auto') {
-  if (mode === 'match' || !config.spreadsheetId || !Object.keys(covers).length) return { written: 0, cells: new Map() as SheetCells }
-  const register = await loadStockRegister(config)
-  if (!register.rows.size) return { written: 0, cells: cellsFromRegister(register) }
-  const requests: object[] = []
-  let nextColumn = register.nextColumn
-  let commencementCol = [...register.rows.values()].find((row) => row.commencement)?.commencement?.col
-  let expiryCol = [...register.rows.values()].find((row) => row.expiry)?.expiry?.col
-  if (!commencementCol) {
-    commencementCol = nextColumn
-    nextColumn += 1
-    requests.push(headerRequest(register.sheetId, register.headerRow, commencementCol, COMMENCEMENT_HEADER))
-    for (const row of register.rows.values()) row.commencement = { col: commencementCol, value: row.commencement?.value || '' }
-  }
-  if (!expiryCol) {
-    expiryCol = nextColumn
-    nextColumn += 1
-    requests.push(headerRequest(register.sheetId, register.headerRow, expiryCol, EXPIRY_HEADER))
-    for (const row of register.rows.values()) row.expiry = { col: expiryCol, value: row.expiry?.value || '' }
-  }
-  register.nextColumn = Math.max(register.nextColumn, nextColumn)
-  const writeLimit = mode === 'full' ? 400 : 80
-  for (const [plate, cover] of Object.entries(covers)) {
-    if (requests.length >= writeLimit) break
-    const row = register.rows.get(compactPlate(plate)) || rowByLoosePlate(register, compactPlate(plate))
-    if (!row) continue
-    const start = sheetCoverDate(cover.commencement)
-    const end = sheetCoverDate(cover.expiry)
-    if (start && row.commencement && parseCoverDate(row.commencement.value) !== cover.commencement) {
-      requests.push(headerRequest(register.sheetId, row.row, row.commencement.col, start))
-      row.commencement.value = start
-    }
-    if (end && row.expiry && parseCoverDate(row.expiry.value) !== cover.expiry) {
-      requests.push(headerRequest(register.sheetId, row.row, row.expiry.col, end))
-      row.expiry.value = end
-    }
-  }
-  if (requests.length) {
-    await applyChipBatches(config.spreadsheetId, requests)
-    registerCache.set(`${config.spreadsheetId}:stock-documents`, { at: Date.now(), register })
-  }
-  return { written: requests.length, cells: cellsFromRegister(register) }
 }
 
 export const stockDocumentsModule: SheetModule = {
