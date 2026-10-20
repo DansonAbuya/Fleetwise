@@ -2,7 +2,7 @@
  * STOCK DOCUMENTS workbook module.
  * To add another tab, copy this file, change id/label/headers/sync, then register it in lib/modules/index.ts.
  */
-import { createFolder, folderViewLink, listChildFolders } from '@/lib/drive'
+import { createFolder, folderViewLink, getFile, listChildFolders } from '@/lib/drive'
 import {
   applyChipBatches,
   cellContents,
@@ -52,8 +52,24 @@ type StockRegister = {
   nextColumn: number
 }
 
-const registerCache = new Map<string, { at: number; register: StockRegister }>()
-const CACHE_MS = 5 * 60 * 1000
+const registerCache = new Map<string, { modifiedTime: string; register: StockRegister }>()
+
+function cacheKeyFor(spreadsheetId: string) {
+  return `${spreadsheetId}:stock-documents`
+}
+
+function storeRegister(spreadsheetId: string, register: StockRegister, modifiedTime = '') {
+  registerCache.set(cacheKeyFor(spreadsheetId), { modifiedTime, register })
+}
+
+async function sheetModifiedTime(spreadsheetId: string) {
+  try {
+    const file = await getFile(spreadsheetId)
+    return file.modifiedTime || ''
+  } catch {
+    return ''
+  }
+}
 
 export function stockTabTitle(config: FleetConfig) {
   return config.logbooksSheet || STOCK_TAB
@@ -68,10 +84,13 @@ export async function readStockRegisterSnapshot(config: FleetConfig, options?: {
     return { vehicles: [] as VehicleRecord[], unmatched: [] as TypedFile[], duplicates: [], plates: new Set<string>(), cells: new Map() as SheetCells, error: undefined as string | undefined }
   }
   try {
+    const cacheKey = cacheKeyFor(config.spreadsheetId)
+    const before = registerCache.get(cacheKey)?.modifiedTime || ''
     const register = await loadStockRegister(config, options)
+    const after = registerCache.get(cacheKey)?.modifiedTime || ''
     const cells = cellsFromRegister(register)
     const built = buildRegister([], { keys: register.plates, cells })
-    return { ...built, plates: register.plates, cells, error: register.rows.size ? undefined : `Tab '${register.title}' in ${config.spreadsheetName || 'the workbook'} had no readable Registration Number plates.` }
+    return { ...built, plates: register.plates, cells, refreshed: !before || before !== after, error: register.rows.size ? undefined : `Tab '${register.title}' in ${config.spreadsheetName || 'the workbook'} had no readable Registration Number plates.` }
   } catch (err) {
     return {
       vehicles: [] as VehicleRecord[],
@@ -79,6 +98,7 @@ export async function readStockRegisterSnapshot(config: FleetConfig, options?: {
       duplicates: [],
       plates: new Set<string>(),
       cells: new Map() as SheetCells,
+      refreshed: false,
       error: err instanceof Error ? err.message : 'Unable to read STOCK DOCUMENTS',
     }
   }
@@ -88,9 +108,10 @@ export async function loadStockRegister(config: FleetConfig, options?: { fresh?:
   if (!config.spreadsheetId) {
     return { title: STOCK_TAB, sheetId: 0, rows: new Map(), plates: new Set(), samples: [], headerRow: 1, nextColumn: 1 }
   }
-  const cacheKey = `${config.spreadsheetId}:stock-documents`
+  const cacheKey = cacheKeyFor(config.spreadsheetId)
+  const modifiedTime = await sheetModifiedTime(config.spreadsheetId)
   const cached = registerCache.get(cacheKey)
-  if (!options?.fresh && cached && Date.now() - cached.at < CACHE_MS) return cached.register
+  if (!options?.fresh && modifiedTime && cached?.modifiedTime === modifiedTime) return cached.register
   const tabs = await listTabs(config.spreadsheetId)
   const preferred = pickTab(tabs, STOCK_TAB, [/stock documents?/i]) || pickTab(tabs, stockTabTitle(config), [/stock document/i, /stock/i, /register/i])
   const fallbacks = tabs.filter((tab) => /stock|register|fleet/i.test(tab.title) && tab.title !== preferred?.title)
@@ -99,7 +120,7 @@ export async function loadStockRegister(config: FleetConfig, options?: { fresh?:
   for (const tab of toRead) {
     try {
       const register = await readStockTab(config.spreadsheetId, tab.title, tab.sheetId, { rows: tab.rowCount, columns: tab.columnCount })
-      registerCache.set(cacheKey, { at: Date.now(), register })
+      storeRegister(config.spreadsheetId, register, modifiedTime)
       return register
     } catch (err) {
       lastError = err instanceof Error ? err.message : 'Unable to read sheet'
@@ -210,7 +231,7 @@ async function writeSheetMatches(config: FleetConfig, files: TypedFile[], mode: 
 
   if (chipRequests.length) {
     await applyChipBatches(config.spreadsheetId, chipRequests)
-    registerCache.set(`${config.spreadsheetId}:stock-documents`, { at: Date.now(), register })
+    storeRegister(config.spreadsheetId, register)
   }
   const sampleText = register.samples.length
     ? ` Values already in Registration Number on '${register.title}': ${register.samples.join(', ')}.`
@@ -301,7 +322,7 @@ export async function linkUnlinkedDocuments(config: FleetConfig, type: 'photo' |
 
   if (chipRequests.length) {
     await applyChipBatches(config.spreadsheetId, chipRequests)
-    registerCache.set(`${config.spreadsheetId}:stock-documents`, { at: Date.now(), register })
+    storeRegister(config.spreadsheetId, register)
   }
   return { written: chipRequests.length, matched, missing, unnamed, cells: cellsFromRegister(register) }
 }
@@ -376,7 +397,7 @@ async function ensureCollateralFolders(config: FleetConfig, mode: SheetSyncMode)
   if (header || requests.length) {
     await applyChipBatches(config.spreadsheetId, requests, header ? [header] : [])
     register.nextColumn = Math.max(register.nextColumn, collateralCol + 1)
-    registerCache.set(`${config.spreadsheetId}:stock-documents`, { at: Date.now(), register })
+    storeRegister(config.spreadsheetId, register)
   }
   const stillOpen = [...register.rows.values()].some((row) => row.columns.collateral && !isDriveDocumentUri(row.columns.collateral.uri))
   const hitCap = created >= createLimit || requests.length >= writeLimit

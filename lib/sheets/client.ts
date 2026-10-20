@@ -79,10 +79,11 @@ function columnLetters(count: number) {
   return letters
 }
 
-export async function readTabGrid(spreadsheetId: string, title: string, bounds?: { rows?: number; columns?: number }) {
-  const rows = Math.min(Math.max(bounds?.rows || 1000, 1), 4000)
-  const columns = Math.min(Math.max(bounds?.columns || 26, 8), 36)
-  const range = `${quotedSheetTitle(title)}!A1:${columnLetters(columns)}${rows}`
+const ROW_CHUNK = 500
+const MAX_SHEET_ROWS = 25000
+const MAX_SHEET_COLUMNS = 80
+
+async function readGridRange(spreadsheetId: string, title: string, range: string) {
   const data = await sheetsFetch(
     `/${spreadsheetId}?includeGridData=true&ranges=${encodeURIComponent(range)}&fields=sheets(properties(title),merges,data(rowData(values(formattedValue,effectiveValue,hyperlink,userEnteredValue,chipRuns))))`,
   ).then((res) => res.json()) as {
@@ -94,9 +95,41 @@ export async function readTabGrid(spreadsheetId: string, title: string, bounds?:
   }
   const sheet = (data.sheets || []).find((item) => item.properties?.title === title)
     || (data.sheets || []).find((item) => item.data?.[0]?.rowData?.length)
-  const rowData = sheet?.data?.[0]?.rowData || []
-  const values = rowData.map((row) => (row.values || []).map((cell) => cellContents(cell).value))
-  return { rowData, values, merges: sheet?.merges || [] }
+  return {
+    rowData: sheet?.data?.[0]?.rowData || [],
+    merges: sheet?.merges || [],
+  }
+}
+
+export async function readTabGrid(spreadsheetId: string, title: string, bounds?: { rows?: number; columns?: number }) {
+  const totalRows = Math.min(Math.max(bounds?.rows || 1000, 1), MAX_SHEET_ROWS)
+  const columns = Math.min(Math.max(bounds?.columns || 26, 8), MAX_SHEET_COLUMNS)
+  const quoted = quotedSheetTitle(title)
+  const rowData: { values?: GridCell[] }[] = []
+  const merges: SheetMerge[] = []
+  const seenMerges = new Set<string>()
+  let emptyChunks = 0
+  for (let start = 1; start <= totalRows; start += ROW_CHUNK) {
+    const end = Math.min(totalRows, start + ROW_CHUNK - 1)
+    const chunk = await readGridRange(spreadsheetId, title, `${quoted}!A${start}:${columnLetters(columns)}${end}`)
+    for (const merge of chunk.merges) {
+      const key = `${merge.startRowIndex}:${merge.endRowIndex}:${merge.startColumnIndex}:${merge.endColumnIndex}`
+      if (seenMerges.has(key)) continue
+      seenMerges.add(key)
+      merges.push(merge)
+    }
+    if (!chunk.rowData.length) {
+      emptyChunks += 1
+      if (emptyChunks >= 2) break
+      continue
+    }
+    emptyChunks = 0
+    for (let index = 0; index < chunk.rowData.length; index += 1) {
+      rowData[start - 1 + index] = chunk.rowData[index]
+    }
+  }
+  const values = Array.from({ length: rowData.length }, (_, index) => (rowData[index]?.values || []).map((cell) => cellContents(cell).value))
+  return { rowData, values, merges }
 }
 
 export async function applyChipBatches(spreadsheetId: string, chips: object[], extras: object[] = []) {
