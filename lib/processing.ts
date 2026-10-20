@@ -1,8 +1,10 @@
 import { compactPlate } from '@/lib/plates'
-import type { ProcessLastAction } from '@/lib/process-cursor'
+import { openProcessSession, type ProcessLastAction } from '@/lib/process-cursor'
+import { processFocusLabel, type ProcessFocus } from '@/lib/process-focus'
 import type { DocType } from '@/lib/types'
 
-export type ProcessFocus = 'all' | 'photos' | 'certificates' | 'logbooks' | 'agreements' | 'repair' | 'repair-photos' | 'repair-certificates' | 'repair-logbooks' | 'repair-agreements'
+export type { ProcessFocus }
+export { processFocusLabel }
 export type ProcessStage = 'queued' | 'opening' | 'reading' | 'renaming' | 'matching' | 'matched' | 'unmatched' | 'error'
 
 export type ProcessItem = {
@@ -76,6 +78,12 @@ export function isStaleProcess(startedAt: number) {
   return cancelRequested || startedAt !== generation
 }
 
+export function resetProcessJob() {
+  generation += 1
+  cancelRequested = true
+  job = emptyJob()
+}
+
 export function requestProcessStop(message = 'Stopped. Choose photos, insurance, logbooks, or a fix-wrong-plates job to start next.') {
   cancelRequested = true
   generation += 1
@@ -94,20 +102,6 @@ export function requestProcessStop(message = 'Stopped. Choose photos, insurance,
 
 export function isRepairFocus(focus?: ProcessFocus) {
   return focus === 'repair' || focus === 'repair-photos' || focus === 'repair-certificates' || focus === 'repair-logbooks' || focus === 'repair-agreements'
-}
-
-export function processFocusLabel(focus?: ProcessFocus) {
-  if (focus === 'photos') return 'Photos'
-  if (focus === 'certificates') return 'Insurance'
-  if (focus === 'logbooks') return 'Logbooks'
-  if (focus === 'agreements') return 'Agreements'
-  if (focus === 'repair-photos') return 'Wrong photos'
-  if (focus === 'repair-certificates') return 'Wrong insurance'
-  if (focus === 'repair-logbooks') return 'Wrong logbooks'
-  if (focus === 'repair-agreements') return 'Wrong agreements'
-  if (focus === 'repair') return 'Wrong matches'
-  if (focus === 'all') return 'All files'
-  return 'Processing'
 }
 
 function now() {
@@ -171,6 +165,7 @@ function asQueued(file: { id: string; name: string; type: DocType; mimeType?: st
 }
 
 export function beginProcessJob(watching: string, files: Array<{ id: string; name: string; type: DocType; mimeType?: string }>, focus: ProcessFocus = 'all') {
+  openProcessSession()
   if (job.running) return false
   cancelRequested = false
   generation += 1

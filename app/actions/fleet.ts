@@ -12,8 +12,8 @@ import { driveIdFromUri, linkUnlinkedDocuments, readStockRegisterSnapshot } from
 import { surplusCopies } from '@/lib/unmatched-files'
 import type { SheetCells, SheetSyncMode } from '@/lib/modules/types'
 import { compactPlate, extractKenyanPlate, listRegistrationNumbers, parseKenyanPlate, parsePhotoPlate, pickOcrPlate, plateFromCertificateText, plateFromLogbookText, plateFromText, printedRegistrationPlate } from '@/lib/plates'
-import { attachLastAction, beginProcessJob, endProcessJob, fileMatchesFocus, getProcessJob, isProcessCancelled, isProcessRunning, isRepairFocus, isStaleProcess, markProcessMatches, processFocusLabel, processGeneration, requestProcessStop, touchProcessItem, type ProcessFocus } from '@/lib/processing'
-import { confirmedPlate, forgetFile, hydrateProcessCursor, isCursorHydrated, lastAction, markConfirmed, markTried, persistProcessCursor, recordLastAction, wasTriedRecently, canResumeProcessQueue, processQueueItems, replaceProcessQueue, takeProcessQueueItem, type ProcessQueueItem } from '@/lib/process-cursor'
+import { attachLastAction, beginProcessJob, endProcessJob, fileMatchesFocus, getProcessJob, isProcessCancelled, isProcessRunning, isRepairFocus, isStaleProcess, markProcessMatches, processFocusLabel, processGeneration, requestProcessStop, resetProcessJob, touchProcessItem, type ProcessFocus } from '@/lib/processing'
+import { confirmedPlate, forgetFile, hydrateProcessCursor, isCursorHydrated, lastAction, markConfirmed, markTried, persistProcessCursor, recordLastAction, wasTriedRecently, canResumeProcessQueue, closeRunningProcesses, processQueueItems, replaceProcessQueue, takeProcessQueueItem, type ProcessQueueItem } from '@/lib/process-cursor'
 import { requireSession } from '@/lib/session'
 import { databaseConfigured, databaseStatus } from '@/lib/prisma'
 import { importVehiclesToDatabase, loadExportedRegister, loadRegisterFromDatabase, saveCoverDates } from '@/lib/register-db'
@@ -679,6 +679,15 @@ export async function continueProcessing() {
   })
   attachLastAction(lastAction())
   return loadFleet('full', false, focus)
+}
+
+export async function abandonProcessing() {
+  resetProcessJob()
+  const config = await loadConfig().catch(() => null)
+  if (!config) return
+  await hydrateProcessCursor(config).catch(() => {})
+  closeRunningProcesses()
+  await persistProcessCursor(config).catch(() => {})
 }
 
 export async function stopProcessing() {

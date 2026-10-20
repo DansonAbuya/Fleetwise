@@ -6,7 +6,8 @@ import { signOut, useSession } from '@/lib/auth-client'
 import { assignUnmatched, assignUnmatchedBatch, continueProcessing, exportVehicleRegister, getProcessingJob, linkPerceivedMatches, listDriveFolders, listSpreadsheets, loadFleet, loadVehiclePage, loadWorkspace, loadWorkspacePanels, ocrUnmatchedPhotos, runProcessing, saveFolderConfig, stopProcessing, syncGmail, syncRegisterToDatabase, uploadDocument } from '@/app/actions/fleet'
 import { coverAlertLabel, formatCoverDate } from '@/lib/insurance'
 import { listRegistrationNumbers, parseKenyanPlate } from '@/lib/plates'
-import { processFocusLabel, type ProcessFocus, type ProcessJob } from '@/lib/processing'
+import { processFocusLabel, type ProcessFocus } from '@/lib/process-focus'
+import type { ProcessJob } from '@/lib/processing'
 import { EMPTY_STATS } from '@/lib/vehicles'
 import { DEFAULT_COLLATERAL_PARENT_ID, type DocType, type DriveItem, type DuplicateFile, type FleetSnapshot, type InboxItem, type TypedFile, type VehicleRecord } from '@/lib/types'
 import {
@@ -190,8 +191,14 @@ function keepVehicles(current: FleetSnapshot | null, next: FleetSnapshot) {
   }
 }
 
-function LoadingCard({ title, detail }: { title: string; detail: string }) {
-  return <main className="auth-page"><div className="auth-card"><span className="eyebrow">FLEETWISE</span><h1>{title}</h1><p>{detail}</p></div></main>
+function RecordsSkeleton() {
+  return <div className="records-skeleton" role="status" aria-live="polite" aria-label="Loading records">
+    <div className="skeleton-kpis">{Array.from({ length: 4 }, (_, index) => <div className="skeleton-card" key={index}><span className="skeleton-bone bone-icon" /><div><span className="skeleton-bone bone-label" /><span className="skeleton-bone bone-value" /></div></div>)}</div>
+    <section className="panel table-panel">
+      <div className="panel-heading"><div><span className="skeleton-bone bone-title" /><span className="skeleton-bone bone-copy" /></div></div>
+      <div className="skeleton-rows">{Array.from({ length: 8 }, (_, index) => <div className="skeleton-row" key={index}><span className="skeleton-bone bone-plate" /><span className="skeleton-bone bone-cell" /><span className="skeleton-bone bone-cell short" /><span className="skeleton-bone bone-cell short" /><span className="skeleton-bone bone-status" /></div>)}</div>
+    </section>
+  </div>
 }
 
 function ConsoleShell({ user, children }: { user?: { name?: string; email?: string } | null; children?: ReactNode }) {
@@ -203,7 +210,7 @@ function ConsoleShell({ user, children }: { user?: { name?: string; email?: stri
       <nav className="nav-list" aria-label="Primary navigation">{nav.map(({ label, icon: Icon }) => <span key={label} className={`nav-item ${label === 'Overview' ? 'active' : ''}`}><Icon size={18} /><span>{label}</span></span>)}</nav>
     </aside>
     <main className="main-content">
-      {children || <div className="page-wrap"><div className="busy-banner" role="status">Opening the operations console…</div></div>}
+      {children || <div className="page-wrap"><RecordsSkeleton /></div>}
     </main>
   </div>
 }
@@ -397,6 +404,7 @@ function FleetApp() {
   const [vehiclePageSize, setVehiclePageSize] = useState(25)
   const [vehicleTotal, setVehicleTotal] = useState(0)
   const [tableBusy, setTableBusy] = useState(false)
+  const [recordsReady, setRecordsReady] = useState(false)
   const [registerTick, setRegisterTick] = useState(0)
   const [unmatchedKind, setUnmatchedKind] = useState<UnmatchedKind>('all')
   const [processJob, setProcessJob] = useState<ProcessJob | null>(null)
@@ -532,6 +540,8 @@ function FleetApp() {
         }
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : 'Unable to load Drive')
+      } finally {
+        if (!cancelled) setRecordsReady(true)
       }
     }
     boot()
@@ -781,13 +791,14 @@ function FleetApp() {
       <header className="topbar"><button className="icon-button mobile-menu" onClick={() => setMobileNav(true)} aria-label="Open navigation"><Menu size={20} /></button><div className="breadcrumbs"><span>Operations</span><span>/</span><strong>{active}</strong></div><div className="top-actions"><div className="notification-wrap"><button className="icon-button" aria-label="Notifications" aria-expanded={notificationsOpen} onClick={() => { setProfileMenu(null); setNotificationsOpen(!notificationsOpen) }}><Bell size={19} />{notifications.length > 0 && <i />}</button>{notificationsOpen && <div className="notification-popover" role="menu"><div className="notification-head"><div><strong>Notifications</strong><span>{notifications.length} open</span></div></div><div className="notification-list">{notifications.length === 0 ? <div className="notification-item read"><span /><span><strong>All clear</strong><small>No unmatched files, insurance expiry alerts, or certificates waiting.</small></span></div> : notifications.map((notification) => <button className="notification-item" key={notification.id} onClick={() => { if ('query' in notification && notification.query) { setQuery(notification.query); setVehiclePage(1) } go(notification.view, false, 'kind' in notification ? notification.kind : undefined) }}><span className={`notification-icon ${'tone' in notification && notification.tone === 'urgent' ? 'urgent' : 'tone' in notification && notification.tone === 'week' ? 'week' : ''}`}>{('tone' in notification && notification.tone) ? <Clock size={15} /> : <ShieldCheck size={15} />}</span><span><strong>{notification.title}</strong><small>{notification.message}</small><time>{notification.time}</time></span><b /></button>)}</div></div>}</div><div className="profile-wrap profile-wrap-top"><button type="button" className="top-avatar" aria-label="Open account menu" aria-haspopup="menu" aria-expanded={profileMenu === 'top'} onClick={() => toggleProfileMenu('top')}>{initials}</button>{profileMenu === 'top' && <ProfileMenu name={sessionUser.name} email={sessionUser.email} onLogout={() => signOut()} />}</div></div></header>
       <div className="page-wrap">
         <div className="page-heading"><div><div className="date-label">{dateLabel}</div><h1>{title}</h1><p>{subtitle}</p></div><div className="heading-actions"><button className="button secondary" onClick={() => exportCsv({ query, status: statusFilter, brand: brandFilter, missing: missingFilters })} disabled={!vehicleCount}><ArrowDownToLine size={16} /> Export report</button><button className="button primary" onClick={() => openUpload()} disabled={!configured}><Upload size={16} /> Upload documents</button></div></div>
-        {busy && <div className="busy-banner" role="status">{busy}</div>}
+        {busy && recordsReady && <div className="busy-banner" role="status">{busy}</div>}
         {batchNotice && <div className="busy-banner process-batch-banner" role="status"><LoaderCircle size={16} className="spin-icon" /><span>{batchNotice}</span>{active !== 'Processing' && <button type="button" onClick={() => go('Processing')}>Watch live</button>}<button type="button" onClick={() => setBatchNotice('')} aria-label="Dismiss"><X size={16} /></button></div>}
         {processJob?.running && active !== 'Processing' && <button type="button" className="busy-banner process-live-banner" onClick={() => go('Processing')}>{processJob.advancing ? `Batch ${processJob.batch || 1} of ${processFocusLabel(processJob.focus)} finished — starting the next files` : processJob.currentId ? `${processFocusLabel(processJob.focus)} live · ${processJob.done} of ${processJob.attempted} finished` : processFocusLabel(processJob.focus)} — open the live board</button>}
         {success && <div className="success-banner" role="status">{success}<button type="button" onClick={() => setSuccess('')} aria-label="Dismiss"><X size={16} /></button></div>}
         {error && <div className={`auth-error banner-error`} role="alert">{error}{isAuthError(error) && <a className="text-button" href="/sign-in">Sign in again</a>}<button type="button" className="text-button" onClick={() => setError('')}>Dismiss</button></div>}
         {fleet?.sheetsError && <div className="auth-error banner-error" role="alert">{/403|PERMISSION|ACCESS_TOKEN|insufficient/i.test(fleet.sheetsError) ? 'Sheets matching failed. Enable the Google Sheets API, then sign out and in again to grant spreadsheet access.' : fleet.sheetsError}</div>}
         {fleet?.ingest?.error && <div className="auth-error banner-error" role="alert">{fleet.ingest.error}</div>}
+        {!recordsReady ? <RecordsSkeleton /> : <>
         {active === 'Overview' && <>
           <div className="kpi-grid">
             <button type="button" className="kpi-card kpi-card-button" onClick={() => go('Vehicles')}><div className="kpi-icon blue"><Truck size={19} /></div><div><p className="eyebrow">Total vehicles</p><div className="kpi-value">{vehicleCount}</div><p className="kpi-detail">{fleet?.config?.spreadsheetName || 'Plates from Sheets, filenames, and photo OCR'}</p></div></button>
@@ -838,6 +849,7 @@ function FleetApp() {
         {active === 'Duplicates' && <DuplicatesView files={duplicates} />}
         {active === 'Audit log' && <AuditView events={fleet?.audit || []} onExport={() => exportAudit(fleet?.audit || [])} />}
         {active === 'Settings' && <SettingsView fleet={fleet} firstRun={!configured} busy={Boolean(busy)} onSave={(input) => { writeSavedFolders(input); return refresh(saveFolderConfig(input), 'Folder and sheet configuration saved.') }} onImportDatabase={() => refresh(syncRegisterToDatabase(), 'STOCK DOCUMENTS tab on Fleet Assets - KE copied into Neon.')} onBrowse={listDriveFolders} onBrowseSheets={listSpreadsheets} />}
+        </>}
       </div>
     </main>
     {selected && <Drawer title={selected.plate} eyebrow="VEHICLE DETAILS" subtitle={`${selected.brand ? `${selected.brand} · ` : ''}${selected.present} / ${selected.total} required documents`} onClose={() => setSelected(null)}>
@@ -902,8 +914,7 @@ function VehicleTable({ vehicles, total, page, pageSize, pageSizes, loading, onP
   const from = total ? (page - 1) * pageSize + 1 : 0
   const to = Math.min(page * pageSize, total)
   return <div>
-    {loading && <div className="busy-banner" role="status">Loading vehicles…</div>}
-    <div className="table-scroll"><table><thead><tr><th>Vehicle</th><th>Brand</th><th>Logbook</th><th>Agreement</th><th>Certificate</th><th>Commencement</th><th>Expiry</th><th>Photo</th><th>Collateral</th><th>Status</th><th>Last updated</th></tr></thead><tbody>{!vehicles.length ? <tr className="empty-row-tr"><td colSpan={11}>{loading ? 'Loading the register…' : 'No plates found in the configured folders yet.'}</td></tr> : vehicles.map((vehicle) => <tr key={vehicle.plate} onClick={() => onSelect(vehicle)}><td><strong className="plate-id">{vehicle.plate}</strong><span className="muted-cell">{vehicle.present} / {vehicle.total} documents</span></td><td>{vehicle.brand || '—'}</td><td className={vehicle.files.logbook.length ? 'cell-yes' : 'cell-no'}>{vehicle.files.logbook.length ? 'Yes' : 'Missing'}</td><td className={vehicle.agreement ? 'cell-yes' : 'cell-no'}>{vehicle.agreement ? 'Yes' : 'Missing'}</td><td className={vehicle.files.certificate.length ? 'cell-yes' : 'cell-no'}>{vehicle.files.certificate.length ? 'Yes' : 'Missing'}</td><td className="cell-cover">{formatCoverDate(vehicle.insurance?.commencement)}</td><td className={`cell-cover ${vehicle.insurance?.alert ? `cover-${vehicle.insurance.alert}` : ''}`}>{formatCoverDate(vehicle.insurance?.expiry)}{vehicle.insurance?.alert ? <span className={`cover-flag ${vehicle.insurance.alert}`}>{coverAlertLabel(vehicle.insurance)}</span> : null}</td><td className={vehicle.files.photo.length ? 'cell-yes' : 'cell-no'}>{vehicle.files.photo.length ? 'Yes' : 'Missing'}</td><td className={vehicle.collateral ? 'cell-yes' : 'cell-no'}>{vehicle.collateral ? 'Yes' : 'Missing'}</td><td><StatusBadge status={vehicle.status} /></td><td className="muted-cell">{vehicle.updated}</td></tr>)}</tbody></table></div>
+    <div className="table-scroll"><table><thead><tr><th>Vehicle</th><th>Brand</th><th>Logbook</th><th>Agreement</th><th>Certificate</th><th>Commencement</th><th>Expiry</th><th>Photo</th><th>Collateral</th><th>Status</th><th>Last updated</th></tr></thead><tbody>{loading ? Array.from({ length: Math.min(pageSize, 8) }, (_, index) => <tr className="skeleton-table-row" key={index}><td colSpan={11}><span className="skeleton-bone bone-row" /></td></tr>) : !vehicles.length ? <tr className="empty-row-tr"><td colSpan={11}>No plates found in the configured folders yet.</td></tr> : vehicles.map((vehicle) => <tr key={vehicle.plate} onClick={() => onSelect(vehicle)}><td><strong className="plate-id">{vehicle.plate}</strong><span className="muted-cell">{vehicle.present} / {vehicle.total} documents</span></td><td>{vehicle.brand || '—'}</td><td className={vehicle.files.logbook.length ? 'cell-yes' : 'cell-no'}>{vehicle.files.logbook.length ? 'Yes' : 'Missing'}</td><td className={vehicle.agreement ? 'cell-yes' : 'cell-no'}>{vehicle.agreement ? 'Yes' : 'Missing'}</td><td className={vehicle.files.certificate.length ? 'cell-yes' : 'cell-no'}>{vehicle.files.certificate.length ? 'Yes' : 'Missing'}</td><td className="cell-cover">{formatCoverDate(vehicle.insurance?.commencement)}</td><td className={`cell-cover ${vehicle.insurance?.alert ? `cover-${vehicle.insurance.alert}` : ''}`}>{formatCoverDate(vehicle.insurance?.expiry)}{vehicle.insurance?.alert ? <span className={`cover-flag ${vehicle.insurance.alert}`}>{coverAlertLabel(vehicle.insurance)}</span> : null}</td><td className={vehicle.files.photo.length ? 'cell-yes' : 'cell-no'}>{vehicle.files.photo.length ? 'Yes' : 'Missing'}</td><td className={vehicle.collateral ? 'cell-yes' : 'cell-no'}>{vehicle.collateral ? 'Yes' : 'Missing'}</td><td><StatusBadge status={vehicle.status} /></td><td className="muted-cell">{vehicle.updated}</td></tr>)}</tbody></table></div>
     {total > 0 && <div className="table-pagination">
       <span className="table-pagination-meta">Showing {from}–{to} of {total}</span>
       {pageSizes && pageSizes.length > 1 && <label className="field-label table-page-size">Rows<select className="assign-input" value={pageSize} onChange={(e) => onPageSizeChange?.(Number(e.target.value))} aria-label="Rows per page">{pageSizes.map((size) => <option key={size} value={size}>{size}</option>)}</select></label>}

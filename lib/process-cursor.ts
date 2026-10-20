@@ -1,6 +1,6 @@
 import { findFileByName, readJsonFile, upsertJsonFile } from '@/lib/drive'
 import type { DocType, FleetConfig } from '@/lib/types'
-import type { ProcessFocus } from '@/lib/processing'
+import type { ProcessFocus } from '@/lib/process-focus'
 
 export const PROCESS_NAME = 'fleetwise-process.json'
 const TRIED_MS = 14 * 24 * 60 * 60 * 1000
@@ -44,6 +44,9 @@ let queue: ProcessQueueItem[] = []
 let queueFocus: ProcessFocus | undefined
 let storedFileId: string | undefined
 let hydrated = false
+let epoch = 0
+let closed = false
+let persistChain: Promise<void> = Promise.resolve()
 
 function pruneTried() {
   const cutoff = Date.now() - TRIED_MS
@@ -106,15 +109,18 @@ export function processQueueItems() {
 }
 
 export function replaceProcessQueue(items: ProcessQueueItem[], focus: ProcessFocus) {
+  if (closed) return
   queue = items
   queueFocus = focus
 }
 
 export function takeProcessQueueItem() {
+  if (closed) return undefined
   return queue.shift()
 }
 
 export function recordLastAction(patch: Partial<ProcessLastAction>) {
+  if (closed) return
   cursor = {
     ...cursor,
     ...patch,
@@ -157,20 +163,46 @@ export async function hydrateProcessCursor(config: FleetConfig) {
   return lastAction()
 }
 
+export function closeRunningProcesses() {
+  epoch += 1
+  closed = true
+  queue = []
+  queueFocus = undefined
+  cursor = {
+    status: 'done',
+    remaining: 0,
+    done: 0,
+    detail: 'Signed out. Start a job to process files.',
+  }
+}
+
+export function openProcessSession() {
+  closed = false
+}
+
 export async function persistProcessCursor(config: FleetConfig) {
+  const seen = epoch
   pruneTried()
   const payload: CursorFile = {
     ...cursor,
     tried: Object.fromEntries(tried),
     confirmed: Object.fromEntries(confirmed),
-    queue,
+    queue: queue.slice(),
     queueFocus,
   }
-  try {
-    const file = await upsertJsonFile(config.certificatesId, PROCESS_NAME, payload, storedFileId)
-    storedFileId = file.id
-  } catch {
-    const file = await upsertJsonFile(config.certificatesId, PROCESS_NAME, payload)
-    storedFileId = file.id
-  }
+  const run = persistChain.then(async () => {
+    if (seen !== epoch) return
+    try {
+      const file = await upsertJsonFile(config.certificatesId, PROCESS_NAME, payload, storedFileId)
+      if (seen !== epoch) return
+      storedFileId = file.id
+    } catch {
+      if (seen !== epoch) return
+      const file = await upsertJsonFile(config.certificatesId, PROCESS_NAME, payload)
+      if (seen !== epoch) return
+      storedFileId = file.id
+    }
+  })
+  persistChain = run.catch(() => {})
+  await run
 }

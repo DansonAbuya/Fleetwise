@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { getCurrentUser, signOutUser } from '@/app/actions/auth'
+import { getCurrentUser } from '@/app/actions/auth'
 
 export type ClientUser = { name: string; email: string; image?: string }
 
@@ -19,6 +19,6 @@ export function useSession() {
   return { user, isPending }
 }
 
-export async function signOut() {
-  await signOutUser()
+export function signOut() {
+  window.location.assign('/auth/logout')
 }
