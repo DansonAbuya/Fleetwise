@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { abandonProcessing } from '@/app/actions/fleet'
+import { abandonProcessing } from '@/modules/stock/actions'
 
 export async function GET(request: Request) {
   await abandonProcessing().catch(() => {})

@@ -6,7 +6,7 @@ export async function middleware(request: NextRequest) {
     return NextResponse.next()
   }
   const session = request.cookies.get('fleetwise_session')?.value
-  if (!session && pathname === '/') {
+  if (!session) {
     return NextResponse.redirect(new URL('/sign-in', request.url))
   }
   return NextResponse.next()

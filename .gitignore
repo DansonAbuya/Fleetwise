@@ -16,4 +16,5 @@ __v0_jsx-dev-runtime.ts
 node_modules
 .next/
 .tesseract-cache/
+data/fleet-operations.json
 .DS_Store

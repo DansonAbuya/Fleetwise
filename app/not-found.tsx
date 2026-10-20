@@ -6,8 +6,8 @@ export default function NotFound() {
       <div className="auth-card">
         <span className="eyebrow">FLEETWISE</span>
         <h1>Page not found</h1>
-        <p>That route does not exist. Return to the operations workspace.</p>
-        <Link className="button primary full google-sign-in" href="/">Back to workspace</Link>
+        <p>That route does not exist. Return to the module home.</p>
+        <Link className="button primary full google-sign-in" href="/">Back to modules</Link>
       </div>
     </main>
   )
