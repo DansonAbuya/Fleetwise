@@ -348,6 +348,7 @@ function canonicalFileName(file: TypedFile) {
 
 const COLLATERAL_PASS = process.env.VERCEL ? 40 : 120
 const COLLATERAL_BUDGET_MS = process.env.VERCEL ? 8000 : 28000
+const chippedCollateral = new Map<string, number>()
 
 async function ensureCollateralFolders(config: FleetConfig) {
   if (!config.spreadsheetId) return { written: 0, created: 0, cells: new Map() as SheetCells, more: false }
@@ -373,11 +374,15 @@ async function ensureCollateralFolders(config: FleetConfig) {
   }
   const deadline = Date.now() + COLLATERAL_BUDGET_MS
   let created = 0
+  const touched: string[] = []
+  const remembered = (plate: string) => {
+    const at = chippedCollateral.get(`${config.spreadsheetId}:${plate}`)
+    return Boolean(at && Date.now() - at < 15 * 60 * 1000)
+  }
   function needsChip(row: StockRow) {
     const column = row.columns.collateral
     if (!column) return false
-    if (isDriveDocumentUri(column.uri)) return false
-    if ((column.value || '').trim()) return false
+    if (isDriveDocumentUri(column.uri) || (column.value || '').trim() || remembered(row.plate)) return false
     return true
   }
   function room() {
@@ -390,6 +395,7 @@ async function ensureCollateralFolders(config: FleetConfig) {
     requests.push(chipRequest(register.sheetId, row.row, column.col, link))
     column.value = folder.name
     column.uri = link
+    touched.push(row.plate)
     return true
   }
   for (const row of register.rows.values()) {
@@ -413,6 +419,8 @@ async function ensureCollateralFolders(config: FleetConfig) {
   }
   if (header || requests.length) {
     await applyChipBatches(config.spreadsheetId, requests, header ? [header] : [])
+    const markedAt = Date.now()
+    for (const plate of touched) chippedCollateral.set(`${config.spreadsheetId}:${plate}`, markedAt)
     register.nextColumn = Math.max(register.nextColumn, collateralCol + 1)
     storeRegister(config.spreadsheetId, register)
   }

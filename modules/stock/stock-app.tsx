@@ -178,8 +178,11 @@ export function StockApp() {
       unmatchedLenRef.current = unmatchedCount
       setRegisterTick((tick) => tick + 1)
     }
-    if (next.ingest?.notice) setSuccess(ok ? `${ok} ${next.ingest.notice}` : next.ingest.notice)
+    const notice = next.ingest?.notice || ''
+    if (/collateral chip/i.test(notice)) setSuccess('')
+    else if (notice) setSuccess(ok && ok !== notice ? `${ok} ${notice}` : notice)
     else if (ok) setSuccess(ok)
+    else setSuccess((current) => /collateral chip/i.test(current) ? '' : current)
   }
 
   async function runSync(loader: Promise<FleetSnapshot>, ok?: string) {
@@ -233,7 +236,7 @@ export function StockApp() {
         autoScanLock.current = true
         try {
           const next = await loadFleet('auto', false, 'off')
-          if (!cancelled) applySnapshot(next, next.ingest?.notice)
+          if (!cancelled) applySnapshot(next)
         } catch (err) {
           if (!cancelled) setError(err instanceof Error ? err.message : 'Unable to load Drive')
         } finally {
@@ -276,7 +279,7 @@ export function StockApp() {
       autoScanLock.current = true
       try {
         const next = await loadFleet('auto', false, 'off')
-        applySnapshot(next, next.ingest?.notice)
+        applySnapshot(next)
       } catch {
         // Keep watching; the next tick retries.
       } finally {

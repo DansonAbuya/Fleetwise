@@ -296,10 +296,7 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
       const collateral = await syncCollateralChips(config)
       if (collateral.cells.size) sheet = { ...sheet, cells: collateral.cells }
       if (collateral.written || collateral.more) {
-        const note = collateral.more
-          ? `Updated ${collateral.written} collateral chip${collateral.written === 1 ? '' : 's'} on STOCK DOCUMENTS. The remaining registration numbers are still being checked.`
-          : `Collateral chips are filled for every registration number${collateral.written ? ` (${collateral.written} updated)` : ''}.`
-        ingest = { ...ingest, collateralMore: collateral.more, collateralStamp: `${collateral.written}:${collateral.created}:${Date.now()}`, notice: ingest.notice ? `${ingest.notice} ${note}` : note }
+        ingest = { ...ingest, collateralMore: collateral.more, collateralStamp: `${collateral.written}:${collateral.created}:${Date.now()}` }
       }
     } catch (err) {
       const detail = err instanceof Error ? err.message : 'Collateral chip update failed'
