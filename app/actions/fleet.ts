@@ -228,12 +228,13 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
   const skipOcr = focus === 'off' || (!requested && (isProcessCancelled() || live.cancelled || !jobFocus))
   const watchPass = focus === 'off'
   const skipExtras = watchPass && mode === 'auto'
-  const freshRead = mode === 'full' || (!ON_VERCEL && !skipOcr)
+  const freshFolders = mode === 'full' || (!ON_VERCEL && !skipOcr)
+  const freshSheet = freshFolders && !requested
   const resumeQueue = ON_VERCEL && !skipOcr && canResumeProcessQueue(jobFocus || 'all')
   const emptyPreview = { vehicles: [] as VehicleRecord[], unmatched: [] as TypedFile[], duplicates: [] as FleetSnapshot['duplicates'], plates: new Set<string>(), cells: new Map() as SheetCells, error: undefined as string | undefined }
   const [preview, folderScan] = await Promise.all([
-    config.spreadsheetId ? readStockRegisterSnapshot(config, { fresh: freshRead }) : Promise.resolve(emptyPreview),
-    resumeQueue ? Promise.resolve(null) : scanFolders(config, new Set<string>(), new Map() as SheetCells, undefined, { fresh: freshRead }),
+    config.spreadsheetId ? readStockRegisterSnapshot(config, { fresh: freshSheet }) : Promise.resolve(emptyPreview),
+    resumeQueue ? Promise.resolve(null) : scanFolders(config, new Set<string>(), new Map() as SheetCells, undefined, { fresh: freshFolders }),
   ])
   let ingest = { watching: '', attempted: 0, renamed: 0, remaining: 0, more: false, error: undefined as string | undefined, renamedFiles: [] as TypedFile[], started: false, focus: jobFocus, notice: undefined as string | undefined }
   let files: TypedFile[] = []
@@ -262,11 +263,29 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
   }
   const ingestGen = processGeneration()
   const continuing = Boolean(ingest.more)
-  const deferSheet = skipOcr || (ON_VERCEL && !skipOcr && (ingest.started || Boolean(ingest.more)))
-  let sheet = deferSheet || !files.length
+  const docType = requested === 'photos' ? 'photo' : requested === 'logbooks' ? 'logbook' : requested === 'certificates' ? 'certificate' : null
+  const deferSheet = skipOcr || (!docType && ON_VERCEL && !skipOcr && (ingest.started || Boolean(ingest.more)))
+  let sheet = docType
     ? { plates: preview.plates, error: preview.error, missing: [] as string[], matched: [] as string[], hint: '', cells: preview.cells, more: false }
-    : await syncSheetIndex(config, continuing ? 'match' : mode, files)
-  for (let round = 0; !deferSheet && sheet.more && !sheet.error && round < 5; round += 1) {
+    : deferSheet || !files.length
+      ? { plates: preview.plates, error: preview.error, missing: [] as string[], matched: [] as string[], hint: '', cells: preview.cells, more: false }
+      : await syncSheetIndex(config, continuing ? 'match' : mode, files)
+  if (docType && config.spreadsheetId) {
+    const ready = ingest.renamedFiles.filter((file) => file.type === docType && hasCanonicalName(file))
+    if (ready.length) {
+      const linked = await linkUnlinkedDocuments(config, docType, ready, { fresh: false })
+      sheet = {
+        plates: preview.plates,
+        error: preview.error,
+        missing: linked.missing,
+        matched: linked.matched,
+        hint: '',
+        cells: linked.cells.size ? linked.cells : preview.cells,
+        more: false,
+      }
+    }
+  }
+  for (let round = 0; !docType && !deferSheet && sheet.more && !sheet.error && round < 5; round += 1) {
     const next = await syncSheetIndex(config, continuing ? 'match' : mode, files)
     sheet = { ...next, matched: [...new Set([...(sheet.matched || []), ...(next.matched || [])])] }
   }
@@ -1063,17 +1082,22 @@ function pendingForFocus(file: TypedFile, focus: ProcessFocus, sheetPlates?: Set
   const repair = isRepairFocus(focus)
   const plate = named ? compactPlate(named) : ''
   const needsDates = file.type === 'certificate' && Boolean(plate && missingDates?.has(plate))
-  if ((file.type === 'logbook' || file.type === 'agreement') && !hasCanonicalName(file) && named) return true
-  if (file.type === 'certificate' && !hasCanonicalName(file)) {
-    if (!repair && wasTriedRecently(file.id) && !needsDates) return false
+  if (file.type === 'agreement' && !hasCanonicalName(file) && named) return true
+  if (file.type === 'certificate' && !repair) {
+    if (hasCanonicalName(file) || wasTriedRecently(file.id)) return false
     return true
   }
-  if (file.type === 'photo') {
-    if (repair) return isOcrImage(file.mimeType, file.name)
-    if (hasCanonicalName(file) && matched) return false
-    if (!repair && wasTriedRecently(file.id)) return false
+  if (file.type === 'certificate' && !hasCanonicalName(file)) return true
+  if (file.type === 'logbook' && !repair) {
+    if (hasCanonicalName(file) || wasTriedRecently(file.id)) return false
+    return true
+  }
+  if (file.type === 'logbook' && !hasCanonicalName(file)) return true
+  if (file.type === 'photo' && !repair) {
+    if (hasCanonicalName(file) || wasTriedRecently(file.id)) return false
     return isOcrImage(file.mimeType, file.name)
   }
+  if (file.type === 'photo') return isOcrImage(file.mimeType, file.name)
   if (matched && !needsDates) return false
   if (!repair && wasTriedRecently(file.id) && !needsDates) return false
   const readable = isOcrImage(file.mimeType, file.name)

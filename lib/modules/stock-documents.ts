@@ -247,9 +247,9 @@ async function writeSheetMatches(config: FleetConfig, files: TypedFile[], mode: 
   }
 }
 
-export async function linkUnlinkedDocuments(config: FleetConfig, type: 'photo' | 'certificate' | 'logbook', files: TypedFile[]) {
-  if (!config.spreadsheetId) return { written: 0, matched: [] as string[], missing: [] as string[], cells: new Map() as SheetCells }
-  const register = await loadStockRegister(config, { fresh: true })
+export async function linkUnlinkedDocuments(config: FleetConfig, type: 'photo' | 'certificate' | 'logbook', files: TypedFile[], options?: { fresh?: boolean }) {
+  if (!config.spreadsheetId) return { written: 0, matched: [] as string[], missing: [] as string[], cells: new Map() as SheetCells, unnamed: 0 }
+  const register = await loadStockRegister(config, { fresh: options?.fresh ?? true })
   const byPlate = new Map<string, TypedFile[]>()
   for (const file of files) {
     if (file.type !== type) continue
@@ -322,7 +322,8 @@ export async function linkUnlinkedDocuments(config: FleetConfig, type: 'photo' |
 
   if (chipRequests.length) {
     await applyChipBatches(config.spreadsheetId, chipRequests)
-    storeRegister(config.spreadsheetId, register)
+    const modifiedTime = await sheetModifiedTime(config.spreadsheetId)
+    storeRegister(config.spreadsheetId, register, modifiedTime)
   }
   return { written: chipRequests.length, matched, missing, unnamed, cells: cellsFromRegister(register) }
 }

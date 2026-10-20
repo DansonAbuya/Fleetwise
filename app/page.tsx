@@ -62,9 +62,9 @@ const MISSING_FILTERS: { id: MissingFilter; label: string }[] = [
 ]
 
 const PROCESS_TASKS: { id: ProcessFocus; label: string; detail: string }[] = [
-  { id: 'photos', label: 'Photos only', detail: 'Read bike plates with Tesseract.js and rename Photos {plate}.' },
-  { id: 'certificates', label: 'Insurance only', detail: 'Rename new insurance PDFs from REGISTRATION No, save commencement and expiry on the vehicle register, then write the insurance chip on the sheet.' },
-  { id: 'logbooks', label: 'Logbooks only', detail: 'Rename new logbook PDFs from REGISTRATION No to {plate} - Logbook, then write chips on the sheet.' },
+  { id: 'photos', label: 'Photos only', detail: 'Rename photos that are not yet named Photos {plate}, then match each file onto the STOCK DOCUMENTS row. Files already named that way are left alone.' },
+  { id: 'certificates', label: 'Insurance only', detail: 'Rename insurance files that are not yet named Insurance - {plate}, then match each file onto the STOCK DOCUMENTS row. Files already named that way are left alone.' },
+  { id: 'logbooks', label: 'Logbooks only', detail: 'Rename logbooks that are not yet named {plate} - Logbook, then match each file onto the STOCK DOCUMENTS row. Files already named that way are left alone.' },
   { id: 'agreements', label: 'Agreements only', detail: 'Rename files in the agreements folder to {plate} - Agreement, then write chips on Agreement Link.' },
   { id: 'all', label: 'All waiting files', detail: 'Photos, insurance, logbooks, agreements, and other waiting documents.' },
   { id: 'repair-photos', label: 'Fix wrong photos', detail: 'Reopen unmatched photos only and rename them from the plate. Files already on STOCK DOCUMENTS are left alone.' },
