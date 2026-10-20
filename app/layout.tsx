@@ -22,10 +22,11 @@ export const metadata: Metadata = {
   applicationName: 'Fleetwise',
   icons: {
     icon: [
-      { url: '/icon.svg', type: 'image/svg+xml' },
+      { url: '/brand/favicon-32.png', sizes: '32x32', type: 'image/png' },
+      { url: '/brand/logo.png', sizes: '512x512', type: 'image/png' },
       { url: '/favicon.ico', sizes: '32x32' },
     ],
-    apple: '/icon.svg',
+    apple: '/brand/apple-touch.png',
   },
 }
 

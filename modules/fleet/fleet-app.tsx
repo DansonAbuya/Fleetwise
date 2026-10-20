@@ -1,7 +1,8 @@
 'use client'
 
 import { signOut, useSession } from '@/lib/auth-client'
-import { ChevronUp, LayoutGrid, LogOut, Menu, Truck } from 'lucide-react'
+import { BrandMark } from '@/modules/shared/brand-mark'
+import { ChevronUp, LayoutGrid, LogOut, Menu } from 'lucide-react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { useEffect, useState } from 'react'
@@ -28,7 +29,7 @@ export function FleetApp() {
   return (
     <div className="app-shell">
       <aside className={`sidebar ${mobileNav ? 'sidebar-open' : ''}`}>
-        <div className="brand"><div className="brand-mark"><Truck size={18} /></div><div><strong>Fleetwise</strong><span>Fleet Management</span></div></div>
+        <div className="brand"><BrandMark kind="fleet" /><div><strong>Fleetwise</strong><span>Fleet Management</span></div></div>
         <Link className="module-switch" href="/" onClick={() => setMobileNav(false)}><LayoutGrid size={16} /> All modules</Link>
         <nav className="nav-list" aria-label="Fleet Management">
           {FLEET_NAV.map(({ label, icon: Icon }) => (

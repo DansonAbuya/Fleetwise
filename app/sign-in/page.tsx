@@ -1,7 +1,7 @@
 'use client'
 
 import { startGoogleSignIn } from '@/app/actions/auth'
-import { Truck } from 'lucide-react'
+import { BrandMark } from '@/modules/shared/brand-mark'
 import { useSearchParams } from 'next/navigation'
 import { Suspense } from 'react'
 import { useFormStatus } from 'react-dom'
@@ -28,7 +28,7 @@ function SignInForm() {
       </div>
       <section className="auth-visual">
         <div className="auth-visual-brand">
-          <div className="brand-mark"><Truck size={20} /></div>
+          <BrandMark />
           <div><strong>Fleetwise</strong><span>Kenya fleet documents</span></div>
         </div>
         <div className="auth-visual-copy">
@@ -43,7 +43,7 @@ function SignInForm() {
       </section>
       <div className="auth-card">
         <div className="brand auth-brand">
-          <div className="brand-mark"><Truck size={18} /></div>
+          <BrandMark />
           <div><strong>Fleetwise</strong><span>Document control</span></div>
         </div>
         <span className="eyebrow">SECURE OPERATIONS ACCESS</span>

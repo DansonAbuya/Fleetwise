@@ -5,6 +5,7 @@ import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { signOut, useSession } from '@/lib/auth-client'
 import { assignUnmatched, assignUnmatchedBatch, continueProcessing, getProcessingJob, linkPerceivedMatches, listDriveFolders, listSpreadsheets, loadFleet, loadVehiclePage, loadWorkspace, loadWorkspacePanels, ocrUnmatchedPhotos, runProcessing, saveFolderConfig, stopProcessing, syncGmail, syncRegisterToDatabase, uploadDocument } from '@/modules/stock/actions'
+import { BrandMark } from '@/modules/shared/brand-mark'
 import { coverAlertLabel, formatCoverDate } from '@/lib/insurance'
 import { processFocusLabel, type ProcessFocus } from '@/lib/process-focus'
 import type { ProcessJob } from '@/lib/processing'
@@ -470,7 +471,7 @@ export function StockApp() {
 
   return <div className="app-shell">
     <aside className={`sidebar ${mobileNav ? 'sidebar-open' : ''}`}>
-      <div className="brand"><div className="brand-mark"><Truck size={18} /></div><div><strong>Fleetwise</strong><span>Stock</span></div></div>
+      <div className="brand"><BrandMark /><div><strong>Fleetwise</strong><span>Stock</span></div></div>
         <Link className="module-switch" href="/"><LayoutGrid size={16} /> All modules</Link>
         <div className="workspace-card"><div className="workspace-avatar">{initials}</div><div><span>Google Drive</span><small>{sessionUser.email}</small></div></div>
       <nav className="nav-list" aria-label="Primary navigation">{nav.map(({ label, icon: Icon }) => {

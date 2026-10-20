@@ -2,7 +2,8 @@
 
 import type { ReactNode } from 'react'
 import Link from 'next/link'
-import { LayoutGrid, LogOut, Truck } from 'lucide-react'
+import { BrandMark } from '@/modules/shared/brand-mark'
+import { LayoutGrid, LogOut } from 'lucide-react'
 import { nav } from '@/modules/stock/model'
 
 export function RecordsSkeleton() {
@@ -19,7 +20,7 @@ export function ConsoleShell({ user, children }: { user?: { name?: string; email
   const initials = (user?.name || 'FW').split(' ').map((part) => part[0]).join('').slice(0, 2).toUpperCase()
   return <div className="app-shell">
     <aside className="sidebar">
-      <div className="brand"><div className="brand-mark"><Truck size={18} /></div><div><strong>Fleetwise</strong><span>Stock</span></div></div>
+      <div className="brand"><BrandMark /><div><strong>Fleetwise</strong><span>Stock</span></div></div>
       <Link className="module-switch" href="/"><LayoutGrid size={16} /> All modules</Link>
       <div className="workspace-card"><div className="workspace-avatar">{initials}</div><div><span>Google Drive</span><small>{user?.email || 'Opening console'}</small></div></div>
       <nav className="nav-list" aria-label="Primary navigation">{nav.map(({ label, icon: Icon }) => <span key={label} className={`nav-item ${label === 'Overview' ? 'active' : ''}`}><Icon size={18} /><span>{label}</span></span>)}</nav>

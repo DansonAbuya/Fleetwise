@@ -1,7 +1,8 @@
 'use client'
 
 import { signOut, useSession } from '@/lib/auth-client'
-import { ClipboardList, LogOut, Truck } from 'lucide-react'
+import { BrandMark } from '@/modules/shared/brand-mark'
+import { LogOut } from 'lucide-react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { useEffect } from 'react'
@@ -20,7 +21,7 @@ export function ModuleHome() {
     <main className="module-home">
       <header className="module-bar">
         <div className="brand">
-          <div className="brand-mark"><Truck size={18} /></div>
+          <BrandMark />
           <div><strong>Fleetwise</strong><span>Choose a module</span></div>
         </div>
         <div className="module-user">
@@ -35,13 +36,13 @@ export function ModuleHome() {
         <p>Stock is the document console already in use. Fleet Management is the operating console we are building next.</p>
         <div className="module-grid">
           <Link className="module-card" href="/stock">
-            <span className="module-icon"><ClipboardList size={22} /></span>
+            <BrandMark kind="stock" className="module-icon" label="Stock" />
             <h2>Stock</h2>
             <p>Open the screens you already use: vehicles, insurance, logbooks, photos, processing, and STOCK DOCUMENTS matching.</p>
             <span className="button primary">Open Stock</span>
           </Link>
           <Link className="module-card" href="/fleet">
-            <span className="module-icon"><Truck size={22} /></span>
+            <BrandMark kind="fleet" className="module-icon" label="Fleet Management" />
             <h2>Fleet Management</h2>
             <p>Open the operating console for the daily fleet report: active bikes, mileage, rides, and earnings.</p>
             <span className="button primary">Open Fleet Management</span>
