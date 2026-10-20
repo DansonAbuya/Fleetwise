@@ -21,20 +21,25 @@ function SignInForm() {
 
   return (
     <main className="auth-page">
-      <section className="auth-visual" aria-hidden="true">
+      <div className="auth-backdrop" aria-hidden="true">
+        <span className="auth-orb auth-orb-a" />
+        <span className="auth-orb auth-orb-b" />
+        <span className="auth-grid" />
+      </div>
+      <section className="auth-visual">
         <div className="auth-visual-brand">
           <div className="brand-mark"><Truck size={20} /></div>
-          <div><strong>Fleetwise</strong></div>
+          <div><strong>Fleetwise</strong><span>Kenya fleet documents</span></div>
         </div>
-        <div>
+        <div className="auth-visual-copy">
           <h2>Document control for the fleet that keeps Kenya moving.</h2>
           <p>Match Drive files to STOCK DOCUMENTS, chip logbooks, insurance, and photos onto the register, and keep completeness visible in one operations console.</p>
         </div>
-        <div className="auth-visual-meta">
-          <div><strong>Drive</strong>Source of files</div>
-          <div><strong>Sheets</strong>Vehicle register</div>
-          <div><strong>Gmail</strong>Certificate intake</div>
-        </div>
+        <ul className="auth-visual-meta">
+          <li><strong>Drive</strong><span>Source of files</span></li>
+          <li><strong>Sheets</strong><span>Vehicle register</span></li>
+          <li><strong>Gmail</strong><span>Certificate intake</span></li>
+        </ul>
       </section>
       <div className="auth-card">
         <div className="brand auth-brand">
