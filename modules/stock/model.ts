@@ -10,7 +10,7 @@ import {
   Mail,
   RefreshCw,
   Settings,
-  Truck,
+  Bike,
 } from 'lucide-react'
 import type { ProcessFocus } from '@/lib/process-focus'
 
@@ -65,7 +65,7 @@ export const TO_SLUG: Record<NavKey, ViewSlug> = {
 
 export const nav = [
   { label: 'Overview' as const, icon: LayoutDashboard },
-  { label: 'Vehicles' as const, icon: Truck },
+  { label: 'Vehicles' as const, icon: Bike },
   { label: 'Insurance inbox' as const, icon: Mail },
   { label: 'Logbook inbox' as const, icon: FileText },
   { label: 'Processing' as const, icon: RefreshCw },

@@ -31,7 +31,7 @@ import {
   RefreshCw,
   Search,
   ShieldCheck,
-  Truck,
+  Bike,
   Upload,
   X,
 } from 'lucide-react'
@@ -503,7 +503,7 @@ export function StockApp() {
         {!recordsReady ? <RecordsSkeleton /> : <>
         {active === 'Overview' && <>
           <div className="kpi-grid">
-            <button type="button" className="kpi-card kpi-card-button" onClick={() => go('Vehicles')}><div className="kpi-icon blue"><Truck size={19} /></div><div><p className="eyebrow">Total vehicles</p><div className="kpi-value">{vehicleCount}</div><p className="kpi-detail">{fleet?.config?.spreadsheetName || 'Plates from Sheets, filenames, and photo OCR'}</p></div></button>
+            <button type="button" className="kpi-card kpi-card-button" onClick={() => go('Vehicles')}><div className="kpi-icon blue"><Bike size={19} /></div><div><p className="eyebrow">Total vehicles</p><div className="kpi-value">{vehicleCount}</div><p className="kpi-detail">{fleet?.config?.spreadsheetName || 'Plates from Sheets, filenames, and photo OCR'}</p></div></button>
             <button type="button" className="kpi-card kpi-card-button" onClick={() => { setStatusFilter('Complete'); setVehiclePage(1); go('Vehicles') }}><div className="kpi-icon green"><ClipboardCheck size={19} /></div><div><p className="eyebrow">Complete packs</p><div className="kpi-value">{complete}</div><p className="kpi-detail">{shareLabel(complete, vehicleCount)} complete · logbook, agreement, certificate, photo, collateral</p></div></button>
             <button type="button" className="kpi-card kpi-card-button" onClick={() => { setStatusFilter('Needs attention'); setVehiclePage(1); go('Vehicles') }}><div className="kpi-icon orange"><AlertCircle size={19} /></div><div><p className="eyebrow">Need attention</p><div className="kpi-value">{attention}</div><p className="kpi-detail">{shareLabel(attention, vehicleCount)} missing a document</p></div></button>
             <button type="button" className="kpi-card kpi-card-button" onClick={() => go('Processing')}><div className="kpi-icon purple"><RefreshCw size={19} /></div><div><p className="eyebrow">Last sync</p><div className="kpi-value">{fleet?.lastSync ? 'Synced' : '—'}</div><p className="kpi-detail">{configured ? lastSyncLabel : 'Folders not configured'}</p></div></button>
