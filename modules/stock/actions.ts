@@ -9,7 +9,7 @@ import { cleanInboxEmail, isInboxEmail, mailboxSearchQuery } from '@/lib/mailbox
 import { warmPlateReader } from '@/lib/read-plate-runner'
 import { SHEET_MODULES, stockDocumentsModule, syncSheetModules } from '@/lib/modules'
 import { hasRenamedName, sameDocumentName } from '@/lib/document-names'
-import { driveIdFromUri, linkUnlinkedDocuments, readStockRegisterSnapshot } from '@/lib/modules/stock-documents'
+import { driveIdFromUri, linkUnlinkedDocuments, readStockRegisterSnapshot, syncCollateralChips } from '@/lib/modules/stock-documents'
 import { surplusCopies } from '@/lib/unmatched-files'
 import type { SheetCells, SheetSyncMode } from '@/lib/modules/types'
 import { compactPlate, extractKenyanPlate, listRegistrationNumbers, parseKenyanPlate, parsePhotoPlate, pickOcrPlate, plateFromCertificateText, plateFromLogbookText, plateFromText, printedRegistrationPlate } from '@/lib/plates'
@@ -291,6 +291,21 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
     const next = await syncSheetIndex(config, continuing ? 'match' : mode, files)
     sheet = { ...next, matched: [...new Set([...(sheet.matched || []), ...(next.matched || [])])] }
   }
+  if (config.spreadsheetId) {
+    try {
+      const collateral = await syncCollateralChips(config)
+      if (collateral.cells.size) sheet = { ...sheet, cells: collateral.cells }
+      if (collateral.written || collateral.more) {
+        const note = collateral.more
+          ? `Updated ${collateral.written} collateral chip${collateral.written === 1 ? '' : 's'} on STOCK DOCUMENTS. The remaining registration numbers are still being checked.`
+          : `Collateral chips are filled for every registration number${collateral.written ? ` (${collateral.written} updated)` : ''}.`
+        ingest = { ...ingest, collateralMore: collateral.more, collateralStamp: `${collateral.written}:${collateral.created}:${Date.now()}`, notice: ingest.notice ? `${ingest.notice} ${note}` : note }
+      }
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : 'Collateral chip update failed'
+      ingest = { ...ingest, notice: ingest.notice ? `${ingest.notice} ${detail}` : detail }
+    }
+  }
   const linkCells = sheet.cells?.size ? sheet.cells : preview.cells
   if (getProcessJob().items.length && linkCells?.size) {
     markProcessMatches(sheet.matched, sheet.missing, sheet.plates || preview.plates, linkedSheetFileIds(linkCells))
@@ -331,6 +346,8 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
     ingest: {
       ...ingest,
       more: Boolean(!isProcessCancelled() && ingest.more),
+      collateralMore: Boolean(ingest.collateralMore),
+      collateralStamp: ingest.collateralStamp,
       remaining: ingest.remaining || lastAction().remaining || 0,
       focus: ingest.focus || jobFocus,
       lastAction: lastAction(),

@@ -141,6 +141,8 @@ export type FleetSnapshot = {
     renamed: number
     remaining?: number
     more?: boolean
+    collateralMore?: boolean
+    collateralStamp?: string
     focus?: 'all' | 'photos' | 'certificates' | 'logbooks' | 'agreements' | 'repair' | 'repair-photos' | 'repair-certificates' | 'repair-logbooks' | 'repair-agreements'
     error?: string
     notice?: string

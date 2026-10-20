@@ -287,6 +287,27 @@ export function StockApp() {
     return () => window.clearInterval(timer)
   }, [user])
   useEffect(() => {
+    if (!user || !fleet?.ingest?.collateralMore) return
+    let cancelled = false
+    async function fillCollateral() {
+      const idle = String(fleet?.ingest?.collateralStamp || '').startsWith('0:0:')
+      await new Promise((resolve) => setTimeout(resolve, idle ? 20000 : 800))
+      if (cancelled || document.hidden) return
+      if (autoScanLock.current) return
+      autoScanLock.current = true
+      try {
+        const next = await loadFleet('auto', false, 'off')
+        if (!cancelled) applySnapshot(next)
+      } catch {
+        // The next pass retries any registration numbers that are still missing a chip.
+      } finally {
+        autoScanLock.current = false
+      }
+    }
+    void fillCollateral()
+    return () => { cancelled = true }
+  }, [user, fleet?.ingest?.collateralMore, fleet?.ingest?.collateralStamp])
+  useEffect(() => {
     const focus = processJob?.focus || fleet?.ingest?.focus || fleet?.ingest?.lastAction?.focus
     const more = Boolean(fleet?.ingest?.more || processJob?.advancing)
     const paused = processJob?.cancelled || fleet?.ingest?.lastAction?.status === 'paused' || fleet?.ingest?.lastAction?.status === 'done'

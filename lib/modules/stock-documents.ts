@@ -346,8 +346,11 @@ function canonicalFileName(file: TypedFile) {
   return file.name.toUpperCase().includes(plate)
 }
 
-async function ensureCollateralFolders(config: FleetConfig, mode: SheetSyncMode) {
-  if (mode === 'match' || !config.spreadsheetId) return { written: 0, created: 0, cells: new Map() as SheetCells, more: false }
+const COLLATERAL_PASS = process.env.VERCEL ? 40 : 120
+const COLLATERAL_BUDGET_MS = process.env.VERCEL ? 8000 : 28000
+
+async function ensureCollateralFolders(config: FleetConfig) {
+  if (!config.spreadsheetId) return { written: 0, created: 0, cells: new Map() as SheetCells, more: false }
   const register = await loadStockRegister(config, { fresh: true })
   if (!register.rows.size) return { written: 0, created: 0, cells: cellsFromRegister(register), more: false }
   const requests: ReturnType<typeof chipRequest>[] = []
@@ -360,8 +363,6 @@ async function ensureCollateralFolders(config: FleetConfig, mode: SheetSyncMode)
       row.columns.collateral = { col: collateralCol, value: '', uri: undefined }
     }
   }
-  const createLimit = mode === 'full' ? 150 : 30
-  const writeLimit = mode === 'full' ? 400 : 80
   const parentId = collateralParentId(config)
   const existing = await listChildFolders(parentId)
   const byName = new Map<string, typeof existing[number]>()
@@ -370,39 +371,57 @@ async function ensureCollateralFolders(config: FleetConfig, mode: SheetSyncMode)
     const plate = extractKenyanPlate(folder.name)
     if (plate && !byName.has(plate.toLowerCase())) byName.set(plate.toLowerCase(), folder)
   }
+  const deadline = Date.now() + COLLATERAL_BUDGET_MS
   let created = 0
+  function needsChip(row: StockRow) {
+    const column = row.columns.collateral
+    if (!column) return false
+    if (isDriveDocumentUri(column.uri)) return false
+    if ((column.value || '').trim()) return false
+    return true
+  }
+  function room() {
+    return requests.length < COLLATERAL_PASS && Date.now() < deadline
+  }
   function chipFolder(row: StockRow, folder: { id: string; name: string; webViewLink?: string }) {
     const column = row.columns.collateral
-    if (!column || requests.length >= writeLimit) return
+    if (!needsChip(row) || !column || !room()) return false
     const link = folderViewLink(folder.id, folder.webViewLink)
     requests.push(chipRequest(register.sheetId, row.row, column.col, link))
     column.value = folder.name
     column.uri = link
+    return true
   }
   for (const row of register.rows.values()) {
-    const column = row.columns.collateral
-    if (!column || isDriveDocumentUri(column.uri)) continue
+    if (!room()) break
+    if (!needsChip(row)) continue
     const folder = byName.get(row.plate.toLowerCase()) || byName.get(row.rawPlate.trim().toLowerCase())
     if (folder) chipFolder(row, folder)
   }
   for (const row of register.rows.values()) {
-    const column = row.columns.collateral
-    if (!column || isDriveDocumentUri(column.uri)) continue
-    if (created >= createLimit || requests.length >= writeLimit) break
-    const folder = await createFolder(parentId, row.plate)
-    created++
-    byName.set(row.plate.toLowerCase(), folder)
-    byName.set(folder.name.trim().toLowerCase(), folder)
-    chipFolder(row, folder)
+    if (!room()) break
+    if (!needsChip(row)) continue
+    try {
+      const folder = await createFolder(parentId, row.plate)
+      created += 1
+      byName.set(row.plate.toLowerCase(), folder)
+      byName.set(folder.name.trim().toLowerCase(), folder)
+      chipFolder(row, folder)
+    } catch {
+      break
+    }
   }
   if (header || requests.length) {
     await applyChipBatches(config.spreadsheetId, requests, header ? [header] : [])
     register.nextColumn = Math.max(register.nextColumn, collateralCol + 1)
     storeRegister(config.spreadsheetId, register)
   }
-  const stillOpen = [...register.rows.values()].some((row) => row.columns.collateral && !isDriveDocumentUri(row.columns.collateral.uri))
-  const hitCap = created >= createLimit || requests.length >= writeLimit
-  return { written: requests.length, created, cells: cellsFromRegister(register), more: hitCap && stillOpen }
+  const stillOpen = [...register.rows.values()].some((row) => needsChip(row))
+  return { written: requests.length, created, cells: cellsFromRegister(register), more: stillOpen }
+}
+
+export async function syncCollateralChips(config: FleetConfig) {
+  return ensureCollateralFolders(config)
 }
 
 function mergeStockColumns(current: StockRow['columns'], incoming: StockRow['columns']): StockRow['columns'] {
@@ -767,18 +786,15 @@ async function sync(config: FleetConfig, files: TypedFile[], mode: SheetSyncMode
     return { moduleId: 'stock-documents', keys: new Set(), written: 0, missing: [], matched: [], hint: '', cells: new Map() }
   }
   const matches = await writeSheetMatches(config, files, mode)
-  const collateral = mode === 'full'
-    ? await ensureCollateralFolders(config, mode)
-    : { written: 0, cells: matches.cells, more: false }
   return {
     moduleId: 'stock-documents',
     keys: matches.plates,
-    written: matches.written + collateral.written,
+    written: matches.written,
     missing: matches.missing,
     matched: matches.matched,
     hint: matches.hint,
-    cells: collateral.cells || matches.cells,
-    more: Boolean(matches.more || collateral.more),
+    cells: matches.cells,
+    more: Boolean(matches.more),
   }
 }
 
