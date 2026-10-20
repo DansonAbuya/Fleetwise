@@ -100,6 +100,11 @@ export function forgetFile(fileId: string) {
   confirmed.delete(fileId)
 }
 
+export function clearTriedFiles() {
+  tried.clear()
+  confirmed.clear()
+}
+
 export function canResumeProcessQueue(focus: ProcessFocus) {
   return queue.length > 0 && queueFocus === focus
 }

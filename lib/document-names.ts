@@ -7,6 +7,10 @@ export function documentBaseName(name: string) {
   return name.replace(/\.(pdf|jpe?g|png|webp|gif|heic)$/i, '').trim()
 }
 
+export function sameDocumentName(a: string, b: string) {
+  return documentBaseName(a) === documentBaseName(b)
+}
+
 export function hasUnmatchedMark(name: string) {
   return UNMATCHED_PREFIX.test(documentBaseName(name))
 }
@@ -67,8 +71,9 @@ export function plateFromTypedName(name: string, type: DocType) {
 }
 
 function matchesCanonical(name: string, expected: string) {
-  if (name === expected) return true
-  return new RegExp(`^${expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\d+$`).test(name)
+  const base = documentBaseName(name)
+  if (base === expected) return true
+  return new RegExp(`^${expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\d+$`).test(base)
 }
 
 export function hasCanonicalAgreementName(file: { name: string; type?: DocType }) {
@@ -76,6 +81,17 @@ export function hasCanonicalAgreementName(file: { name: string; type?: DocType }
   const plate = plateFromTypedName(file.name, 'agreement')
   if (!plate) return false
   return matchesCanonical(file.name, suggestedAgreementName(plate))
+}
+
+/** The file already carries its renamed plate, even if spacing is not exact. */
+export function hasRenamedName(file: { name: string; type: DocType }) {
+  if (file.type === 'logbook') {
+    const base = stripUnmatchedMark(file.name)
+    const body = base.match(/^(.+?)\s*[-–—]?\s*logbook(?:\s+\d+)?$/i)?.[1]
+      || base.match(/^logbook\s*[-–—]?\s*(.+)$/i)?.[1]
+    return isKenyanPlate(body ? compactPlate(body) : '')
+  }
+  return Boolean(plateFromTypedName(file.name, file.type))
 }
 
 export function hasCanonicalName(file: { name: string; type: DocType }) {

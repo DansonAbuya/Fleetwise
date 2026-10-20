@@ -8,12 +8,13 @@ import { coverFromCertificate, isOcrImage, ocrConfigured, plateFromImage, resolv
 import { cleanInboxEmail, isInboxEmail, mailboxSearchQuery } from '@/lib/mailboxes'
 import { warmPlateReader } from '@/lib/read-plate-runner'
 import { SHEET_MODULES, stockDocumentsModule, syncSheetModules } from '@/lib/modules'
+import { hasRenamedName, sameDocumentName } from '@/lib/document-names'
 import { driveIdFromUri, linkUnlinkedDocuments, readStockRegisterSnapshot } from '@/lib/modules/stock-documents'
 import { surplusCopies } from '@/lib/unmatched-files'
 import type { SheetCells, SheetSyncMode } from '@/lib/modules/types'
 import { compactPlate, extractKenyanPlate, listRegistrationNumbers, parseKenyanPlate, parsePhotoPlate, pickOcrPlate, plateFromCertificateText, plateFromLogbookText, plateFromText, printedRegistrationPlate } from '@/lib/plates'
 import { attachLastAction, beginProcessJob, endProcessJob, fileMatchesFocus, getProcessJob, isProcessCancelled, isProcessRunning, isRepairFocus, isStaleProcess, markProcessMatches, processFocusLabel, processGeneration, requestProcessStop, resetProcessJob, touchProcessItem, type ProcessFocus } from '@/lib/processing'
-import { confirmedPlate, forgetFile, hydrateProcessCursor, isCursorHydrated, lastAction, markConfirmed, markTried, persistProcessCursor, recordLastAction, wasTriedRecently, canResumeProcessQueue, closeRunningProcesses, processQueueItems, replaceProcessQueue, takeProcessQueueItem, type ProcessQueueItem } from '@/lib/process-cursor'
+import { confirmedPlate, forgetFile, hydrateProcessCursor, isCursorHydrated, lastAction, markConfirmed, markTried, persistProcessCursor, recordLastAction, wasTriedRecently, canResumeProcessQueue, clearTriedFiles, closeRunningProcesses, processQueueItems, replaceProcessQueue, takeProcessQueueItem, type ProcessQueueItem } from '@/lib/process-cursor'
 import { requireSession } from '@/lib/session'
 import { databaseConfigured, databaseStatus } from '@/lib/prisma'
 import { importVehiclesToDatabase, loadExportedRegister, loadRegisterFromDatabase, saveCoverDates } from '@/lib/register-db'
@@ -684,6 +685,7 @@ export async function runProcessing(focus: ProcessFocus = 'all') {
   await requireSession()
   const config = await requireConfig()
   await hydrateProcessCursor(config).catch(() => lastAction())
+  clearTriedFiles()
   replaceProcessQueue([], focus)
   recordLastAction({
     focus,
@@ -823,6 +825,16 @@ function plateOnRegister(plate: string | null | undefined, sheetPlates?: Set<str
   return sheetPlates.has(compactPlate(plate))
 }
 
+function sheetLinkedFile(file: TypedFile, cells?: SheetCells) {
+  if (!cells?.size) return false
+  const ids = new Set([file.id, file.shortcutDetails?.targetId].filter((id): id is string => Boolean(id)))
+  for (const row of cells.values()) {
+    const linked = driveIdFromUri(row[file.type]?.uri)
+    if (linked && ids.has(linked)) return true
+  }
+  return false
+}
+
 async function ocrMatchFile(config: FleetConfig, user: string, file: TypedFile, options: { verify?: boolean; sheetPlates?: Set<string>; focus?: ProcessFocus; takenNames?: Set<string> } = {}) {
   const certificate = isPlatePdf(file.type)
   const repair = isRepairFocus(options.focus)
@@ -834,6 +846,8 @@ async function ocrMatchFile(config: FleetConfig, user: string, file: TypedFile, 
       : printedRegistrationPlate(first.text || '')) || first.plate
     const named = plateFromTypedName(first.file?.name || file.name, file.type) || plateFromText(first.file?.name || file.name)
     const filenameWrong = Boolean(printed && named && compactPlate(named) !== compactPlate(printed))
+    const current = first.file || file
+    if (!repair && hasRenamedName(current) && !filenameWrong) return first
     if (!repair && !filenameWrong && (plateOnRegister(printed, options.sheetPlates) || !options.sheetPlates?.size)) return first
     forgetFile(file.id)
     const retry = first.file || file
@@ -874,6 +888,11 @@ async function ocrAndRename(config: FleetConfig, user: string, file: TypedFile, 
   const named = typedPlate || (file.type === 'logbook' || file.type === 'agreement' ? extractKenyanPlate(file.name) : plateFromText(file.name))
   const readable = isOcrImage(file.mimeType, file.name)
   const usesRegistrationField = isPlatePdf(file.type)
+  if (!options.verify && !options.forceRaster && hasRenamedName(file)) {
+    const plate = plateFromTypedName(file.name, file.type) || named
+    touchProcessItem(file.id, { stage: 'matching', detail: `Already renamed ${file.name}`, plate, name: file.name, type: file.type, mimeType: file.mimeType })
+    return { renamed: 0, text: '', name: file.name, plate, file: { ...file, name: file.name, plate, type: file.type } }
+  }
   if (hasCanonicalName(file) && !options.verify && !options.forceRaster && plateOnRegister(typedPlate || named, options.sheetPlates)) {
     const plate = typedPlate || named
     const name = file.name
@@ -884,7 +903,7 @@ async function ocrAndRename(config: FleetConfig, user: string, file: TypedFile, 
   if ((file.type === 'logbook' || file.type === 'agreement') && named && !hasCanonicalName(file) && !options.verify && !options.forceRaster) {
     const name = uniqueSuggestedName(named, file.type, file.name, options.takenNames)
     touchProcessItem(file.id, { stage: 'renaming', detail: `Renaming to ${name}`, plate: named, name: file.name, type: file.type, mimeType: file.mimeType })
-    if (name === file.name) return { renamed: 0, text: '', name, plate: named, file: { ...file, name, plate: named, type: file.type } }
+    if (sameDocumentName(name, file.name)) return { renamed: 0, text: '', name, plate: named, file: { ...file, name, plate: named, type: file.type } }
     const updated = await moveAndRename(file.id, { name })
     await appendAudit(config, user, `Normalized ${file.name} to ${name}`)
     touchProcessItem(file.id, { stage: 'renaming', detail: `Renamed to ${name}`, plate: named, name })
@@ -893,7 +912,7 @@ async function ocrAndRename(config: FleetConfig, user: string, file: TypedFile, 
   if (typedPlate && !readable && !usesRegistrationField) {
     const name = suggestedName(typedPlate, file.type, file.name)
     touchProcessItem(file.id, { stage: 'renaming', detail: `Filename already has ${typedPlate}`, plate: typedPlate, name: file.name, type: file.type, mimeType: file.mimeType })
-    if (name === file.name) return { renamed: 0, text: '', name, plate: typedPlate, file: { ...file, name, plate: typedPlate, type: file.type } }
+    if (sameDocumentName(name, file.name)) return { renamed: 0, text: '', name, plate: typedPlate, file: { ...file, name, plate: typedPlate, type: file.type } }
     const updated = await moveAndRename(file.id, { name })
     await appendAudit(config, user, `Normalized ${file.name} to ${name}`)
     touchProcessItem(file.id, { stage: 'renaming', detail: `Renamed to ${name}`, plate: typedPlate, name })
@@ -960,7 +979,7 @@ async function ocrAndRename(config: FleetConfig, user: string, file: TypedFile, 
   if (file.type === 'certificate') await rememberInsuranceCover(config, plate, ocr.text)
   const name = uniqueSuggestedName(plate, file.type, file.name, options.takenNames)
   const source = usesRegistrationField ? 'REGISTRATION No on the PDF' : 'the plate on the photo'
-  if (named && documentPlate && compactPlate(named) === compactPlate(documentPlate) && name === file.name) {
+  if (named && documentPlate && compactPlate(named) === compactPlate(documentPlate) && sameDocumentName(name, file.name)) {
     touchProcessItem(file.id, { stage: 'renaming', detail: `Checked ${plate} — the filename already matches ${source}`, plate, name: file.name })
     return { renamed: 0, text: ocr.text, name, plate, file: { ...file, name, plate, type: file.type } }
   }
@@ -970,7 +989,7 @@ async function ocrAndRename(config: FleetConfig, user: string, file: TypedFile, 
     plate,
     name: file.name,
   })
-  if (name === file.name) {
+  if (sameDocumentName(name, file.name)) {
     touchProcessItem(file.id, { stage: 'matching', detail: `Named ${name} from ${source}. Matching on STOCK DOCUMENTS`, plate, name })
     return { renamed: 0, text: ocr.text, name, plate, file: { ...file, name, plate, type: file.type } }
   }
@@ -1074,7 +1093,7 @@ function watchingLabel(config: FleetConfig, focus: ProcessFocus) {
   return [config.photosName || 'photos', config.certificatesName || 'certificates', config.logbooksName || 'logbooks', config.agreementsName || 'agreements'].join(', ')
 }
 
-function pendingForFocus(file: TypedFile, focus: ProcessFocus, sheetPlates?: Set<string>, missingDates?: Set<string>, extraIds?: Set<string>) {
+function pendingForFocus(file: TypedFile, focus: ProcessFocus, sheetPlates?: Set<string>, missingDates?: Set<string>, extraIds?: Set<string>, cells?: SheetCells) {
   if (extraIds?.has(file.id)) return false
   if (!fileMatchesFocus(file, focus)) return false
   const named = namedPlateOf(file)
@@ -1082,22 +1101,23 @@ function pendingForFocus(file: TypedFile, focus: ProcessFocus, sheetPlates?: Set
   const repair = isRepairFocus(focus)
   const plate = named ? compactPlate(named) : ''
   const needsDates = file.type === 'certificate' && Boolean(plate && missingDates?.has(plate))
+  const finished = hasRenamedName(file) || sheetLinkedFile(file, cells)
   if (file.type === 'agreement' && !hasCanonicalName(file) && named) return true
   if (file.type === 'certificate' && !repair) {
-    if (hasCanonicalName(file) || wasTriedRecently(file.id)) return false
+    if (finished || wasTriedRecently(file.id)) return false
     return true
   }
-  if (file.type === 'certificate' && !hasCanonicalName(file)) return true
+  if (file.type === 'certificate' && !hasCanonicalName(file) && !finished) return true
   if (file.type === 'logbook' && !repair) {
-    if (hasCanonicalName(file) || wasTriedRecently(file.id)) return false
+    if (finished || wasTriedRecently(file.id)) return false
     return true
   }
-  if (file.type === 'logbook' && !hasCanonicalName(file)) return true
+  if (file.type === 'logbook' && !hasCanonicalName(file) && !finished) return true
   if (file.type === 'photo' && !repair) {
-    if (hasCanonicalName(file) || wasTriedRecently(file.id)) return false
+    if (finished || wasTriedRecently(file.id)) return false
     return isOcrImage(file.mimeType, file.name)
   }
-  if (file.type === 'photo') return isOcrImage(file.mimeType, file.name)
+  if (file.type === 'photo') return !finished && isOcrImage(file.mimeType, file.name)
   if (matched && !needsDates) return false
   if (!repair && wasTriedRecently(file.id) && !needsDates) return false
   const readable = isOcrImage(file.mimeType, file.name)
@@ -1216,11 +1236,11 @@ async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 
     }),
   )
   const toNormalize = listed.filter((file) => {
-    if (extraIds.has(file.id) || !fileMatchesFocus(file, focus) || hasCanonicalName(file)) return false
+    if (extraIds.has(file.id) || !fileMatchesFocus(file, focus) || hasRenamedName(file) || sheetLinkedFile(file, cells)) return false
     if (file.type === 'logbook' || file.type === 'agreement') return Boolean(plateFromTypedName(file.name, file.type) || extractKenyanPlate(file.name))
     return Boolean(plateFromTypedName(file.name, file.type)) && !isOcrImage(file.mimeType, file.name)
   })
-  const pending = orderForResume(listed.filter((file) => pendingForFocus(file, focus, sheetPlates, missingDates, extraIds)), focus)
+  const pending = orderForResume(listed.filter((file) => pendingForFocus(file, focus, sheetPlates, missingDates, extraIds, cells)), focus)
   if (ON_VERCEL) {
     const queued = uniqueTypedFiles([...toNormalize, ...pending])
     replaceProcessQueue(queued.map(toQueueItem), focus)
@@ -1292,7 +1312,7 @@ async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 
       break
     }
     working = mergeTypedFiles(working, renamedFiles)
-    const pendingNow = orderForResume(working.filter((file) => pendingForFocus(file, focus, sheetPlates, missingDates)), focus)
+    const pendingNow = orderForResume(working.filter((file) => pendingForFocus(file, focus, sheetPlates, missingDates, undefined, cells)), focus)
     const normalizeNow = batch === 0 ? toNormalize : []
     const ocrSlice = pendingNow.slice(0, OCR_BATCH)
     const batchFiles = uniqueTypedFiles([...normalizeNow, ...(ocrConfigured() ? ocrSlice : [])])
