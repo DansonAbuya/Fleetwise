@@ -3,7 +3,7 @@ import { getGoogleAccessToken, googleFetch } from '@/lib/google'
 const SHEETS = 'https://sheets.googleapis.com/v4/spreadsheets'
 const CHIP_BATCH = 10
 
-export type SheetTab = { sheetId: number; title: string }
+export type SheetTab = { sheetId: number; title: string; rowCount: number; columnCount: number }
 
 export type GridCell = {
   formattedValue?: string
@@ -55,16 +55,34 @@ export function quotedSheetTitle(title: string) {
 }
 
 export async function listTabs(spreadsheetId: string): Promise<SheetTab[]> {
-  const data = await sheetsFetch(`/${spreadsheetId}?fields=sheets.properties(sheetId,title)`).then((res) => res.json()) as {
-    sheets?: { properties?: { sheetId?: number; title?: string } }[]
+  const data = await sheetsFetch(`/${spreadsheetId}?fields=sheets.properties(sheetId,title,gridProperties(rowCount,columnCount))`).then((res) => res.json()) as {
+    sheets?: { properties?: { sheetId?: number; title?: string; gridProperties?: { rowCount?: number; columnCount?: number } } }[]
   }
   return (data.sheets || [])
-    .map((sheet) => ({ sheetId: sheet.properties?.sheetId ?? 0, title: sheet.properties?.title || '' }))
+    .map((sheet) => ({
+      sheetId: sheet.properties?.sheetId ?? 0,
+      title: sheet.properties?.title || '',
+      rowCount: sheet.properties?.gridProperties?.rowCount || 1000,
+      columnCount: sheet.properties?.gridProperties?.columnCount || 26,
+    }))
     .filter((tab) => tab.title)
 }
 
-export async function readTabGrid(spreadsheetId: string, title: string) {
-  const range = `${quotedSheetTitle(title)}!A1:CZ8000`
+function columnLetters(count: number) {
+  let n = Math.max(1, count)
+  let letters = ''
+  while (n > 0) {
+    const rem = (n - 1) % 26
+    letters = String.fromCharCode(65 + rem) + letters
+    n = Math.floor((n - 1) / 26)
+  }
+  return letters
+}
+
+export async function readTabGrid(spreadsheetId: string, title: string, bounds?: { rows?: number; columns?: number }) {
+  const rows = Math.min(Math.max(bounds?.rows || 1000, 1), 4000)
+  const columns = Math.min(Math.max(bounds?.columns || 26, 8), 36)
+  const range = `${quotedSheetTitle(title)}!A1:${columnLetters(columns)}${rows}`
   const data = await sheetsFetch(
     `/${spreadsheetId}?includeGridData=true&ranges=${encodeURIComponent(range)}&fields=sheets(properties(title),merges,data(rowData(values(formattedValue,effectiveValue,hyperlink,userEnteredValue,chipRuns))))`,
   ).then((res) => res.json()) as {

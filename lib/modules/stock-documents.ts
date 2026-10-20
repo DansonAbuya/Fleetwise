@@ -53,7 +53,7 @@ type StockRegister = {
 }
 
 const registerCache = new Map<string, { at: number; register: StockRegister }>()
-const CACHE_MS = 45_000
+const CACHE_MS = 5 * 60 * 1000
 
 export function stockTabTitle(config: FleetConfig) {
   return config.logbooksSheet || STOCK_TAB
@@ -98,7 +98,7 @@ export async function loadStockRegister(config: FleetConfig, options?: { fresh?:
   let lastError = ''
   for (const tab of toRead) {
     try {
-      const register = await readStockTab(config.spreadsheetId, tab.title, tab.sheetId)
+      const register = await readStockTab(config.spreadsheetId, tab.title, tab.sheetId, { rows: tab.rowCount, columns: tab.columnCount })
       registerCache.set(cacheKey, { at: Date.now(), register })
       return register
     } catch (err) {
@@ -120,7 +120,7 @@ async function writeSheetMatches(config: FleetConfig, files: TypedFile[], mode: 
   const filesById = new Map(files.map((file) => [file.id, file]))
   const bestForRow = new Map<string, TypedFile>()
   for (const file of files) {
-    if ((file.type === 'logbook' || file.type === 'agreement') && !hasCanonicalName(file)) continue
+    if ((file.type === 'logbook' || file.type === 'agreement' || file.type === 'certificate') && !hasCanonicalName(file)) continue
     const plate = filePlate(file)
     if (!plate) continue
     const key = `${columnKeyForFile(file.type, file.name)}:${plate}`
@@ -271,8 +271,9 @@ export async function linkUnlinkedDocuments(config: FleetConfig, type: 'photo' |
     if (type === 'certificate') {
       const column = row.columns.certificate
       if (column && !isDriveDocumentUri(column.uri)) {
-        const file = take(pool, (file) => canonicalFileName(file))
-        if (file) queue(row, column, file)
+        const canonical = pool.find((file) => hasCanonicalName(file))
+        if (canonical) queue(row, column, canonical)
+        else unnamed += 1
       }
       continue
     }
@@ -441,8 +442,8 @@ function emptySync() {
   return { plates: new Set<string>(), written: 0, missing: [] as string[], matched: [] as string[], hint: '', cells: new Map() as SheetCells, more: false }
 }
 
-async function readStockTab(spreadsheetId: string, title: string, sheetId: number): Promise<StockRegister> {
-  const { rowData, values, merges } = await readTabGrid(spreadsheetId, title)
+async function readStockTab(spreadsheetId: string, title: string, sheetId: number, bounds?: { rows?: number; columns?: number }): Promise<StockRegister> {
+  const { rowData, values, merges } = await readTabGrid(spreadsheetId, title, bounds)
   if (!values.length) throw new Error(`'${title}' is empty.`)
   const header = findHeader(values)
   if (!header) throw new Error(`'${title}' needs a header row with Registration Number.`)

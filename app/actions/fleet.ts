@@ -215,24 +215,29 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
   const skipOcr = focus === 'off' || (!requested && (isProcessCancelled() || live.cancelled || !jobFocus))
   const watchPass = focus === 'off'
   const skipExtras = watchPass && mode === 'auto'
-  const preview = config.spreadsheetId ? await readStockRegisterSnapshot(config) : { vehicles: [], unmatched: [], duplicates: [], plates: new Set<string>(), cells: new Map() as SheetCells, error: undefined as string | undefined }
+  const freshRead = mode === 'full' || (!ON_VERCEL && !skipOcr)
+  const resumeQueue = ON_VERCEL && !skipOcr && canResumeProcessQueue(jobFocus || 'all')
+  const emptyPreview = { vehicles: [] as VehicleRecord[], unmatched: [] as TypedFile[], duplicates: [] as FleetSnapshot['duplicates'], plates: new Set<string>(), cells: new Map() as SheetCells, error: undefined as string | undefined }
+  const [preview, folderScan] = await Promise.all([
+    config.spreadsheetId ? readStockRegisterSnapshot(config, { fresh: freshRead }) : Promise.resolve(emptyPreview),
+    resumeQueue ? Promise.resolve(null) : scanFolders(config, new Set<string>(), new Map() as SheetCells, undefined, { fresh: freshRead }),
+  ])
   let ingest = { watching: '', attempted: 0, renamed: 0, remaining: 0, more: false, error: undefined as string | undefined, renamedFiles: [] as TypedFile[], started: false, focus: jobFocus, notice: undefined as string | undefined }
   let files: TypedFile[] = []
   const warming = !skipOcr ? warmPlateReader().catch(() => {}) : Promise.resolve()
-  const resumeQueue = ON_VERCEL && !skipOcr && canResumeProcessQueue(jobFocus || 'all')
   try {
     if (resumeQueue) {
       await warming
       ingest = await ingestQueued(config, session.name, jobFocus || 'all', preview.plates)
       files = [...processQueueItems().map(queueItemToFile), ...ingest.renamedFiles]
     } else {
-      const listed = await scanFolders(config, preview.plates, preview.cells, undefined, { fresh: ON_VERCEL ? false : !skipOcr || mode === 'full' })
+      const listed = await scanFolders(config, preview.plates, preview.cells, folderScan?.files)
       await warming
       ingest = skipOcr
         ? { watching: '', attempted: 0, renamed: 0, remaining: 0, more: false, error: undefined, renamedFiles: [] as TypedFile[], started: false, focus: undefined }
         : await ingestIncoming(config, session.name, mode, listed.files, preview.plates, jobFocus || 'all', preview.cells)
       files = mergeTypedFiles(listed.files, ingest.renamedFiles)
-      if (!isProcessRunning() && !(ON_VERCEL && !skipOcr)) {
+      if (!skipOcr && !ON_VERCEL && !isProcessRunning()) {
         const cleared = await clearUnmatchedFolderMarks(files)
         if (cleared.length) files = mergeTypedFiles(files, cleared)
       }
@@ -244,7 +249,7 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
   }
   const ingestGen = processGeneration()
   const continuing = Boolean(ingest.more)
-  const deferSheet = ON_VERCEL && !skipOcr && (ingest.started || Boolean(ingest.more))
+  const deferSheet = skipOcr || (ON_VERCEL && !skipOcr && (ingest.started || Boolean(ingest.more)))
   let sheet = deferSheet || !files.length
     ? { plates: preview.plates, error: preview.error, missing: [] as string[], matched: [] as string[], hint: '', cells: preview.cells, more: false }
     : await syncSheetIndex(config, continuing ? 'match' : mode, files)
@@ -268,11 +273,8 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
     skipExtras || continuing ? Promise.resolve(emptyGmail) : loadGmailState().catch(() => emptyGmail),
   ])
   const covers = await loadInsuranceCovers(config).catch(() => ({} as Awaited<ReturnType<typeof loadInsuranceCovers>>))
-  const filledCovers = skipOcr && !isProcessRunning()
-    ? await backfillInsuranceCovers(config, files, covers)
-    : covers
-  const registerVehicles = attachInsurance(vehicles.length ? vehicles : preview.vehicles, filledCovers)
-  if (Object.keys(filledCovers).length) await saveCoverDates(filledCovers).catch(() => {})
+  const registerVehicles = attachInsurance(vehicles.length ? vehicles : preview.vehicles, covers)
+  if (!skipOcr && Object.keys(covers).length) await saveCoverDates(covers).catch(() => {})
   const database = await databaseStatus().catch(() => ({ configured: false, connected: false, vehicles: 0 }))
   return {
     user: { name: session.name, email: session.email, image: session.image },
@@ -280,7 +282,7 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
     vehicles: [],
     unmatched,
     duplicates,
-    insuranceAlerts: insuranceAlertsFor(filledCovers),
+    insuranceAlerts: insuranceAlertsFor(covers),
     inbox: gmail.state.items,
     audit,
     stats: statsFor(registerVehicles),
@@ -618,7 +620,9 @@ export async function linkPerceivedMatches(type: 'photo' | 'certificate' | 'logb
   const linked = await linkUnlinkedDocuments(config, type, waiting)
   if (!linked.written) {
     if (linked.unnamed) {
-      throw new Error(`${linked.unnamed} logbook${linked.unnamed === 1 ? ' is' : 's are'} not linked because the file is not named {plate} - Logbook yet.`)
+      const expected = type === 'certificate' ? 'Insurance - {plate}' : '{plate} - Logbook'
+      const labelOne = type === 'certificate' ? 'insurance file' : 'logbook'
+      throw new Error(`${linked.unnamed} ${labelOne}${linked.unnamed === 1 ? ' is' : 's are'} not linked because the file is not named ${expected} yet.`)
     }
     if (linked.missing.length) {
       const plates = listRegistrationNumbers(linked.missing)
@@ -631,7 +635,7 @@ export async function linkPerceivedMatches(type: 'photo' | 'certificate' | 'logb
   const fleet = await loadFleet('auto', false, 'off')
   const skipped = [
     linked.missing.length ? `${linked.missing.length} registration number${linked.missing.length === 1 ? ' is' : 's are'} not on the sheet, so those files were left in the folder.` : '',
-    linked.unnamed ? `${linked.unnamed} logbook${linked.unnamed === 1 ? ' still needs' : 's still need'} the name {plate} - Logbook before it can be linked.` : '',
+    linked.unnamed ? `${linked.unnamed} file${linked.unnamed === 1 ? '' : 's'} still need the name ${type === 'certificate' ? 'Insurance - {plate}' : '{plate} - Logbook'} before they can be linked.` : '',
   ].filter(Boolean).join(' ')
   return {
     ...fleet,
@@ -1038,6 +1042,10 @@ function pendingForFocus(file: TypedFile, focus: ProcessFocus, sheetPlates?: Set
   const plate = named ? compactPlate(named) : ''
   const needsDates = file.type === 'certificate' && Boolean(plate && missingDates?.has(plate))
   if ((file.type === 'logbook' || file.type === 'agreement') && !hasCanonicalName(file) && named) return true
+  if (file.type === 'certificate' && !hasCanonicalName(file)) {
+    if (!repair && wasTriedRecently(file.id) && !needsDates) return false
+    return true
+  }
   if (file.type === 'photo') {
     if (repair) return isOcrImage(file.mimeType, file.name)
     if (hasCanonicalName(file) && matched) return false
