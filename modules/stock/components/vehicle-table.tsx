@@ -17,7 +17,7 @@ export function VehicleTable({ vehicles, total, page, pageSize, pageSizes, loadi
       {pageSizes && pageSizes.length > 1 && <label className="field-label table-page-size">Rows<select className="assign-input" value={pageSize} onChange={(e) => onPageSizeChange?.(Number(e.target.value))} aria-label="Rows per page">{pageSizes.map((size) => <option key={size} value={size}>{size}</option>)}</select></label>}
       <div className="table-pagination-controls">
         <button type="button" className="button secondary pagination-nav" onClick={() => onPageChange?.(Math.max(1, page - 1))} disabled={page <= 1 || !onPageChange} aria-label="Previous page"><ChevronLeft size={16} /> Previous</button>
-        {pageNumbers(page, totalPages).map((item, index) => item === '…' ? <span key={`gap-${index}`} className="pagination-gap">…</span> : <button type="button" key={item} className={`pagination-page ${page === item ? 'active' : ''}`} onClick={() => onPageChange?.(item)} aria-current={page === item ? 'page' : undefined}>{item}</button>)}
+        {pageNumbers(page, totalPages).map((item, index) => item === '…' ? <span key={`gap-${index}`} className="pagination-gap">…</span> : <button type="button" key={item} className={`pagination-page ${page === item ? 'active' : ''}`} onClick={() => onPageChange?.(item)} disabled={!onPageChange} aria-current={page === item ? 'page' : undefined}>{item}</button>)}
         <button type="button" className="button secondary pagination-nav" onClick={() => onPageChange?.(Math.min(totalPages, page + 1))} disabled={page >= totalPages || !onPageChange} aria-label="Next page">Next <ChevronRight size={16} /></button>
       </div>
     </div>}

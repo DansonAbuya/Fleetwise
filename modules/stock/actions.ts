@@ -141,20 +141,18 @@ async function syncRegisterFromSheet(config: FleetConfig) {
 export async function loadVehiclePage(input: VehicleQuery = {}) {
   await requireSession()
   const config = await loadConfig()
-  const sheet = config?.spreadsheetId ? await syncRegisterFromSheet(config) : null
   if (databaseConfigured()) {
     const database = await databaseStatus().catch(() => ({ connected: false, vehicles: 0 }))
     if (database.connected && database.vehicles > 0) {
       try {
         const covers = config ? await loadInsuranceCovers(config).catch(() => ({} as Record<string, InsuranceCover>)) : {}
-        if (Object.keys(covers).length) await saveCoverDates(covers).catch(() => {})
         const fromDb = await loadRegisterFromDatabase(input, covers)
-        return { ...fromDb, error: sheet?.error }
+        return { ...fromDb, error: undefined as string | undefined }
       } catch (err) {
         return {
           vehicles: [] as VehicleRecord[],
           total: 0,
-          page: 1,
+          page: input.page || 1,
           pageSize: input.pageSize || 25,
           stats: EMPTY_STATS,
           insuranceAlerts: [] as FleetSnapshot['insuranceAlerts'],
@@ -163,6 +161,7 @@ export async function loadVehiclePage(input: VehicleQuery = {}) {
       }
     }
   }
+  const sheet = config?.spreadsheetId ? await readStockRegisterSnapshot(config) : null
   if (!config?.spreadsheetId || !sheet) {
     return { vehicles: [] as VehicleRecord[], total: 0, page: 1, pageSize: input.pageSize || 25, stats: EMPTY_STATS, insuranceAlerts: [] as FleetSnapshot['insuranceAlerts'], error: undefined as string | undefined }
   }

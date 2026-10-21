@@ -422,7 +422,7 @@ async function ensureCollateralFolders(config: FleetConfig) {
     const markedAt = Date.now()
     for (const plate of touched) chippedCollateral.set(`${config.spreadsheetId}:${plate}`, markedAt)
     register.nextColumn = Math.max(register.nextColumn, collateralCol + 1)
-    storeRegister(config.spreadsheetId, register)
+    storeRegister(config.spreadsheetId, register, await sheetModifiedTime(config.spreadsheetId))
   }
   const stillOpen = [...register.rows.values()].some((row) => needsChip(row))
   return { written: requests.length, created, cells: cellsFromRegister(register), more: stillOpen }
