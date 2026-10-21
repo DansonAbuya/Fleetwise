@@ -318,6 +318,79 @@ async function readPdfDocument(buffer, raster = true) {
   return { text: texts.join('\n'), pages: pages.filter(Boolean) }
 }
 
+const AGREEMENT_MONTHS = {
+  jan: 1, january: 1, feb: 2, february: 2, mar: 3, march: 3, apr: 4, april: 4, may: 5,
+  jun: 6, june: 6, jul: 7, july: 7, aug: 8, august: 8, sep: 9, sept: 9, september: 9,
+  oct: 10, october: 10, nov: 11, november: 11, dec: 12, december: 12,
+}
+
+function agreementIsoDate(day, monthName, year) {
+  const month = AGREEMENT_MONTHS[String(monthName || '').toLowerCase()]
+  const date = Number(day)
+  const fullYear = Number(year)
+  if (!month || date < 1 || date > 31 || fullYear < 2000 || fullYear > 2100) return ''
+  return `${fullYear}-${String(month).padStart(2, '0')}-${String(date).padStart(2, '0')}`
+}
+
+function latestAgreementDate(text) {
+  const found = []
+  const labeled = /\bDate\s*:\s*(\d{1,2})(?:st|nd|rd|th)?\s+(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+(\d{4})\b/gi
+  for (const match of text.matchAll(labeled)) {
+    const iso = agreementIsoDate(match[1], match[2], match[3])
+    if (iso) found.push(iso)
+  }
+  return found.sort().at(-1) || ''
+}
+
+function agreementRegistration(text) {
+  const labeled = text.match(/registration\s+no\.?\s*[:.]?\s*([A-Z]{2,4}\s*\d{3}\s*[A-Z])/i)
+  return parseKenyanPlate((labeled?.[1] || '').replace(/[^A-Za-z0-9]/g, '')) || null
+}
+
+export async function inspectHirePurchase(bytes) {
+  const getDocument = await loadPdfjs()
+  const data = Uint8Array.from(bytes)
+  const pdf = await getDocument({
+    data,
+    disableFontFace: true,
+    isOffscreenCanvasSupported: false,
+    useSystemFonts: false,
+    disableRange: true,
+    disableStream: true,
+    verbosity: 0,
+    useWasm: false,
+    useWorkerFetch: false,
+  }).promise
+  const texts = new Array(pdf.numPages)
+  let signed = false
+  try {
+    for (let start = 1; start <= pdf.numPages; start += 4) {
+      const numbers = []
+      for (let n = start; n < start + 4 && n <= pdf.numPages; n += 1) numbers.push(n)
+      const pages = await Promise.all(numbers.map((n) => pdf.getPage(n)))
+      await Promise.all(pages.map(async (page, index) => {
+        const content = await page.getTextContent()
+        texts[numbers[index] - 1] = content.items.map((item) => String(item.str || '')).join(' ')
+        if (signed) return
+        const annotations = await page.getAnnotations().catch(() => [])
+        if (annotations.some((item) => /ink|sig|stamp/i.test(String(item.subtype || '')))) signed = true
+      }))
+    }
+  } finally {
+    try {
+      pdf.cleanup?.()
+    } catch {
+      // The text and signature marks are already collected.
+    }
+  }
+  const text = texts.filter(Boolean).join('\n')
+  return JSON.stringify({
+    plate: agreementRegistration(text),
+    signed,
+    date: latestAgreementDate(text),
+  })
+}
+
 async function rasterPage(page, canvasFactory, scale) {
   const viewport = page.getViewport({ scale: scale || scaleFor(page) })
   const canvasAndContext = canvasFactory.create(Math.ceil(viewport.width), Math.ceil(viewport.height))

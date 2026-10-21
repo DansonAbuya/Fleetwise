@@ -29,18 +29,30 @@ export type ProcessQueueItem = {
   parents?: string[]
 }
 
+export type AgreementRead = {
+  id: string
+  name: string
+  modifiedTime?: string
+  webViewLink?: string
+  plate: string
+  signed: boolean
+  date: string
+}
+
 type CursorFile = ProcessLastAction & {
   tried?: Record<string, number>
   confirmed?: Record<string, { plate: string; at: number }>
   queue?: ProcessQueueItem[]
   queueFocus?: ProcessFocus
   fileId?: string
+  agreementReads?: AgreementRead[]
 }
 
 let cursor: ProcessLastAction = { status: 'idle' }
 const tried = new Map<string, number>()
 const confirmed = new Map<string, { plate: string; at: number }>()
 let queue: ProcessQueueItem[] = []
+let agreementReads: AgreementRead[] = []
 let queueFocus: ProcessFocus | undefined
 let storedFileId: string | undefined
 let hydrated = false
@@ -113,6 +125,19 @@ export function processQueueItems() {
   return queue.slice()
 }
 
+export function agreementReadList() {
+  return agreementReads.slice()
+}
+
+export function rememberAgreementReads(reads: AgreementRead[]) {
+  if (closed) return
+  agreementReads = reads
+}
+
+export function clearAgreementReads() {
+  agreementReads = []
+}
+
 export function replaceProcessQueue(items: ProcessQueueItem[], focus: ProcessFocus) {
   if (closed) return
   queue = items
@@ -157,6 +182,7 @@ export async function hydrateProcessCursor(config: FleetConfig) {
     done: stored.done || 0,
   }
   queue = Array.isArray(stored.queue) ? stored.queue.filter((item) => item?.id && item?.name && item?.type) : []
+  agreementReads = Array.isArray(stored.agreementReads) ? stored.agreementReads.filter((item) => item?.id && item?.name) : []
   queueFocus = stored.queueFocus
   for (const [id, at] of Object.entries(stored.tried || {})) {
     if (typeof at === 'number') tried.set(id, at)
@@ -172,6 +198,7 @@ export function closeRunningProcesses() {
   epoch += 1
   closed = true
   queue = []
+  agreementReads = []
   queueFocus = undefined
   cursor = {
     status: 'done',
@@ -193,6 +220,7 @@ export async function persistProcessCursor(config: FleetConfig) {
     tried: Object.fromEntries(tried),
     confirmed: Object.fromEntries(confirmed),
     queue: queue.slice(),
+    agreementReads: agreementReads.slice(),
     queueFocus,
   }
   const run = persistChain.then(async () => {

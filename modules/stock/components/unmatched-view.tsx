@@ -27,7 +27,7 @@ export function UnmatchedView({ files, category, onCategory, busy, ocrConfigured
     { id: 'agreement' as const, title: 'Agreements', empty: 'No unmatched agreements.', items: split.agreements },
   ]
   const visible = category === 'all' ? groups : groups.filter((group) => group.id === category)
-  const readableCount = files.filter((file) => isPhotoFile(file) || file.type === 'certificate' || file.type === 'logbook' || file.type === 'agreement').length
+  const readableCount = files.filter((file) => isPhotoFile(file) || file.type === 'certificate' || file.type === 'logbook').length
   const queued = files.flatMap((item) => {
     const draft = drafts[item.id] || { plate: '', type: item.type }
     if (!draft.plate.trim()) return []
@@ -97,7 +97,7 @@ export function UnmatchedView({ files, category, onCategory, busy, ocrConfigured
               <div className="file-info"><strong>{item.name}</strong><span>{labelFor(item.type)}</span></div>
               <label className="field-label">Plate<input className="assign-input" placeholder="KDA 482M" value={draft.plate} onChange={(e) => updateDraft(item.id, { plate: e.target.value }, item.type)} /></label>
               <label className="field-label">Type<select className="assign-input" value={draft.type} onChange={(e) => updateDraft(item.id, { type: e.target.value as DocType }, item.type)}><option value="logbook">Logbook</option><option value="agreement">Agreement</option><option value="certificate">Certificate</option><option value="photo">Photo</option></select></label>
-              {(isPhotoFile(item) || item.type === 'certificate' || item.type === 'logbook' || item.type === 'agreement') && <button className="button secondary" disabled={busy || Boolean(busyId) || !ocrConfigured} onClick={async () => { setRowError(''); setBusyId(item.id); try { await onOcr(item.id) } finally { setBusyId('') } }}>{busyId === item.id ? 'Reading…' : 'Read plate'}</button>}
+              {(isPhotoFile(item) || item.type === 'certificate' || item.type === 'logbook') && <button className="button secondary" disabled={busy || Boolean(busyId) || !ocrConfigured} onClick={async () => { setRowError(''); setBusyId(item.id); try { await onOcr(item.id) } finally { setBusyId('') } }}>{busyId === item.id ? 'Reading…' : 'Read plate'}</button>}
               <button className="button secondary" disabled={busy || Boolean(busyId)} onClick={async () => {
                 if (!draft.plate.trim()) { setRowError('Enter a registration plate.'); return }
                 if (!parseKenyanPlate(draft.plate)) { setRowError(`Not a Kenyan registration number for ${item.name}. Example KMHE520A.`); return }

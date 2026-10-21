@@ -10,12 +10,13 @@ import { warmPlateReader } from '@/lib/read-plate-runner'
 import { SHEET_MODULES, stockDocumentsModule, syncSheetModules } from '@/lib/modules'
 import { hasRenamedName, sameDocumentName } from '@/lib/document-names'
 import { driveIdFromUri, linkUnlinkedDocuments, readStockRegisterSnapshot, syncCollateralChips } from '@/lib/modules/stock-documents'
+import { linkHirePurchaseAgreements } from '@/lib/hire-agreements'
 import { surplusCopies } from '@/lib/unmatched-files'
 import type { SheetCells, SheetSyncMode } from '@/lib/modules/types'
 import { compactPlate, extractKenyanPlate, listRegistrationNumbers, parseKenyanPlate, parsePhotoPlate, pickOcrPlate, plateFromCertificateText, plateFromLogbookText, plateFromText, printedRegistrationPlate } from '@/lib/plates'
 import { attachLastAction, beginProcessJob, endProcessJob, fileMatchesFocus, getProcessJob, isProcessCancelled, isProcessRunning, isRepairFocus, isStaleProcess, markProcessMatches, processGeneration, requestProcessStop, resetProcessJob, touchProcessItem } from '@/lib/processing'
 import { processFocusLabel, type ProcessFocus } from '@/lib/process-focus'
-import { confirmedPlate, forgetFile, hydrateProcessCursor, isCursorHydrated, lastAction, markConfirmed, markTried, persistProcessCursor, recordLastAction, wasTriedRecently, canResumeProcessQueue, clearTriedFiles, closeRunningProcesses, processQueueItems, replaceProcessQueue, takeProcessQueueItem, type ProcessQueueItem } from '@/lib/process-cursor'
+import { agreementReadList, confirmedPlate, forgetFile, hydrateProcessCursor, isCursorHydrated, lastAction, markConfirmed, markTried, persistProcessCursor, recordLastAction, wasTriedRecently, canResumeProcessQueue, clearAgreementReads, clearTriedFiles, closeRunningProcesses, processQueueItems, replaceProcessQueue, takeProcessQueueItem, type ProcessQueueItem } from '@/lib/process-cursor'
 import { requireSession } from '@/lib/session'
 import { databaseConfigured, databaseStatus } from '@/lib/prisma'
 import { importVehiclesToDatabase, loadExportedRegister, loadRegisterFromDatabase, saveCoverDates } from '@/lib/register-db'
@@ -51,7 +52,7 @@ function namedPlateOf(file: { name: string; type: DocType }) {
 }
 
 function isPlatePdf(type: DocType) {
-  return type === 'certificate' || type === 'logbook' || type === 'agreement'
+  return type === 'certificate' || type === 'logbook'
 }
 
 function nameMatchesDocument(file: { id: string; name: string; type: DocType }) {
@@ -231,7 +232,33 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
   const skipExtras = watchPass && mode === 'auto'
   const freshFolders = mode === 'full' || (!ON_VERCEL && !skipOcr)
   const freshSheet = freshFolders && !requested
-  const resumeQueue = ON_VERCEL && !skipOcr && canResumeProcessQueue(jobFocus || 'all')
+  const resumeQueue = requested !== 'agreements' && ON_VERCEL && !skipOcr && canResumeProcessQueue(jobFocus || 'all')
+  if (requested === 'agreements') {
+    const continuingReads = agreementReadList().length > 0
+    let ingest = { watching: config.agreementsName || 'agreements', attempted: 0, renamed: 0, remaining: 0, more: false, error: undefined as string | undefined, renamedFiles: [] as TypedFile[], started: true, focus: 'agreements' as const, notice: undefined as string | undefined }
+    try {
+      const listed = config.agreementsId
+        ? await scanFolders(config, new Set<string>(), new Map() as SheetCells, undefined, { fresh: !continuingReads, types: ['agreement'] })
+        : { files: [] as TypedFile[] }
+      ingest = await linkHirePurchaseAgreements(config, listed.files)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Loan agreements could not be read.'
+      ingest = { ...ingest, error: message, notice: message }
+    }
+    if ((ingest.started || closeLive) && isProcessRunning()) {
+      endProcessJob(ingest.error, { remaining: ingest.remaining || 0, renamed: ingest.renamed })
+    }
+    return emptySnapshot(session, config, {
+      ingest: {
+        ...ingest,
+        more: Boolean(!isProcessCancelled() && ingest.more),
+        preserve: true,
+        focus: 'agreements',
+        remaining: ingest.remaining || 0,
+        lastAction: lastAction(),
+      },
+    })
+  }
   const emptyPreview = { vehicles: [] as VehicleRecord[], unmatched: [] as TypedFile[], duplicates: [] as FleetSnapshot['duplicates'], plates: new Set<string>(), cells: new Map() as SheetCells, error: undefined as string | undefined }
   const [preview, folderScan] = await Promise.all([
     config.spreadsheetId ? readStockRegisterSnapshot(config, { fresh: freshSheet }) : Promise.resolve(emptyPreview),
@@ -248,9 +275,13 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
     } else {
       const listed = await scanFolders(config, preview.plates, preview.cells, folderScan?.files)
       await warming
-      ingest = skipOcr
-        ? { watching: '', attempted: 0, renamed: 0, remaining: 0, more: false, error: undefined, renamedFiles: [] as TypedFile[], started: false, focus: undefined }
-        : await ingestIncoming(config, session.name, mode, listed.files, preview.plates, jobFocus || 'all', preview.cells)
+      if (requested === 'agreements') {
+        ingest = await linkHirePurchaseAgreements(config, listed.files)
+      } else {
+        ingest = skipOcr
+          ? { watching: '', attempted: 0, renamed: 0, remaining: 0, more: false, error: undefined, renamedFiles: [] as TypedFile[], started: false, focus: undefined }
+          : await ingestIncoming(config, session.name, mode, listed.files, preview.plates, jobFocus || 'all', preview.cells)
+      }
       files = mergeTypedFiles(listed.files, ingest.renamedFiles)
       if (!skipOcr && !ON_VERCEL && !isProcessRunning()) {
         const cleared = await clearUnmatchedFolderMarks(files)
@@ -460,7 +491,7 @@ export async function uploadDocument(formData: FormData) {
     await appendAudit(config, 'System', `OCR skipped for ${file.name}: ${err instanceof Error ? err.message : 'OCR error'}`)
   }
   const auto = Boolean(match.plate && match.confidence >= (config.autoUploadThreshold ?? 85))
-  const name = auto && match.plate ? suggestedName(match.plate, type, file.name) : file.name
+  const name = type === 'agreement' || !(auto && match.plate) ? file.name : suggestedName(match.plate, type, file.name)
   const folderId = folderIdForType(config, type)
   if (!folderId) throw new Error(type === 'agreement' ? 'Choose the agreements Drive folder in Settings first.' : 'Choose the Drive folder for that document type in Settings.')
   const uploaded = await uploadBinary(folderId, name, bytes, file.type || 'application/octet-stream')
@@ -478,7 +509,7 @@ async function applyManualAssignment(config: FleetConfig, user: string, input: A
   const nextFolder = folderIdForType(config, input.type)
   if (!nextFolder) throw new Error(input.type === 'agreement' ? 'Choose the agreements Drive folder in Settings first.' : 'Choose the Drive folder for that document type in Settings.')
   const file = await moveAndRename(input.fileId, {
-    name: suggestedName(plate, input.type, input.name),
+    name: input.type === 'agreement' ? input.name : suggestedName(plate, input.type, input.name),
     addParent: currentFolder !== nextFolder ? nextFolder : undefined,
     removeParent: currentFolder !== nextFolder ? currentFolder : undefined,
   })
@@ -578,7 +609,7 @@ export async function syncGmail() {
           await appendAudit(config, 'System', `OCR skipped for ${attachment.filename}: ${err instanceof Error ? err.message : 'OCR error'}`)
         }
         const auto = Boolean(match.confidence >= (config.autoUploadThreshold ?? 85) && match.plate)
-        const name = auto && match.plate ? suggestedName(match.plate, mailbox.type, attachment.filename) : attachment.filename
+        const name = mailbox.type === 'agreement' || !(auto && match.plate) ? attachment.filename : suggestedName(match.plate, mailbox.type, attachment.filename)
         const uploaded = await uploadBinary(folderIdForType(config, mailbox.type), name, bytes, attachment.mimeType)
         if (mailbox.type === 'certificate' && auto && match.plate) {
           await fillInsuranceCover(config, { ...uploaded, type: 'certificate', plate: match.plate }).catch(() => {})
@@ -700,6 +731,7 @@ export async function runProcessing(focus: ProcessFocus = 'all') {
   const config = await requireConfig()
   await hydrateProcessCursor(config).catch(() => lastAction())
   clearTriedFiles()
+  if (focus === 'agreements') clearAgreementReads()
   replaceProcessQueue([], focus)
   recordLastAction({
     focus,
@@ -765,10 +797,10 @@ export async function ocrUnmatchedPhotos(fileId?: string) {
   const { unmatched, files } = await scanFolders(config, preview.plates, preview.cells, undefined, { fresh: true })
   const target = fileId ? files.find((file) => file.id === fileId) || unmatched.find((file) => file.id === fileId) : undefined
   if (fileId) forgetFile(fileId)
-  const readable = unmatched.filter((file) => isOcrImage(file.mimeType, file.name) || plateFromText(file.name))
+  const readable = unmatched.filter((file) => file.type !== 'agreement' && (isOcrImage(file.mimeType, file.name) || plateFromText(file.name)))
   const waiting = fileId ? (target ? [target] : []) : readable.filter((file) => !hasCanonicalName(file) && !nameMatchesDocument(file) && !wasTriedRecently(file.id))
   if (!waiting.length) {
-    throw new Error(fileId ? 'That file is not a JPEG, PNG, or PDF Fleetwise can OCR.' : 'No unmatched photos, insurance, logbook, or agreement files to OCR.')
+    throw new Error(fileId ? 'That file is not a JPEG, PNG, or PDF Fleetwise can OCR.' : 'No unmatched photos, insurance, or logbook files to OCR.')
   }
   if (ON_VERCEL) {
     replaceProcessQueue(waiting.map(toQueueItem), 'repair')
@@ -791,7 +823,7 @@ export async function ocrUnmatchedPhotos(fileId?: string) {
         focus: 'repair',
         follow: 'files',
         preserve: true,
-        notice: `Queued ${waiting.length} unmatched file${waiting.length === 1 ? '' : 's'}. Photos, insurance, logbooks, and agreements are renamed one at a time. Leave this page open.`,
+        notice: `Queued ${waiting.length} unmatched file${waiting.length === 1 ? '' : 's'}. Photos, insurance, and logbooks are renamed one at a time. Agreement names stay as they are. Leave this page open.`,
       },
     })
   }
@@ -898,6 +930,10 @@ async function ocrMatchFile(config: FleetConfig, user: string, file: TypedFile, 
 }
 
 async function ocrAndRename(config: FleetConfig, user: string, file: TypedFile, options: { verify?: boolean; sheetPlates?: Set<string>; forceRaster?: boolean; reopen?: boolean; takenNames?: Set<string> } = {}) {
+  if (file.type === 'agreement') {
+    touchProcessItem(file.id, { stage: 'matching', detail: `Keeping the agreement name ${file.name}`, name: file.name, type: file.type, mimeType: file.mimeType, plate: file.plate })
+    return { renamed: 0, text: '', name: file.name, plate: file.plate || null, file }
+  }
   const typedPlate = plateFromTypedName(file.name, file.type)
   const named = typedPlate || (file.type === 'logbook' || file.type === 'agreement' ? extractKenyanPlate(file.name) : plateFromText(file.name))
   const readable = isOcrImage(file.mimeType, file.name)
@@ -914,7 +950,7 @@ async function ocrAndRename(config: FleetConfig, user: string, file: TypedFile, 
     if (file.type === 'certificate' && plate) await fillInsuranceCover(config, { ...file, plate })
     return { renamed: 0, text: '', name, plate, file: { ...file, name, plate, type: file.type } }
   }
-  if ((file.type === 'logbook' || file.type === 'agreement') && named && !hasCanonicalName(file) && !options.verify && !options.forceRaster) {
+  if (file.type === 'logbook' && named && !hasCanonicalName(file) && !options.verify && !options.forceRaster) {
     const name = uniqueSuggestedName(named, file.type, file.name, options.takenNames)
     touchProcessItem(file.id, { stage: 'renaming', detail: `Renaming to ${name}`, plate: named, name: file.name, type: file.type, mimeType: file.mimeType })
     if (sameDocumentName(name, file.name)) return { renamed: 0, text: '', name, plate: named, file: { ...file, name, plate: named, type: file.type } }
@@ -1116,7 +1152,7 @@ function pendingForFocus(file: TypedFile, focus: ProcessFocus, sheetPlates?: Set
   const plate = named ? compactPlate(named) : ''
   const needsDates = file.type === 'certificate' && Boolean(plate && missingDates?.has(plate))
   const finished = hasRenamedName(file) || sheetLinkedFile(file, cells)
-  if (file.type === 'agreement' && !hasCanonicalName(file) && named) return true
+  if (file.type === 'agreement') return false
   if (file.type === 'certificate' && !repair) {
     if (finished || wasTriedRecently(file.id)) return false
     return true
@@ -1251,7 +1287,8 @@ async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 
   )
   const toNormalize = listed.filter((file) => {
     if (extraIds.has(file.id) || !fileMatchesFocus(file, focus) || hasRenamedName(file) || sheetLinkedFile(file, cells)) return false
-    if (file.type === 'logbook' || file.type === 'agreement') return Boolean(plateFromTypedName(file.name, file.type) || extractKenyanPlate(file.name))
+    if (file.type === 'agreement') return false
+    if (file.type === 'logbook') return Boolean(plateFromTypedName(file.name, file.type) || extractKenyanPlate(file.name))
     return Boolean(plateFromTypedName(file.name, file.type)) && !isOcrImage(file.mimeType, file.name)
   })
   const pending = orderForResume(listed.filter((file) => pendingForFocus(file, focus, sheetPlates, missingDates, extraIds, cells)), focus)
@@ -1280,7 +1317,7 @@ async function ingestIncoming(config: FleetConfig, user: string, mode: 'auto' | 
       focus,
       follow: 'files' as const,
       notice: waiting
-        ? `Queued ${waiting} ${processFocusLabel(focus).toLowerCase()} file${waiting === 1 ? '' : 's'}. Photos, insurance, logbooks, and agreements rename one at a time. Leave this page open.`
+        ? `Queued ${waiting} ${processFocusLabel(focus).toLowerCase()} file${waiting === 1 ? '' : 's'}. Photos, insurance, and logbooks rename one at a time. Agreement names stay as they are. Leave this page open.`
         : undefined,
       lastAction: lastAction(),
     }

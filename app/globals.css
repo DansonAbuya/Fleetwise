@@ -804,6 +804,7 @@ td strong, .muted-cell { display: block; }
 .connected-pill.muted { color: rgba(250, 249, 246, .7); border-color: rgba(250, 249, 246, .16); }
 .field-label { display: flex; flex-direction: column; gap: 4px; font-size: 10px; font-weight: 700; color: var(--slate); }
 .mailbox-field { margin: 0 21px 14px; }
+.loan-link-field .assign-input { max-width: none; width: 100%; }
 .banner-error { margin-bottom: 16px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .help-body { display: flex; flex-direction: column; gap: 12px; font-size: 13px; line-height: 1.55; color: var(--muted-foreground); margin-top: 16px; }
 .setup-hero { grid-column: 1 / -1; }

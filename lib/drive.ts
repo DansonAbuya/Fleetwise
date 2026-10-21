@@ -395,18 +395,18 @@ export async function readTextFile(fileId: string) {
   return res.text()
 }
 
-export async function downloadBinary(fileId: string, attempt = 0): Promise<Buffer> {
+export async function downloadBinary(fileId: string, attempt = 0, timeoutMs = 180_000): Promise<Buffer> {
   try {
-    const res = await driveFetch(`${DRIVE}/files/${fileId}?${withDriveParams({ alt: 'media' })}`, { timeoutMs: 180_000 })
-    return Buffer.from(await readResponseBytes(res, 180_000))
+    const res = await driveFetch(`${DRIVE}/files/${fileId}?${withDriveParams({ alt: 'media' })}`, { timeoutMs })
+    return Buffer.from(await readResponseBytes(res, timeoutMs))
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err)
-    if (attempt < 1 && /timeout|timed out|aborted|dropped|slow|longer than/i.test(detail)) {
+    if (attempt < 1 && timeoutMs >= 60_000 && /timeout|timed out|aborted|dropped|slow|longer than/i.test(detail)) {
       await new Promise((resolve) => setTimeout(resolve, 2000))
-      return downloadBinary(fileId, attempt + 1)
+      return downloadBinary(fileId, attempt + 1, timeoutMs)
     }
     if (err instanceof Error && /Google Drive|connection to Google|Could not reach Google/i.test(err.message)) throw err
-    throw new Error(googleNetworkMessage(detail, 180_000))
+    throw new Error(googleNetworkMessage(detail, timeoutMs))
   }
 }
 

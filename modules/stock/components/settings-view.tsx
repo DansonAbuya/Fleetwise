@@ -5,17 +5,32 @@ import { Database, FileSpreadsheet, FileText, Mail, ScanLine } from 'lucide-reac
 import { DEFAULT_COLLATERAL_PARENT_ID, type DriveItem, type FleetSnapshot } from '@/lib/types'
 import { Drawer } from '@/modules/stock/components/drawer'
 
+function loanFolderId(value: string) {
+  const trimmed = value.trim()
+  if (!trimmed) return ''
+  const fromFolder = trimmed.match(/\/folders\/([a-zA-Z0-9_-]+)/)?.[1]
+  const fromQuery = trimmed.match(/[?&]id=([a-zA-Z0-9_-]+)/)?.[1]
+  if (fromFolder || fromQuery) return fromFolder || fromQuery || ''
+  return /^[a-zA-Z0-9_-]{15,}$/.test(trimmed) ? trimmed : ''
+}
+
+function loanFolderLink(id: string) {
+  return id ? `https://drive.google.com/drive/folders/${id}` : ''
+}
+
 export function SettingsView({ fleet, firstRun, busy, onSave, onImportDatabase, onBrowse, onBrowseSheets }: { fleet: FleetSnapshot | null; firstRun: boolean; busy: boolean; onSave: (input: { logbooksId: string; certificatesId: string; photosId: string; agreementsId?: string; collateralId?: string; spreadsheetId?: string; autoUploadThreshold: number; insuranceInboxEmail?: string; logbooksInboxEmail?: string }) => void; onImportDatabase: () => void; onBrowse: (parentId?: string, query?: string) => Promise<DriveItem[]>; onBrowseSheets: () => Promise<DriveItem[]> }) {
   const [logbooks, setLogbooks] = useState({ id: fleet?.config?.logbooksId || '', name: fleet?.config?.logbooksName || '' })
   const [certificates, setCertificates] = useState({ id: fleet?.config?.certificatesId || '', name: fleet?.config?.certificatesName || '' })
   const [photos, setPhotos] = useState({ id: fleet?.config?.photosId || '', name: fleet?.config?.photosName || '' })
   const [agreements, setAgreements] = useState({ id: fleet?.config?.agreementsId || '', name: fleet?.config?.agreementsName || '' })
+  const [agreementLink, setAgreementLink] = useState(loanFolderLink(fleet?.config?.agreementsId || ''))
   const [collateral, setCollateral] = useState({ id: fleet?.config?.collateralId || DEFAULT_COLLATERAL_PARENT_ID, name: fleet?.config?.collateralName || 'Collateral parent folder' })
   const [spreadsheet, setSpreadsheet] = useState({ id: fleet?.config?.spreadsheetId || '', name: fleet?.config?.spreadsheetName || '' })
   const [threshold, setThreshold] = useState(fleet?.config?.autoUploadThreshold ?? 85)
   const [insuranceInboxEmail, setInsuranceInboxEmail] = useState(fleet?.config?.insuranceInboxEmail || '')
   const [logbooksInboxEmail, setLogbooksInboxEmail] = useState(fleet?.config?.logbooksInboxEmail || '')
   const [mailboxError, setMailboxError] = useState('')
+  const [folderError, setFolderError] = useState('')
   const [picker, setPicker] = useState<'logbook' | 'certificate' | 'photo' | 'agreement' | 'collateral' | null>(null)
   const [sheetPicker, setSheetPicker] = useState(false)
   const savedFolders = [
@@ -33,6 +48,7 @@ export function SettingsView({ fleet, firstRun, busy, onSave, onImportDatabase, 
     setCertificates({ id: fleet?.config?.certificatesId || '', name: fleet?.config?.certificatesName || '' })
     setPhotos({ id: fleet?.config?.photosId || '', name: fleet?.config?.photosName || '' })
     setAgreements({ id: fleet?.config?.agreementsId || '', name: fleet?.config?.agreementsName || '' })
+    setAgreementLink(loanFolderLink(fleet?.config?.agreementsId || ''))
     setCollateral({ id: fleet?.config?.collateralId || DEFAULT_COLLATERAL_PARENT_ID, name: fleet?.config?.collateralName || 'Collateral parent folder' })
     setSpreadsheet({ id: fleet?.config?.spreadsheetId || '', name: fleet?.config?.spreadsheetName || '' })
     setThreshold(fleet?.config?.autoUploadThreshold ?? 85)
@@ -52,7 +68,14 @@ export function SettingsView({ fleet, firstRun, busy, onSave, onImportDatabase, 
       return
     }
     setMailboxError('')
-    onSave({ logbooksId: logbooks.id, certificatesId: certificates.id, photosId: photos.id, agreementsId: agreements.id || undefined, collateralId: collateral.id, spreadsheetId: spreadsheet.id, autoUploadThreshold: threshold, insuranceInboxEmail: insurance, logbooksInboxEmail: logbooksMail })
+    setFolderError('')
+    const pasted = agreementLink.trim()
+    const linkedId = pasted ? loanFolderId(pasted) : agreements.id
+    if (pasted && !linkedId) {
+      setFolderError('Paste the Loan Agreements folder link from Google Drive.')
+      return
+    }
+    onSave({ logbooksId: logbooks.id, certificatesId: certificates.id, photosId: photos.id, agreementsId: linkedId || undefined, collateralId: collateral.id, spreadsheetId: spreadsheet.id, autoUploadThreshold: threshold, insuranceInboxEmail: insurance, logbooksInboxEmail: logbooksMail })
   }
   return <div className="settings-grid">
     {firstRun && <section className="panel settings-card setup-hero"><div className="panel-heading"><div><h2>Set up Drive folders and Sheets</h2><p>Choose the logbooks, certificates, photos, and agreements folders, then add the insurance and logbook inbox emails. Fleetwise updates the STOCK DOCUMENTS tab on Fleet Assets or Fleet Assets - KE: Logbook / Agreement, Agreement Link, PSV Insurance, and Asset Photo.</p></div></div></section>}
@@ -60,9 +83,11 @@ export function SettingsView({ fleet, firstRun, busy, onSave, onImportDatabase, 
       <FolderRow label="Logbooks" name={logbooks.name} id={logbooks.id} onChoose={() => setPicker('logbook')} />
       <FolderRow label="Certificates" name={certificates.name} id={certificates.id} onChoose={() => setPicker('certificate')} />
       <FolderRow label="Photos" name={photos.name} id={photos.id} onChoose={() => setPicker('photo')} />
-      <FolderRow label="Agreements" name={agreements.name} id={agreements.id} onChoose={() => setPicker('agreement')} />
+      <FolderRow label="Loan Agreements" name={agreements.name} id={agreements.id} onChoose={() => setPicker('agreement')} />
+      <label className="field-label mailbox-field loan-link-field">Loan Agreements link<input className="assign-input" value={agreementLink} onChange={(e) => { setAgreementLink(e.target.value); setFolderError('') }} placeholder="https://drive.google.com/drive/folders/…" autoComplete="off" /><span>Agreements Only reads the PDFs in this folder and its subfolders.</span></label>
+      {folderError ? <div className="auth-error" style={{ margin: '0 21px 12px' }}>{folderError}</div> : null}
       <FolderRow label="Collateral parent" name={collateral.name} id={collateral.id} onChoose={() => setPicker('collateral')} />
-      <div className="setting-toggle"><div><strong>Auto-upload threshold</strong><span>Gmail attachments at or above this confidence are renamed and stored in the matching folder. Insurance uses Insurance - {'{plate}'}; logbooks use {'{plate}'} - Logbook; agreements use {'{plate}'} - Agreement.</span></div><label className="field-label">Percent<input className="assign-input" type="number" min={50} max={99} value={threshold} onChange={(e) => setThreshold(Number(e.target.value))} /></label></div>
+      <div className="setting-toggle"><div><strong>Auto-upload threshold</strong><span>Gmail attachments at or above this confidence are renamed and stored in the matching folder. Insurance uses Insurance - {'{plate}'}; logbooks use {'{plate}'} - Logbook. Loan agreements keep the file name already on the PDF.</span></div><label className="field-label">Percent<input className="assign-input" type="number" min={50} max={99} value={threshold} onChange={(e) => setThreshold(Number(e.target.value))} /></label></div>
       <div style={{ padding: '0 21px 18px' }}><button className="button primary" onClick={saveSettings} disabled={busy || !logbooks.id || !certificates.id || !photos.id}>{busy ? 'Saving…' : 'Save configuration'}</button></div>
     </section>
     <section className="panel settings-card"><div className="panel-heading"><div><h2>Gmail inboxes</h2><p>Use two addresses — one for insurance certificates and one for logbooks. Check inboxes searches the signed-in Gmail account for attachments sent to those addresses, then downloads, renames, and uploads them to the matching Drive folder. They are chipped on STOCK DOCUMENTS when the plate is on the register.</p></div></div>
@@ -85,7 +110,7 @@ export function SettingsView({ fleet, firstRun, busy, onSave, onImportDatabase, 
       <div className="connection-row"><div className="connection-icon"><Mail size={17} /></div><div><strong>Gmail</strong><span>{fleet?.gmailConnected ? 'Inboxes have been checked' : 'Not checked yet — use Check inboxes on Insurance inbox or Logbook inbox'}</span></div></div>
       <div className="connection-row"><div className="connection-icon"><ScanLine size={17} /></div><div><strong>On-device OCR</strong><span>{fleet?.ocrConfigured ? 'Tesseract — reads plates locally, no Google billing' : 'OCR is not ready'}</span></div></div>
     </section>
-    {picker && <FolderPicker title={`Choose ${picker} folder`} onClose={() => setPicker(null)} onBrowse={onBrowse} onSelect={(folder) => { if (picker === 'logbook') setLogbooks({ id: folder.id, name: folder.name }); if (picker === 'certificate') setCertificates({ id: folder.id, name: folder.name }); if (picker === 'photo') setPhotos({ id: folder.id, name: folder.name }); if (picker === 'agreement') setAgreements({ id: folder.id, name: folder.name }); if (picker === 'collateral') setCollateral({ id: folder.id, name: folder.name }); setPicker(null) }} />}
+    {picker && <FolderPicker title={`Choose ${picker === 'agreement' ? 'Loan Agreements' : picker} folder`} onClose={() => setPicker(null)} onBrowse={onBrowse} onSelect={(folder) => { if (picker === 'logbook') setLogbooks({ id: folder.id, name: folder.name }); if (picker === 'certificate') setCertificates({ id: folder.id, name: folder.name }); if (picker === 'photo') setPhotos({ id: folder.id, name: folder.name }); if (picker === 'agreement') { setAgreements({ id: folder.id, name: folder.name }); setAgreementLink(loanFolderLink(folder.id)) }; if (picker === 'collateral') setCollateral({ id: folder.id, name: folder.name }); setPicker(null) }} />}
     {sheetPicker && <SpreadsheetPicker onClose={() => setSheetPicker(false)} onBrowse={onBrowseSheets} onSelect={(file) => { setSpreadsheet({ id: file.id, name: file.name }); setSheetPicker(false) }} />}
   </div>
 }

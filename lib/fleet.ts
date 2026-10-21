@@ -232,12 +232,13 @@ export async function loadAudit(): Promise<AuditEvent[]> {
     })
 }
 
-async function listTypedFiles(config: FleetConfig, fresh = false): Promise<TypedFile[]> {
+async function listTypedFiles(config: FleetConfig, fresh = false, types?: Array<'logbook' | 'certificate' | 'photo' | 'agreement'>): Promise<TypedFile[]> {
+  const want = (type: 'logbook' | 'certificate' | 'photo' | 'agreement') => !types?.length || types.includes(type)
   const [logbooks, certificates, photos, agreements] = await Promise.all([
-    listFolderFiles(config.logbooksId, { fresh }),
-    listFolderFiles(config.certificatesId, { fresh }),
-    listFolderFiles(config.photosId, { fresh }),
-    config.agreementsId ? listFolderFiles(config.agreementsId, { fresh }) : Promise.resolve([]),
+    want('logbook') ? listFolderFiles(config.logbooksId, { fresh }) : Promise.resolve([]),
+    want('certificate') ? listFolderFiles(config.certificatesId, { fresh }) : Promise.resolve([]),
+    want('photo') ? listFolderFiles(config.photosId, { fresh }) : Promise.resolve([]),
+    want('agreement') && config.agreementsId ? listFolderFiles(config.agreementsId, { fresh }) : Promise.resolve([]),
   ])
   return [
     ...logbooks.map((file) => ({ ...file, type: 'logbook' as const, plate: plateFromTypedName(file.name, 'logbook') || extractKenyanPlate(file.name) })),
@@ -247,8 +248,8 @@ async function listTypedFiles(config: FleetConfig, fresh = false): Promise<Typed
   ]
 }
 
-export async function scanFolders(config: FleetConfig, sheetPlates?: Set<string>, sheetCells?: SheetCells, listed?: TypedFile[], options?: { fresh?: boolean }) {
-  const typed = listed || await listTypedFiles(config, options?.fresh)
+export async function scanFolders(config: FleetConfig, sheetPlates?: Set<string>, sheetCells?: SheetCells, listed?: TypedFile[], options?: { fresh?: boolean; types?: Array<'logbook' | 'certificate' | 'photo' | 'agreement'> }) {
+  const typed = listed || await listTypedFiles(config, options?.fresh, options?.types)
   const register = stockDocumentsModule.buildRegister(typed, {
     keys: sheetPlates || new Set(),
     cells: sheetCells || new Map(),
@@ -289,7 +290,7 @@ export async function clearUnmatchedFolderMarks(files: TypedFile[]) {
   const taken = new Set(files.map((file) => file.name))
   const renamed: TypedFile[] = []
   for (const file of files) {
-    if (!hasUnmatchedMark(file.name)) continue
+    if (file.type === 'agreement' || !hasUnmatchedMark(file.name)) continue
     const stripped = stripUnmatchedMark(file.name)
     const plate = plateFromTypedName(stripped, file.type) || extractKenyanPlate(stripped)
     const name = plate ? uniqueSuggestedName(plate, file.type, stripped, taken) : stripped
@@ -312,7 +313,7 @@ export async function normalizeLogbookFilenames(files: TypedFile[]) {
   const taken = new Set(files.map((file) => file.name))
   const renamed: TypedFile[] = []
   for (const file of files) {
-    if ((file.type !== 'logbook' && file.type !== 'agreement') || hasCanonicalName(file)) continue
+    if (file.type !== 'logbook' || hasCanonicalName(file)) continue
     const plate = plateFromTypedName(file.name, file.type) || extractKenyanPlate(file.name)
     if (!plate) continue
     const name = uniqueSuggestedName(plate, file.type, file.name, taken)

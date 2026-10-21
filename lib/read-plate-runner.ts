@@ -18,6 +18,7 @@ export type PhotoRegistrationResult = {
 type PlateReader = {
   extractPlateText: (data: Buffer, readKind: string) => Promise<string>
   extractPhotoRegistration?: (data: Buffer) => Promise<PhotoRegistrationResult>
+  inspectHirePurchase?: (data: Buffer) => Promise<string>
   warmOcr?: () => Promise<void>
 }
 
@@ -49,6 +50,18 @@ async function loadReader() {
 export async function warmPlateReader() {
   const mod = await loadReader()
   await mod.warmOcr?.()
+}
+
+export async function inspectHirePurchase(bytes: Buffer) {
+  const mod = await loadReader()
+  if (!mod.inspectHirePurchase) return { plate: null as string | null, signed: false, date: '' }
+  const raw = await mod.inspectHirePurchase(bytes)
+  const parsed = JSON.parse(raw) as { plate?: string | null; signed?: boolean; date?: string }
+  return {
+    plate: parsed.plate || null,
+    signed: Boolean(parsed.signed),
+    date: parsed.date || '',
+  }
 }
 
 export async function extractPlateText(bytes: Buffer, kind: string) {

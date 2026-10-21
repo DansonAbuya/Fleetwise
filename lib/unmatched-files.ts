@@ -73,8 +73,19 @@ export function surplusCopies(files: TypedFile[], cells?: SheetCells): Duplicate
   return extras
 }
 
+function agreementLinked(file: TypedFile, cells?: SheetCells) {
+  if (!cells?.size) return false
+  const ids = new Set([file.id, file.shortcutDetails?.targetId].filter((id): id is string => Boolean(id)))
+  for (const row of cells.values()) {
+    const linked = driveIdFromUri(row.agreement?.uri)
+    if (linked && ids.has(linked)) return true
+  }
+  return false
+}
+
 /** Drive folder files that are not matched to a Registration Number on the sheet. */
-export function isUnmatchedFile(file: TypedFile, sheetPlates?: Set<string>) {
-  if ((file.type === 'logbook' || file.type === 'agreement') && !hasCanonicalName(file)) return true
+export function isUnmatchedFile(file: TypedFile, sheetPlates?: Set<string>, cells?: SheetCells) {
+  if (file.type === 'agreement') return !agreementLinked(file, cells)
+  if (file.type === 'logbook' && !hasCanonicalName(file)) return true
   return !onRegister(filePlate(file), sheetPlates)
 }

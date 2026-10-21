@@ -31,12 +31,12 @@ export const PROCESS_TASKS: { id: ProcessFocus; label: string; detail: string }[
   { id: 'photos', label: 'Photos only', detail: 'Rename photos that are not yet named Photos {plate}, then match each file onto the STOCK DOCUMENTS row. Files already named that way are left alone.' },
   { id: 'certificates', label: 'Insurance only', detail: 'Rename insurance files that are not yet named Insurance - {plate}, then match each file onto the STOCK DOCUMENTS row. Files already named that way are left alone.' },
   { id: 'logbooks', label: 'Logbooks only', detail: 'Rename logbooks that are not yet named {plate} - Logbook, then match each file onto the STOCK DOCUMENTS row. Files already named that way are left alone.' },
-  { id: 'agreements', label: 'Agreements only', detail: 'Rename files in the agreements folder to {plate} - Agreement, then write chips on Agreement Link.' },
-  { id: 'all', label: 'All waiting files', detail: 'Photos, insurance, logbooks, agreements, and other waiting documents.' },
+  { id: 'agreements', label: 'Agreements only', detail: 'Read loan agreements in the agreements folder, including subfolders. Chip the latest signed PDF onto an empty Agreement Link cell. The file name stays as it is.' },
+  { id: 'all', label: 'All waiting files', detail: 'Photos, insurance, logbooks, and other waiting documents. Agreement file names stay as they are.' },
   { id: 'repair-photos', label: 'Fix wrong photos', detail: 'Reopen unmatched photos only and rename them from the plate. Files already on STOCK DOCUMENTS are left alone.' },
   { id: 'repair-certificates', label: 'Fix wrong insurance', detail: 'Reopen unmatched insurance only and rename from REGISTRATION No. Files already on STOCK DOCUMENTS are left alone.' },
   { id: 'repair-logbooks', label: 'Fix wrong logbooks', detail: 'Reopen unmatched logbooks only and rename from REGISTRATION No. Files already on STOCK DOCUMENTS are left alone.' },
-  { id: 'repair-agreements', label: 'Fix wrong agreements', detail: 'Reopen unmatched agreements only and rename to {plate} - Agreement. Files already on STOCK DOCUMENTS are left alone.' },
+  { id: 'repair-agreements', label: 'Fix wrong agreements', detail: 'Agreement file names stay as they are. Agreements Only matches Registration No. inside the PDF to an empty Agreement Link cell.' },
 ]
 
 export const SLUGS: Record<ViewSlug, NavKey> = {

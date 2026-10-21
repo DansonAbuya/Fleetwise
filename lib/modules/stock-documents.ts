@@ -185,12 +185,6 @@ async function writeSheetMatches(config: FleetConfig, files: TypedFile[], mode: 
         column.uri = undefined
         continue
       }
-      if (key === 'agreement' && hasChip && linked?.type === 'agreement' && !hasCanonicalName(linked)) {
-        chipRequests.push(clearChipRequest(register.sheetId, row.row, column.col))
-        column.value = ''
-        column.uri = undefined
-        continue
-      }
       if (hasChip && !currentPlate && linkedId && !linked) continue
       if (hasChip && currentPlate && currentPlate !== row.plate) {
         chipRequests.push(clearChipRequest(register.sheetId, row.row, column.col))
@@ -326,6 +320,37 @@ export async function linkUnlinkedDocuments(config: FleetConfig, type: 'photo' |
     storeRegister(config.spreadsheetId, register, modifiedTime)
   }
   return { written: chipRequests.length, matched, missing, unnamed, cells: cellsFromRegister(register) }
+}
+
+export async function writeAgreementChips(config: FleetConfig, files: { plate: string; id: string; name: string; webViewLink?: string }[]) {
+  if (!config.spreadsheetId || !files.length) return { written: 0, matched: [] as string[], missing: [] as string[], cells: new Map() as SheetCells }
+  const register = await loadStockRegister(config, { fresh: true })
+  const requests: object[] = []
+  const matched: string[] = []
+  const missing: string[] = []
+  const seen = new Set<string>()
+  for (const file of files) {
+    const plate = compactPlate(file.plate)
+    if (!plate || seen.has(plate)) continue
+    seen.add(plate)
+    const row = register.rows.get(plate)
+    if (!row) {
+      missing.push(plate)
+      continue
+    }
+    const column = row.columns.agreement
+    if (!column || isDriveDocumentUri(column.uri) || (column.value || '').trim()) continue
+    const link = file.webViewLink || `https://drive.google.com/file/d/${file.id}/view`
+    requests.push(chipRequest(register.sheetId, row.row, column.col, link))
+    column.value = file.name.replace(/\.pdf$/i, '')
+    column.uri = link
+    matched.push(plate)
+  }
+  if (requests.length) {
+    await applyChipBatches(config.spreadsheetId, requests)
+    storeRegister(config.spreadsheetId, register, await sheetModifiedTime(config.spreadsheetId))
+  }
+  return { written: requests.length, matched, missing, cells: cellsFromRegister(register) }
 }
 
 function chipTitle(file: { name?: string }) {
@@ -688,7 +713,7 @@ function buildRegister(files: TypedFile[], sync: Pick<ModuleSyncResult, 'keys' |
   const onSheet = (plate: string | null) => onRegister(plate, sheetPlates)
   const duplicates = surplusCopies(files, sheetCells)
   const duplicateIds = new Set(duplicates.map((file) => file.id))
-  const unmatched = files.filter((file) => !duplicateIds.has(file.id) && isUnmatchedFile(file, sheetPlates))
+  const unmatched = files.filter((file) => !duplicateIds.has(file.id) && isUnmatchedFile(file, sheetPlates, sheetCells))
   const byPlate = new Map<string, VehicleRecord>()
   for (const plate of sheetPlates || []) {
     byPlate.set(plate, {
@@ -736,10 +761,6 @@ function buildRegister(files: TypedFile[], sync: Pick<ModuleSyncResult, 'keys' |
         ))
         const linkedPlate = linked ? compactPlate(linked.plate || extractKenyanPlate(linked.name) || '') : ''
         if (type === 'logbook' && linked && !hasCanonicalName(linked)) {
-          vehicle.files[type] = []
-          continue
-        }
-        if (type === 'agreement' && linked?.type === 'agreement' && !hasCanonicalName(linked)) {
           vehicle.files[type] = []
           continue
         }
