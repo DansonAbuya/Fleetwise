@@ -343,7 +343,8 @@ function latestAgreementDate(text) {
 }
 
 function agreementRegistration(text) {
-  const labeled = text.match(/registration\s+no\.?\s*[:.]?\s*([A-Z]{2,4}\s*\d{3}\s*[A-Z])/i)
+  const labeled = text.match(/registration\s+(?:no\.?|number|num)\.?\s*[:.]?\s*([A-Z]{1,4}\s*\d{3}\s*[A-Z])/i)
+    || text.match(/\breg\.?\s*(?:no\.?|number|num)\.?\s*[:.]?\s*([A-Z]{1,4}\s*\d{3}\s*[A-Z])/i)
   return parseKenyanPlate((labeled?.[1] || '').replace(/[^A-Za-z0-9]/g, '')) || null
 }
 
@@ -373,7 +374,7 @@ export async function inspectHirePurchase(bytes) {
         texts[numbers[index] - 1] = content.items.map((item) => String(item.str || '')).join(' ')
         if (signed) return
         const annotations = await page.getAnnotations().catch(() => [])
-        if (annotations.some((item) => /ink|sig|stamp/i.test(String(item.subtype || '')))) signed = true
+        if (annotations.some((item) => /ink|sig|stamp/i.test(`${item.subtype || ''} ${item.fieldType || ''}`))) signed = true
       }))
     }
   } finally {

@@ -323,8 +323,11 @@ export async function linkUnlinkedDocuments(config: FleetConfig, type: 'photo' |
 }
 
 export async function writeAgreementChips(config: FleetConfig, files: { plate: string; id: string; name: string; webViewLink?: string }[]) {
-  if (!config.spreadsheetId || !files.length) return { written: 0, matched: [] as string[], missing: [] as string[], cells: new Map() as SheetCells }
+  if (!config.spreadsheetId || !files.length) return { written: 0, matched: [] as string[], missing: [] as string[], cells: new Map() as SheetCells, noColumn: false }
   const register = await loadStockRegister(config, { fresh: true })
+  if (![...register.rows.values()].some((row) => row.columns.agreement)) {
+    return { written: 0, matched: [], missing: [], cells: cellsFromRegister(register), noColumn: true }
+  }
   const requests: object[] = []
   const matched: string[] = []
   const missing: string[] = []
@@ -333,13 +336,13 @@ export async function writeAgreementChips(config: FleetConfig, files: { plate: s
     const plate = compactPlate(file.plate)
     if (!plate || seen.has(plate)) continue
     seen.add(plate)
-    const row = register.rows.get(plate)
+    const row = register.rows.get(plate) || rowByLoosePlate(register, plate)
     if (!row) {
       missing.push(plate)
       continue
     }
     const column = row.columns.agreement
-    if (!column || isDriveDocumentUri(column.uri) || (column.value || '').trim()) continue
+    if (!agreementCellNeedsChip(column)) continue
     const link = file.webViewLink || `https://drive.google.com/file/d/${file.id}/view`
     requests.push(chipRequest(register.sheetId, row.row, column.col, link))
     column.value = file.name.replace(/\.pdf$/i, '')
@@ -350,7 +353,7 @@ export async function writeAgreementChips(config: FleetConfig, files: { plate: s
     await applyChipBatches(config.spreadsheetId, requests)
     storeRegister(config.spreadsheetId, register, await sheetModifiedTime(config.spreadsheetId))
   }
-  return { written: requests.length, matched, missing, cells: cellsFromRegister(register) }
+  return { written: requests.length, matched, missing, cells: cellsFromRegister(register), noColumn: false }
 }
 
 function chipTitle(file: { name?: string }) {
@@ -590,7 +593,7 @@ function findHeader(values: string[][]) {
     const next = (values[index + 1] || []).map(normalizeHeader)
     const plateIndex = header.findIndex(isPlateHeader)
     const logbookIndex = header.findIndex((cell) => cell.includes('logbook'))
-    const agreementIndex = headerIndex(header, next, isAgreementHeader)
+    const agreementIndex = agreementColumnIndex(header, next)
     const insuranceIndex = header.findIndex((cell) => cell.includes('insurance') || cell.includes('psv'))
     const brandedIndex = header.findIndex((cell) => (cell.includes('asset photo') || cell.includes('photo')) && cell.includes('branded'))
     const photoIndex = header.findIndex((cell, col) => isPhotoHeader(cell) && col !== brandedIndex)
@@ -605,17 +608,29 @@ function findHeader(values: string[][]) {
   return null
 }
 
+function agreementCellNeedsChip(column?: { col: number; value: string; uri?: string }): column is { col: number; value: string; uri?: string } {
+  if (!column || isDriveDocumentUri(column.uri)) return false
+  const value = (column.value || '').trim().toLowerCase().replace(/\s+/g, ' ')
+  if (!value || value === '@') return true
+  return /^(missing|not there|not available|unavailable|n\/a|na|n\.a\.?|none|nil|null|no|pending|blank|tbd|—|–|-|\.)$/.test(value)
+}
+
 function isAgreementHeader(cell: string) {
   if (!cell) return false
   if (cell.includes('logbook')) return false
   return cell.includes('agreement')
 }
 
-function headerIndex(header: string[], next: string[], match: (cell: string) => boolean) {
-  const top = header.findIndex(match)
+function agreementColumnIndex(header: string[], next: string[]) {
+  const pick = (cells: string[]) => {
+    const link = cells.findIndex((cell) => isAgreementHeader(cell) && cell.includes('link'))
+    if (link >= 0) return link
+    return cells.findIndex(isAgreementHeader)
+  }
+  const top = pick(header)
   if (top >= 0) return top
   if (next.some((cell) => extractKenyanPlate(cell))) return -1
-  return next.findIndex(match)
+  return pick(next)
 }
 
 function isPlateHeader(cell: string) {

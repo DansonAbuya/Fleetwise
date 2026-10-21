@@ -22,9 +22,13 @@ function isAgreementPdf(file: TypedFile) {
 function chooseSigned(reads: AgreementRead[]) {
   const chosen: AgreementRead[] = []
   let unsigned = 0
+  let unread = 0
   const byPlate = new Map<string, AgreementRead[]>()
   for (const read of reads) {
-    if (!read.plate) continue
+    if (!read.plate) {
+      unread += 1
+      continue
+    }
     const list = byPlate.get(read.plate) || []
     list.push(read)
     byPlate.set(read.plate, list)
@@ -38,7 +42,7 @@ function chooseSigned(reads: AgreementRead[]) {
     signed.sort((a, b) => (b.date || '').localeCompare(a.date || '') || (b.modifiedTime || '').localeCompare(a.modifiedTime || ''))
     chosen.push(signed[0])
   }
-  return { chosen, unsigned }
+  return { chosen, unsigned, unread }
 }
 
 export async function linkHirePurchaseAgreements(config: FleetConfig, files: TypedFile[]) {
@@ -126,17 +130,19 @@ export async function linkHirePurchaseAgreements(config: FleetConfig, files: Typ
       notice: `Read ${reads.length} of ${pdfs.length} loan agreements. The rest are still being checked.`,
     }
   }
-  const { chosen, unsigned } = chooseSigned(reads)
+  const { chosen, unsigned, unread } = chooseSigned(reads)
   const linked = await writeAgreementChips(config, chosen)
   clearAgreementReads()
   const plates = listRegistrationNumbers(linked.matched)
   const skipped = [
     unsigned ? `${unsigned} unsigned file${unsigned === 1 ? '' : 's'} stayed in the folder.` : '',
+    unread ? `Registration No. could not be read in ${unread} file${unread === 1 ? '' : 's'}.` : '',
+    linked.noColumn ? 'STOCK DOCUMENTS has no Agreement Link column.' : '',
     linked.missing.length ? `${linked.missing.length} registration number${linked.missing.length === 1 ? ' is' : 's are'} not on STOCK DOCUMENTS.` : '',
   ].filter(Boolean).join(' ')
   const notice = linked.written
     ? `Linked ${linked.written} signed agreement${linked.written === 1 ? '' : 's'} onto empty Agreement Link cells${plates ? ` for ${plates}` : ''}.${skipped ? ` ${skipped}` : ''}`
-    : `No empty Agreement Link cells needed a signed agreement.${skipped ? ` ${skipped}` : ''}`
+    : `No signed agreement was written to an empty Agreement Link cell.${skipped ? ` ${skipped}` : ' Cells that say Missing, or are blank, are filled when the PDF has Registration No. and a signature.'}`
   recordLastAction({
     focus: 'agreements',
     status: 'done',
