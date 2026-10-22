@@ -115,6 +115,8 @@ export function StockApp() {
   const lastBatchKey = useRef('')
   const unmatchedLenRef = useRef(0)
   const panelsLoaded = useRef(false)
+  const resumeAttempts = useRef(0)
+  const [resumeTick, setResumeTick] = useState(0)
   useEffect(() => {
     setMounted(true)
     setActive(viewFromSearch())
@@ -166,9 +168,15 @@ export function StockApp() {
           batchCountRef.current += 1
           const finished = batchCountRef.current
           const waiting = next.ingest.remaining ? `${next.ingest.remaining} file${next.ingest.remaining === 1 ? '' : 's'} still waiting` : 'more files are queued'
-          setBatchNotice(`Batch ${finished} finished — ${next.ingest.renamed} renamed of ${next.ingest.attempted}. Starting batch ${finished + 1}. ${waiting}.`)
+          const agreementBatch = next.ingest.focus === 'agreements'
+          setBatchNotice(agreementBatch
+            ? `Batch ${finished} finished — read ${next.ingest.attempted} agreements. Starting batch ${finished + 1}. ${next.ingest.remaining || 0} still being checked. File names stay as they are.`
+            : `Batch ${finished} finished — ${next.ingest.renamed} renamed of ${next.ingest.attempted}. Starting batch ${finished + 1}. ${waiting}.`)
         } else if (batchCountRef.current > 0) {
-          setBatchNotice(`Batch ${batchCountRef.current} finished — ${next.ingest.renamed} renamed of ${next.ingest.attempted}. No more files waiting.`)
+          const agreementBatch = next.ingest.focus === 'agreements'
+          setBatchNotice(agreementBatch
+            ? `Finished checking the loan agreements. ${next.ingest.renamed} Agreement Link chip${next.ingest.renamed === 1 ? '' : 's'} written. File names were left as they are.`
+            : `Batch ${batchCountRef.current} finished — ${next.ingest.renamed} renamed of ${next.ingest.attempted}. No more files waiting.`)
           batchCountRef.current = 0
         }
       }
@@ -180,7 +188,9 @@ export function StockApp() {
       setRegisterTick((tick) => tick + 1)
     }
     const notice = next.ingest?.notice || ''
+    if (next.ingest?.more && next.ingest.attempted) resumeAttempts.current = 0
     if (/collateral chip/i.test(notice)) setSuccess('')
+    else if (notice && next.ingest?.focus === 'agreements') setSuccess(notice)
     else if (notice) setSuccess(ok && ok !== notice ? `${ok} ${notice}` : notice)
     else if (ok) setSuccess(ok)
     else setSuccess((current) => /collateral chip/i.test(current) ? '' : current)
@@ -209,6 +219,10 @@ export function StockApp() {
       setError(err instanceof Error ? err.message : 'Unable to load Drive')
     } finally {
       autoScanLock.current = false
+      if (moreWorkRef.current && resumeAttempts.current < 4) {
+        resumeAttempts.current += 1
+        setResumeTick((tick) => tick + 1)
+      }
     }
   }
 
@@ -275,7 +289,7 @@ export function StockApp() {
   useEffect(() => {
     if (!user) return
     async function watchFolders() {
-      if (document.hidden || autoScanLock.current || activeRef.current === 'Settings') return
+      if (document.hidden || autoScanLock.current || moreWorkRef.current || activeRef.current === 'Settings') return
       if (activeRef.current !== 'Processing' && activeRef.current !== 'Overview') return
       autoScanLock.current = true
       try {
@@ -296,7 +310,7 @@ export function StockApp() {
     async function fillCollateral() {
       const idle = String(fleet?.ingest?.collateralStamp || '').startsWith('0:0:')
       await new Promise((resolve) => setTimeout(resolve, idle ? 20000 : 800))
-      if (cancelled || document.hidden) return
+      if (cancelled || document.hidden || moreWorkRef.current) return
       if (autoScanLock.current) return
       autoScanLock.current = true
       try {
@@ -312,12 +326,12 @@ export function StockApp() {
     return () => { cancelled = true }
   }, [user, fleet?.ingest?.collateralMore, fleet?.ingest?.collateralStamp])
   useEffect(() => {
-    const focus = processJob?.focus || fleet?.ingest?.focus || fleet?.ingest?.lastAction?.focus
-    const more = Boolean(fleet?.ingest?.more || processJob?.advancing)
-    const paused = processJob?.cancelled || fleet?.ingest?.lastAction?.status === 'paused' || fleet?.ingest?.lastAction?.status === 'done'
+    const agreementOpen = fleet?.ingest?.lastAction?.focus === 'agreements' && fleet.ingest.lastAction.status === 'running' && (fleet.ingest.lastAction.remaining || 0) > 0
+    const more = Boolean(fleet?.ingest?.more || processJob?.advancing || agreementOpen)
+    const paused = processJob?.cancelled || fleet?.ingest?.lastAction?.status === 'paused' || (fleet?.ingest?.lastAction?.status === 'done' && !agreementOpen)
     if (!user || !more || paused || autoScanLock.current) return
     refresh(continueProcessing(), undefined, false)
-  }, [user, fleet?.ingest?.more, processJob?.advancing, processJob?.focus, fleet?.ingest?.focus])
+  }, [user, fleet?.ingest?.more, fleet?.ingest?.lastAction?.status, fleet?.ingest?.lastAction?.remaining, fleet?.ingest?.lastAction?.focus, processJob?.advancing, processJob?.focus, fleet?.ingest?.focus, resumeTick])
   useEffect(() => {
     if (fleet && !fleet.config && active !== 'Settings') go('Settings', true)
   }, [fleet, active])

@@ -343,9 +343,14 @@ function latestAgreementDate(text) {
 }
 
 function agreementRegistration(text) {
-  const labeled = text.match(/registration\s+(?:no\.?|number|num)\.?\s*[:.]?\s*([A-Z]{1,4}\s*\d{3}\s*[A-Z])/i)
-    || text.match(/\breg\.?\s*(?:no\.?|number|num)\.?\s*[:.]?\s*([A-Z]{1,4}\s*\d{3}\s*[A-Z])/i)
-  return parseKenyanPlate((labeled?.[1] || '').replace(/[^A-Za-z0-9]/g, '')) || null
+  const flat = String(text || '').replace(/\s+/g, ' ')
+  const labeled = flat.match(/reg(?:istration)?\.?\s*(?:no|number|num|mark)?\.?\s*[:.]?\s*([A-Z0-9][A-Z0-9\s.-]{4,18})/i)
+  const fromLabel = parseKenyanPlate(labeled?.[1] || '')
+  if (fromLabel) return fromLabel
+  const compact = flat.toUpperCase().replace(/[^A-Z0-9]/g, '')
+  const glued = compact.match(/REGISTRATION(?:NO|NUMBER|NUM|MARK)?(K[A-Z]{2,3}\d{3}[A-Z])/)
+    || compact.match(/REG(?:NO|NUMBER|NUM)?(K[A-Z]{2,3}\d{3}[A-Z])/)
+  return parseKenyanPlate(glued?.[1] || '') || null
 }
 
 export async function inspectHirePurchase(bytes) {
@@ -362,20 +367,16 @@ export async function inspectHirePurchase(bytes) {
     useWasm: false,
     useWorkerFetch: false,
   }).promise
-  const texts = new Array(pdf.numPages)
+  const texts = []
   let signed = false
   try {
-    for (let start = 1; start <= pdf.numPages; start += 4) {
-      const numbers = []
-      for (let n = start; n < start + 4 && n <= pdf.numPages; n += 1) numbers.push(n)
-      const pages = await Promise.all(numbers.map((n) => pdf.getPage(n)))
-      await Promise.all(pages.map(async (page, index) => {
-        const content = await page.getTextContent()
-        texts[numbers[index] - 1] = content.items.map((item) => String(item.str || '')).join(' ')
-        if (signed) return
-        const annotations = await page.getAnnotations().catch(() => [])
-        if (annotations.some((item) => /ink|sig|stamp/i.test(`${item.subtype || ''} ${item.fieldType || ''}`))) signed = true
-      }))
+    for (let n = 1; n <= pdf.numPages; n += 1) {
+      const page = await pdf.getPage(n)
+      const content = await page.getTextContent()
+      texts.push(content.items.map((item) => String(item.str || '')).join(' '))
+      if (signed) continue
+      const annotations = await page.getAnnotations().catch(() => [])
+      if (annotations.some((item) => /ink|sig|stamp/i.test(`${item.subtype || ''} ${item.fieldType || ''}`))) signed = true
     }
   } finally {
     try {
@@ -385,10 +386,12 @@ export async function inspectHirePurchase(bytes) {
     }
   }
   const text = texts.filter(Boolean).join('\n')
+  const plate = agreementRegistration(text)
   return JSON.stringify({
-    plate: agreementRegistration(text),
+    plate,
     signed,
     date: latestAgreementDate(text),
+    ...(plate ? {} : { text: text.slice(0, 20000) }),
   })
 }
 

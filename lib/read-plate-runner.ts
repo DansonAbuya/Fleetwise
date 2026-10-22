@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { plateFromLogbookText, printedRegistrationPlate } from '@/lib/plates'
 
 export type PhotoRegistrationResult = {
   registrationNumber: string | null
@@ -56,9 +57,10 @@ export async function inspectHirePurchase(bytes: Buffer) {
   const mod = await loadReader()
   if (!mod.inspectHirePurchase) return { plate: null as string | null, signed: false, date: '' }
   const raw = await mod.inspectHirePurchase(bytes)
-  const parsed = JSON.parse(raw) as { plate?: string | null; signed?: boolean; date?: string }
+  const parsed = JSON.parse(raw) as { plate?: string | null; signed?: boolean; date?: string; text?: string }
+  const plate = parsed.plate || (parsed.text ? plateFromLogbookText(parsed.text) || printedRegistrationPlate(parsed.text) : null)
   return {
-    plate: parsed.plate || null,
+    plate: plate || null,
     signed: Boolean(parsed.signed),
     date: parsed.date || '',
   }

@@ -35,7 +35,13 @@ export function ProcessThumb({ item }: { item: { fileId: string; name: string; p
 }
 
 export function ProcessingView({ lastSync, vehicles, unmatched, busy, configured, ocrConfigured, ingest, job, photosFolder, certificatesFolder, logbooksFolder, agreementsFolder, onScan, onGmail, onOcr, onStart, onStop, onLinkSheet }: { lastSync?: string; vehicles: number; unmatched: TypedFile[]; busy: boolean; configured: boolean; ocrConfigured: boolean; ingest?: FleetSnapshot['ingest']; job: ProcessJob | null; photosFolder?: string; certificatesFolder?: string; logbooksFolder?: string; agreementsFolder?: string; onScan: () => void; onGmail: () => void; onOcr: () => void; onStart: (focus: ProcessFocus) => void | Promise<void>; onStop: () => void | Promise<void>; onLinkSheet: (type: 'photo' | 'certificate' | 'logbook') => void | Promise<void> }) {
-  const percent = job?.attempted ? Math.round((job.done / job.attempted) * 100) : 0
+  const agreementJob = (job?.focus || ingest?.focus || ingest?.lastAction?.focus) === 'agreements'
+  const readDone = ingest?.lastAction?.done || job?.lastAction?.done || 0
+  const readRemaining = ingest?.remaining || ingest?.lastAction?.remaining || 0
+  const readTotal = readDone + readRemaining
+  const percent = agreementJob && readTotal
+    ? Math.round((readDone / readTotal) * 100)
+    : job?.attempted ? Math.round((job.done / job.attempted) * 100) : 0
   const liveItems: ProcessJob['items'] = []
   const liveIds = new Set<string>()
   for (const item of job?.items || []) {
@@ -59,9 +65,11 @@ export function ProcessingView({ lastSync, vehicles, unmatched, busy, configured
   return <div className="view-stack">
     <section className="panel process-hero">
       <div className="batch-percent">{percent}<span>%</span></div>
-      <div><span className="eyebrow">{advancing ? 'NEXT BATCH' : job?.running ? `LIVE · ${focusLabel.toUpperCase()} · BATCH ${batch}` : last?.status === 'paused' ? 'PAUSED' : 'CHOOSE A JOB'}</span>
-        <h2>{advancing ? `Batch ${batch} of ${focusLabel} finished — starting the next files` : job?.running ? `Reading ${focusLabel.toLowerCase()} · batch ${batch}` : last?.fileName ? `Resume from ${last.fileName}` : 'Pick what to process first'}</h2>
-        <p>{advancing
+      <div><span className="eyebrow">{agreementJob && (advancing || live) ? 'READING AGREEMENTS' : advancing ? 'NEXT BATCH' : job?.running ? `LIVE · ${focusLabel.toUpperCase()} · BATCH ${batch}` : last?.status === 'paused' ? 'PAUSED' : 'CHOOSE A JOB'}</span>
+        <h2>{agreementJob && (advancing || live) ? `Reading loan agreements${readTotal ? ` · ${readDone} of ${readTotal}` : ''}` : advancing ? `Batch ${batch} of ${focusLabel} finished — starting the next files` : job?.running ? `Reading ${focusLabel.toLowerCase()} · batch ${batch}` : last?.fileName ? `Resume from ${last.fileName}` : 'Pick what to process first'}</h2>
+        <p>{agreementJob && (advancing || live)
+          ? `Checked ${readDone} of ${readTotal || readDone} PDFs. Each registration number is written to Agreement Link as it is read. Leave this page open${readRemaining ? `. ${readRemaining} still to read` : ''}.`
+          : advancing
           ? `${job?.lastRenamed ?? ingest?.renamed ?? 0} file(s) renamed in batch ${batch}. The next ${focusLabel.toLowerCase()} batch is starting now${remaining ? ` · ${remaining} still need a plate` : ''}.`
           : live
             ? `Running ${focusLabel.toLowerCase()}. Stop to pause; start the same job later to continue from the last file.`
@@ -69,7 +77,7 @@ export function ProcessingView({ lastSync, vehicles, unmatched, busy, configured
               ? `Last action: ${processFocusLabel(last.focus)} · ${last.fileName}${last.plate ? ` · ${last.plate}` : ''}${lastWhen ? ` · ${lastWhen}` : ''}. Start that job to continue from this point.`
               : `Start photos, insurance, logbooks, agreements, all waiting files, or a fix-wrong job. Stop pauses the job; starting the same one continues from the last file. Photos: ${photosFolder || 'not set'}. Insurance: ${certificatesFolder || 'not set'}. Logbooks: ${logbooksFolder || 'not set'}. Agreements: ${agreementsFolder || 'not set'}.`}</p>
       </div>
-      {advancing && <div className="process-advance" role="status"><LoaderCircle size={16} className="spin-icon" /> Ending batch {batch} and opening the next {remaining ? `${Math.min(10, remaining)} of ${remaining}` : 'files'}.</div>}
+      {advancing && <div className="process-advance" role="status"><LoaderCircle size={16} className="spin-icon" /> {agreementJob ? `Opening the next agreements. ${readRemaining} still to read.` : `Ending batch ${batch} and opening the next ${remaining ? `${Math.min(10, remaining)} of ${remaining}` : 'files'}.`}</div>}
       <div className="process-tasks" role="group" aria-label="Processing jobs">
         {PROCESS_TASKS.map((task) => {
           const current = (job?.focus || ingest?.focus) === task.id && live
@@ -107,7 +115,7 @@ export function ProcessingView({ lastSync, vehicles, unmatched, busy, configured
       </div>
     </section>
     <section className="panel table-panel standalone">
-      <div className="panel-heading"><div><h2>{advancing ? `Starting batch ${(job?.batch || 1) + 1}` : job?.running ? `Now processing · batch ${batch}` : 'Processing queue'} {(job?.items.length || waiting.length) ? <span className="count-pill">{(job?.items.length || 0) + waiting.length}</span> : null}</h2><p>{advancing ? 'This batch is complete. The next files are being opened, read, and matched.' : job?.running ? 'Each card updates as the file is opened, read, renamed, and matched. The next batch starts when this one finishes.' : 'Drop files in the photos, insurance, logbooks, or agreements folders, then watch them here until they match a Registration Number.'}</p></div>{job?.running ? <span className="live-pill"><LoaderCircle size={14} className="spin-icon" /> Live</span> : advancing ? <span className="live-pill"><LoaderCircle size={14} className="spin-icon" /> Next batch</span> : ingest?.more ? <span className="live-pill">Next batch</span> : null}</div>
+      <div className="panel-heading"><div><h2>{agreementJob && (advancing || live) ? 'Checking loan agreements' : advancing ? `Starting batch ${(job?.batch || 1) + 1}` : job?.running ? `Now processing · batch ${batch}` : 'Processing queue'} {(job?.items.length || waiting.length) ? <span className="count-pill">{(job?.items.length || 0) + waiting.length}</span> : null}</h2><p>{agreementJob && (advancing || live) ? 'Each PDF keeps its file name. The registration number inside the file is matched to that plate on STOCK DOCUMENTS after every agreement has been read.' : advancing ? 'This batch is complete. The next files are being opened, read, and matched.' : job?.running ? 'Each card updates as the file is opened, read, renamed, and matched. The next batch starts when this one finishes.' : 'Drop files in the photos, insurance, logbooks, or agreements folders, then watch them here until they match a Registration Number.'}</p></div>{job?.running ? <span className="live-pill"><LoaderCircle size={14} className="spin-icon" /> Live</span> : advancing ? <span className="live-pill"><LoaderCircle size={14} className="spin-icon" /> Next batch</span> : ingest?.more ? <span className="live-pill">Next batch</span> : null}</div>
       <div className="process-board">
         {(!job?.items.length && waiting.length === 0) ? <div className="empty-row">No files in the live queue. New photos, certificates, logbooks, and agreements appear here as they are processed.</div> : null}
         {liveItems.map((item) => {

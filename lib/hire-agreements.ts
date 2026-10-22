@@ -19,6 +19,10 @@ function isAgreementPdf(file: TypedFile) {
   return file.type === 'agreement' && (/\.pdf$/i.test(file.name) || (file.mimeType || '').toLowerCase().includes('pdf'))
 }
 
+function agreementSettled(read?: AgreementRead) {
+  return Boolean(read && (read.plate || (read.attempts || 0) >= 2))
+}
+
 function chooseSigned(reads: AgreementRead[]) {
   const chosen: AgreementRead[] = []
   let unsigned = 0
@@ -26,7 +30,7 @@ function chooseSigned(reads: AgreementRead[]) {
   const byPlate = new Map<string, AgreementRead[]>()
   for (const read of reads) {
     if (!read.plate) {
-      unread += 1
+      if ((read.attempts || 0) >= 2) unread += 1
       continue
     }
     const list = byPlate.get(read.plate) || []
@@ -35,14 +39,32 @@ function chooseSigned(reads: AgreementRead[]) {
   }
   for (const list of byPlate.values()) {
     const signed = list.filter((read) => read.signed)
-    if (!signed.length) {
-      unsigned += list.length
-      continue
-    }
-    signed.sort((a, b) => (b.date || '').localeCompare(a.date || '') || (b.modifiedTime || '').localeCompare(a.modifiedTime || ''))
-    chosen.push(signed[0])
+    const pool = signed.length ? signed : list
+    if (!signed.length) unsigned += list.length
+    pool.sort((a, b) => (b.date || '').localeCompare(a.date || '') || (b.modifiedTime || '').localeCompare(a.modifiedTime || ''))
+    chosen.push(pool[0])
   }
   return { chosen, unsigned, unread }
+}
+
+async function placeAgreementChips(config: FleetConfig, reads: AgreementRead[]) {
+  const { chosen } = chooseSigned(reads)
+  const linkedByPlate = new Map<string, AgreementRead>()
+  for (const read of reads) {
+    if (read.linked && read.plate) linkedByPlate.set(read.plate, read)
+  }
+  const toWrite = chosen.filter((file) => linkedByPlate.get(file.plate)?.id !== file.id)
+  if (!toWrite.length) return { written: 0, matched: [] as string[], missing: [] as string[], writtenIds: [] as string[], noColumn: false }
+  const ownIds = new Set([...linkedByPlate.values()].map((read) => read.id))
+  const linked = await writeAgreementChips(config, toWrite, ownIds)
+  const writtenIds = new Set(linked.writtenIds)
+  for (const read of reads) {
+    if (!writtenIds.has(read.id)) continue
+    const previous = linkedByPlate.get(read.plate)
+    if (previous && previous !== read) previous.linked = false
+    read.linked = true
+  }
+  return linked
 }
 
 export async function linkHirePurchaseAgreements(config: FleetConfig, files: TypedFile[]) {
@@ -61,7 +83,7 @@ export async function linkHirePurchaseAgreements(config: FleetConfig, files: Typ
     return { watching, attempted: 0, renamed: 0, remaining: 0, more: false, error: undefined as string | undefined, renamedFiles: [] as TypedFile[], started: true, focus: 'agreements' as const, notice: 'No agreement PDFs were found in the agreements folder.' }
   }
   const stored = new Map(agreementReadList().map((read) => [readKey(read), read]))
-  const pending = pdfs.filter((file) => !stored.has(readKey(file)))
+  const pending = pdfs.filter((file) => !agreementSettled(stored.get(readKey(file))))
   const deadline = Date.now() + READ_BUDGET_MS
   let readNow = 0
   let cursor = 0
@@ -73,6 +95,7 @@ export async function linkHirePurchaseAgreements(config: FleetConfig, files: Typ
       const file = pending[index]
       readNow += 1
       const key = readKey(file)
+      const previous = stored.get(key)
       try {
         const bytes = (file.mimeType || '').includes('vnd.google-apps')
           ? (await downloadNamedFile(file.id)).bytes
@@ -86,6 +109,8 @@ export async function linkHirePurchaseAgreements(config: FleetConfig, files: Typ
           plate: info.plate || '',
           signed: info.signed,
           date: info.date,
+          attempts: info.plate ? 0 : (previous?.attempts || 0) + 1,
+          linked: Boolean(previous?.linked && previous.plate === (info.plate || '')),
         })
       } catch {
         stored.set(key, {
@@ -96,6 +121,8 @@ export async function linkHirePurchaseAgreements(config: FleetConfig, files: Typ
           plate: '',
           signed: false,
           date: '',
+          attempts: (previous?.attempts || 0) + 1,
+          linked: previous?.linked,
         })
       }
     }
@@ -106,43 +133,44 @@ export async function linkHirePurchaseAgreements(config: FleetConfig, files: Typ
     const read = stored.get(readKey(file))
     return read ? [read] : []
   })
+  const linked = await placeAgreementChips(config, reads).catch(() => ({ written: 0, matched: [] as string[], missing: [] as string[], writtenIds: [] as string[], noColumn: false }))
   rememberAgreementReads(reads)
-  const remaining = pdfs.length - reads.length
+  const checked = pdfs.filter((file) => agreementSettled(stored.get(readKey(file)))).length
+  const remaining = pdfs.length - checked
+  const linkedCount = new Set(reads.filter((read) => read.linked && read.plate).map((read) => read.plate)).size
   if (remaining > 0) {
     recordLastAction({
       focus: 'agreements',
       status: 'running',
       remaining,
-      done: reads.length,
-      detail: `Read ${reads.length} of ${pdfs.length} loan agreements.`,
+      done: checked,
+      detail: `Read ${checked} of ${pdfs.length} loan agreements. ${linkedCount} matched on Agreement Link.`,
     })
     await persistProcessCursor(config).catch(() => {})
     return {
       watching,
       attempted: readNow,
-      renamed: 0,
+      renamed: linked.written,
       remaining,
       more: true,
       error: undefined as string | undefined,
       renamedFiles: [] as TypedFile[],
       started: true,
       focus: 'agreements' as const,
-      notice: `Read ${reads.length} of ${pdfs.length} loan agreements. The rest are still being checked.`,
+      notice: `Read ${checked} of ${pdfs.length} loan agreements. ${linkedCount} registration number${linkedCount === 1 ? ' is' : 's are'} matched on Agreement Link. File names stay as they are.`,
     }
   }
-  const { chosen, unsigned, unread } = chooseSigned(reads)
-  const linked = await writeAgreementChips(config, chosen)
+  const { unsigned, unread } = chooseSigned(reads)
   clearAgreementReads()
-  const plates = listRegistrationNumbers(linked.matched)
+  const plates = listRegistrationNumbers(reads.filter((read) => read.linked).map((read) => read.plate))
   const skipped = [
-    unsigned ? `${unsigned} unsigned file${unsigned === 1 ? '' : 's'} stayed in the folder.` : '',
     unread ? `Registration No. could not be read in ${unread} file${unread === 1 ? '' : 's'}.` : '',
     linked.noColumn ? 'STOCK DOCUMENTS has no Agreement Link column.' : '',
     linked.missing.length ? `${linked.missing.length} registration number${linked.missing.length === 1 ? ' is' : 's are'} not on STOCK DOCUMENTS.` : '',
   ].filter(Boolean).join(' ')
-  const notice = linked.written
-    ? `Linked ${linked.written} signed agreement${linked.written === 1 ? '' : 's'} onto empty Agreement Link cells${plates ? ` for ${plates}` : ''}.${skipped ? ` ${skipped}` : ''}`
-    : `No signed agreement was written to an empty Agreement Link cell.${skipped ? ` ${skipped}` : ' Cells that say Missing, or are blank, are filled when the PDF has Registration No. and a signature.'}`
+  const notice = linkedCount
+    ? `Linked ${linkedCount} agreement${linkedCount === 1 ? '' : 's'} onto Agreement Link cells${plates ? ` for ${plates}` : ''}. File names were left as they are.${skipped ? ` ${skipped}` : ''}${unsigned ? ` ${unsigned} file${unsigned === 1 ? '' : 's'} had no signature mark, so the latest copy was used.` : ''}`
+    : `No agreement was written to an Agreement Link cell.${skipped ? ` ${skipped}` : ' The registration number is read from inside the PDF.'}`
   recordLastAction({
     focus: 'agreements',
     status: 'done',
@@ -154,7 +182,7 @@ export async function linkHirePurchaseAgreements(config: FleetConfig, files: Typ
   return {
     watching,
     attempted: pdfs.length,
-    renamed: linked.written,
+    renamed: linkedCount,
     remaining: 0,
     more: false,
     error: undefined as string | undefined,

@@ -322,15 +322,17 @@ export async function linkUnlinkedDocuments(config: FleetConfig, type: 'photo' |
   return { written: chipRequests.length, matched, missing, unnamed, cells: cellsFromRegister(register) }
 }
 
-export async function writeAgreementChips(config: FleetConfig, files: { plate: string; id: string; name: string; webViewLink?: string }[]) {
-  if (!config.spreadsheetId || !files.length) return { written: 0, matched: [] as string[], missing: [] as string[], cells: new Map() as SheetCells, noColumn: false }
+export async function writeAgreementChips(config: FleetConfig, files: { plate: string; id: string; name: string; webViewLink?: string }[], ownIds?: Set<string>) {
+  const empty = { written: 0, matched: [] as string[], missing: [] as string[], writtenIds: [] as string[], cells: new Map() as SheetCells, noColumn: false }
+  if (!config.spreadsheetId || !files.length) return empty
   const register = await loadStockRegister(config, { fresh: true })
   if (![...register.rows.values()].some((row) => row.columns.agreement)) {
-    return { written: 0, matched: [], missing: [], cells: cellsFromRegister(register), noColumn: true }
+    return { ...empty, cells: cellsFromRegister(register), noColumn: true }
   }
   const requests: object[] = []
   const matched: string[] = []
   const missing: string[] = []
+  const writtenIds: string[] = []
   const seen = new Set<string>()
   for (const file of files) {
     const plate = compactPlate(file.plate)
@@ -342,18 +344,22 @@ export async function writeAgreementChips(config: FleetConfig, files: { plate: s
       continue
     }
     const column = row.columns.agreement
-    if (!agreementCellNeedsChip(column)) continue
+    if (!column) continue
+    const linkedId = column.uri && isDriveDocumentUri(column.uri) ? driveIdFromUri(column.uri) || '' : ''
+    const replaceOwn = Boolean(ownIds?.has(linkedId) && linkedId !== file.id)
+    if (!replaceOwn && !agreementCellNeedsChip(column)) continue
     const link = file.webViewLink || `https://drive.google.com/file/d/${file.id}/view`
     requests.push(chipRequest(register.sheetId, row.row, column.col, link))
     column.value = file.name.replace(/\.pdf$/i, '')
     column.uri = link
     matched.push(plate)
+    writtenIds.push(file.id)
   }
   if (requests.length) {
     await applyChipBatches(config.spreadsheetId, requests)
     storeRegister(config.spreadsheetId, register, await sheetModifiedTime(config.spreadsheetId))
   }
-  return { written: requests.length, matched, missing, cells: cellsFromRegister(register), noColumn: false }
+  return { written: requests.length, matched, missing, writtenIds, cells: cellsFromRegister(register), noColumn: false }
 }
 
 function chipTitle(file: { name?: string }) {
