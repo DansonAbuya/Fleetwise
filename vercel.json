@@ -2,7 +2,7 @@
   "functions": {
     "app/**/*.{js,jsx,ts,tsx}": {
       "maxDuration": 300,
-      "includeFiles": "scripts/**"
+      "includeFiles": "{scripts/**,node_modules/@napi-rs/canvas/**,node_modules/@napi-rs/canvas-linux-x64-gnu/**,node_modules/@napi-rs/canvas-linux-arm64-gnu/**,node_modules/sharp/**,node_modules/@img/sharp-linux-x64/**,node_modules/@img/sharp-linux-arm64/**,node_modules/@img/sharp-libvips-linux-x64/**,node_modules/@img/sharp-libvips-linux-arm64/**,node_modules/tesseract.js/**,node_modules/tesseract.js-core/**,node_modules/pdfjs-dist/**,node_modules/zod/**}"
     }
   }
 }
