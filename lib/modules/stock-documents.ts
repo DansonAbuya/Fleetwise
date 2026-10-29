@@ -12,6 +12,7 @@ import {
   driveViewLink,
   headerRequest,
   isDriveDocumentUri,
+  textCellRequest,
   listTabs,
   parseSheetLink,
   pickTab,
@@ -19,8 +20,9 @@ import {
   type GridCell,
   type SheetMerge,
 } from '@/lib/sheets/client'
-import { insuranceState, parseCoverDate } from '@/lib/insurance'
+import { formatCoverDate, insuranceState, parseCoverDate, type InsuranceCover } from '@/lib/insurance'
 import { compactPlate, extractKenyanPlate, plateFromText } from '@/lib/plates'
+import { knownSheetRevision, noteSheetRevision, rememberRegisterLinks, saveCoverDates } from '@/lib/register-db'
 import { hasCanonicalName } from '@/lib/document-names'
 import { isUnmatchedFile, onRegister, surplusCopies } from '@/lib/unmatched-files'
 import { DEFAULT_COLLATERAL_PARENT_ID, type DocType, type FleetConfig, type TypedFile, type VehicleRecord } from '@/lib/types'
@@ -52,14 +54,14 @@ type StockRegister = {
   nextColumn: number
 }
 
-const registerCache = new Map<string, { modifiedTime: string; register: StockRegister }>()
+const registerCache = new Map<string, { modifiedTime: string; register: StockRegister; storedAt: number }>()
 
 function cacheKeyFor(spreadsheetId: string) {
   return `${spreadsheetId}:stock-documents`
 }
 
 function storeRegister(spreadsheetId: string, register: StockRegister, modifiedTime = '') {
-  registerCache.set(cacheKeyFor(spreadsheetId), { modifiedTime, register })
+  registerCache.set(cacheKeyFor(spreadsheetId), { modifiedTime, register, storedAt: Date.now() })
 }
 
 async function sheetModifiedTime(spreadsheetId: string) {
@@ -71,6 +73,79 @@ async function sheetModifiedTime(spreadsheetId: string) {
   }
 }
 
+export async function workbookModifiedTime(spreadsheetId: string) {
+  return sheetModifiedTime(spreadsheetId)
+}
+
+function cachedModifiedTime(spreadsheetId: string) {
+  return registerCache.get(cacheKeyFor(spreadsheetId))?.modifiedTime || ''
+}
+
+async function publishRegisterLinks(spreadsheetId: string, register: StockRegister, plates: string[], priorModifiedTime: string, nextModifiedTime: string) {
+  const keys = [...new Set(plates.map((plate) => compactPlate(plate)).filter(Boolean))]
+  if (!spreadsheetId || !keys.length) return
+  try {
+    const wanted = new Set(keys)
+    const vehicles = buildRegister([], { keys: wanted, cells: cellsFromRegister(register) }).vehicles
+      .filter((vehicle) => wanted.has(compactPlate(vehicle.plate)))
+    if (vehicles.length) await rememberRegisterLinks(vehicles)
+    if (priorModifiedTime && knownSheetRevision(spreadsheetId) === priorModifiedTime && nextModifiedTime) {
+      noteSheetRevision(spreadsheetId, nextModifiedTime)
+    }
+  } catch {
+    // The chip is already on the sheet. The next screen load copies the workbook into Neon.
+  }
+}
+
+/** Write dates the app has read into empty Commencement and Expiry cells, and onto the vehicle rows. */
+export async function writeCoverDates(config: FleetConfig, covers: Record<string, InsuranceCover>) {
+  const entries = Object.entries(covers).flatMap(([plate, cover]) => {
+    const key = compactPlate(plate)
+    if (!key || (!cover?.commencement && !cover?.expiry)) return []
+    return [[key, cover] as const]
+  })
+  if (!entries.length) return { written: 0 }
+  await saveCoverDates(Object.fromEntries(entries)).catch(() => {})
+  if (!config.spreadsheetId) return { written: 0 }
+  const register = await loadStockRegister(config)
+  const priorModifiedTime = cachedModifiedTime(config.spreadsheetId)
+  const requests: object[] = []
+  for (const [plate, cover] of entries) {
+    const row = register.rows.get(plate) || rowByLoosePlate(register, plate)
+    if (!row) continue
+    if (cover.commencement && row.commencement && dateCellOpen(row.commencement.value)) {
+      const label = formatCoverDate(cover.commencement)
+      if (label !== 'Not read') {
+        requests.push(textCellRequest(register.sheetId, row.row, row.commencement.col, label))
+        row.commencement.value = label
+      }
+    }
+    if (cover.expiry && row.expiry && dateCellOpen(row.expiry.value)) {
+      const label = formatCoverDate(cover.expiry)
+      if (label !== 'Not read') {
+        requests.push(textCellRequest(register.sheetId, row.row, row.expiry.col, label))
+        row.expiry.value = label
+      }
+    }
+  }
+  if (!requests.length || !config.spreadsheetId) return { written: 0 }
+  await applyChipBatches(config.spreadsheetId, requests)
+  const nextModifiedTime = await sheetModifiedTime(config.spreadsheetId)
+  storeRegister(config.spreadsheetId, register, nextModifiedTime)
+  if (priorModifiedTime && knownSheetRevision(config.spreadsheetId) === priorModifiedTime && nextModifiedTime) {
+    noteSheetRevision(config.spreadsheetId, nextModifiedTime)
+  }
+  return { written: requests.length }
+}
+
+function dateCellOpen(value?: string) {
+  const raw = (value || '').trim()
+  if (!raw) return true
+  if (parseCoverDate(raw)) return false
+  const compact = raw.toLowerCase().replace(/\s+/g, ' ')
+  return /^(missing|not there|not available|unavailable|n\/a|na|n\.a\.?|none|nil|null|no|pending|blank|tbd|not read|—|–|-|\.|@)$/.test(compact)
+}
+
 export function stockTabTitle(config: FleetConfig) {
   return config.logbooksSheet || STOCK_TAB
 }
@@ -79,7 +154,7 @@ export function collateralParentId(config: FleetConfig) {
   return config.collateralId || process.env.DRIVE_FOLDER_COLLATERAL || DEFAULT_COLLATERAL_PARENT_ID
 }
 
-export async function readStockRegisterSnapshot(config: FleetConfig, options?: { fresh?: boolean }) {
+export async function readStockRegisterSnapshot(config: FleetConfig, options?: { fresh?: boolean; maxAgeMs?: number }) {
   if (!config.spreadsheetId) {
     return { vehicles: [] as VehicleRecord[], unmatched: [] as TypedFile[], duplicates: [], plates: new Set<string>(), cells: new Map() as SheetCells, error: undefined as string | undefined }
   }
@@ -104,14 +179,19 @@ export async function readStockRegisterSnapshot(config: FleetConfig, options?: {
   }
 }
 
-export async function loadStockRegister(config: FleetConfig, options?: { fresh?: boolean }): Promise<StockRegister> {
+export async function loadStockRegister(config: FleetConfig, options?: { fresh?: boolean; maxAgeMs?: number }): Promise<StockRegister> {
   if (!config.spreadsheetId) {
     return { title: STOCK_TAB, sheetId: 0, rows: new Map(), plates: new Set(), samples: [], headerRow: 1, nextColumn: 1 }
   }
   const cacheKey = cacheKeyFor(config.spreadsheetId)
-  const modifiedTime = await sheetModifiedTime(config.spreadsheetId)
   const cached = registerCache.get(cacheKey)
-  if (!options?.fresh && modifiedTime && cached?.modifiedTime === modifiedTime) return cached.register
+  const maxAge = options?.maxAgeMs || 0
+  if (!options?.fresh && cached && maxAge > 0 && Date.now() - cached.storedAt < maxAge) return cached.register
+  const modifiedTime = await sheetModifiedTime(config.spreadsheetId)
+  if (!options?.fresh && modifiedTime && cached?.modifiedTime === modifiedTime) {
+    cached.storedAt = Date.now()
+    return cached.register
+  }
   const tabs = await listTabs(config.spreadsheetId)
   const preferred = pickTab(tabs, STOCK_TAB, [/stock documents?/i]) || pickTab(tabs, stockTabTitle(config), [/stock document/i, /stock/i, /register/i])
   const fallbacks = tabs.filter((tab) => /stock|register|fleet/i.test(tab.title) && tab.title !== preferred?.title)
@@ -132,6 +212,8 @@ export async function loadStockRegister(config: FleetConfig, options?: { fresh?:
 async function writeSheetMatches(config: FleetConfig, files: TypedFile[], mode: SheetSyncMode = 'auto') {
   if (!config.spreadsheetId) return emptySync()
   const register = await loadStockRegister(config)
+  const priorModifiedTime = cachedModifiedTime(config.spreadsheetId)
+  const changed = new Set<string>()
   const missing: string[] = []
   const matched: string[] = []
   const seenMissing = new Set<string>()
@@ -155,6 +237,7 @@ async function writeSheetMatches(config: FleetConfig, files: TypedFile[], mode: 
     chipRequests.push(chipRequest(register.sheetId, row.row, column.col, link))
     column.value = chipTitle(file)
     column.uri = link
+    changed.add(row.plate)
     if (!seenMatched.has(row.plate)) {
       seenMatched.add(row.plate)
       matched.push(row.plate)
@@ -183,6 +266,7 @@ async function writeSheetMatches(config: FleetConfig, files: TypedFile[], mode: 
         chipRequests.push(clearChipRequest(register.sheetId, row.row, column.col))
         column.value = ''
         column.uri = undefined
+        changed.add(row.plate)
         continue
       }
       if (hasChip && !currentPlate && linkedId && !linked) continue
@@ -190,6 +274,7 @@ async function writeSheetMatches(config: FleetConfig, files: TypedFile[], mode: 
         chipRequests.push(clearChipRequest(register.sheetId, row.row, column.col))
         column.value = ''
         column.uri = undefined
+        changed.add(row.plate)
       }
     }
   }
@@ -223,9 +308,11 @@ async function writeSheetMatches(config: FleetConfig, files: TypedFile[], mode: 
     }
   }
 
-  if (chipRequests.length) {
+  if (chipRequests.length && config.spreadsheetId) {
     await applyChipBatches(config.spreadsheetId, chipRequests)
-    storeRegister(config.spreadsheetId, register)
+    const nextModifiedTime = await sheetModifiedTime(config.spreadsheetId)
+    storeRegister(config.spreadsheetId, register, nextModifiedTime)
+    await publishRegisterLinks(config.spreadsheetId, register, [...changed], priorModifiedTime, nextModifiedTime)
   }
   const sampleText = register.samples.length
     ? ` Values already in Registration Number on '${register.title}': ${register.samples.join(', ')}.`
@@ -244,6 +331,7 @@ async function writeSheetMatches(config: FleetConfig, files: TypedFile[], mode: 
 export async function linkUnlinkedDocuments(config: FleetConfig, type: 'photo' | 'certificate' | 'logbook', files: TypedFile[], options?: { fresh?: boolean }) {
   if (!config.spreadsheetId) return { written: 0, matched: [] as string[], missing: [] as string[], cells: new Map() as SheetCells, unnamed: 0 }
   const register = await loadStockRegister(config, { fresh: options?.fresh ?? true })
+  const priorModifiedTime = cachedModifiedTime(config.spreadsheetId)
   const byPlate = new Map<string, TypedFile[]>()
   for (const file of files) {
     if (file.type !== type) continue
@@ -314,18 +402,33 @@ export async function linkUnlinkedDocuments(config: FleetConfig, type: 'photo' |
     }
   }
 
-  if (chipRequests.length) {
+  if (chipRequests.length && config.spreadsheetId) {
     await applyChipBatches(config.spreadsheetId, chipRequests)
-    const modifiedTime = await sheetModifiedTime(config.spreadsheetId)
-    storeRegister(config.spreadsheetId, register, modifiedTime)
+    const nextModifiedTime = await sheetModifiedTime(config.spreadsheetId)
+    storeRegister(config.spreadsheetId, register, nextModifiedTime)
+    await publishRegisterLinks(config.spreadsheetId, register, matched, priorModifiedTime, nextModifiedTime)
   }
   return { written: chipRequests.length, matched, missing, unnamed, cells: cellsFromRegister(register) }
 }
 
+export async function linkedAgreementFileIds(config: FleetConfig) {
+  const ids = new Set<string>()
+  if (!config.spreadsheetId) return ids
+  const register = await loadStockRegister(config, { fresh: false })
+  for (const row of register.rows.values()) {
+    const uri = row.columns.agreement?.uri
+    if (!isDriveDocumentUri(uri)) continue
+    const id = driveIdFromUri(uri)
+    if (id) ids.add(id)
+  }
+  return ids
+}
+
 export async function writeAgreementChips(config: FleetConfig, files: { plate: string; id: string; name: string; webViewLink?: string }[], ownIds?: Set<string>) {
-  const empty = { written: 0, matched: [] as string[], missing: [] as string[], writtenIds: [] as string[], cells: new Map() as SheetCells, noColumn: false }
+  const empty = { written: 0, matched: [] as string[], missing: [] as string[], writtenIds: [] as string[], skipped: [] as { id: string; name: string; plate: string }[], cells: new Map() as SheetCells, noColumn: false }
   if (!config.spreadsheetId || !files.length) return empty
-  const register = await loadStockRegister(config, { fresh: true })
+  const register = await loadStockRegister(config, { fresh: false })
+  const priorModifiedTime = cachedModifiedTime(config.spreadsheetId)
   if (![...register.rows.values()].some((row) => row.columns.agreement)) {
     return { ...empty, cells: cellsFromRegister(register), noColumn: true }
   }
@@ -333,6 +436,7 @@ export async function writeAgreementChips(config: FleetConfig, files: { plate: s
   const matched: string[] = []
   const missing: string[] = []
   const writtenIds: string[] = []
+  const skipped: { id: string; name: string; plate: string }[] = []
   const seen = new Set<string>()
   for (const file of files) {
     const plate = compactPlate(file.plate)
@@ -347,7 +451,10 @@ export async function writeAgreementChips(config: FleetConfig, files: { plate: s
     if (!column) continue
     const linkedId = column.uri && isDriveDocumentUri(column.uri) ? driveIdFromUri(column.uri) || '' : ''
     const replaceOwn = Boolean(ownIds?.has(linkedId) && linkedId !== file.id)
-    if (!replaceOwn && !agreementCellNeedsChip(column)) continue
+    if (!replaceOwn && !agreementCellNeedsChip(column)) {
+      if (linkedId) skipped.push({ id: file.id, name: file.name, plate })
+      continue
+    }
     const link = file.webViewLink || `https://drive.google.com/file/d/${file.id}/view`
     requests.push(chipRequest(register.sheetId, row.row, column.col, link))
     column.value = file.name.replace(/\.pdf$/i, '')
@@ -355,11 +462,13 @@ export async function writeAgreementChips(config: FleetConfig, files: { plate: s
     matched.push(plate)
     writtenIds.push(file.id)
   }
-  if (requests.length) {
+  if (requests.length && config.spreadsheetId) {
     await applyChipBatches(config.spreadsheetId, requests)
-    storeRegister(config.spreadsheetId, register, await sheetModifiedTime(config.spreadsheetId))
+    const nextModifiedTime = await sheetModifiedTime(config.spreadsheetId)
+    storeRegister(config.spreadsheetId, register, nextModifiedTime)
+    await publishRegisterLinks(config.spreadsheetId, register, matched, priorModifiedTime, nextModifiedTime)
   }
-  return { written: requests.length, matched, missing, writtenIds, cells: cellsFromRegister(register), noColumn: false }
+  return { written: requests.length, matched, missing, writtenIds, skipped, cells: cellsFromRegister(register), noColumn: false }
 }
 
 function chipTitle(file: { name?: string }) {
@@ -386,7 +495,8 @@ const chippedCollateral = new Map<string, number>()
 
 async function ensureCollateralFolders(config: FleetConfig) {
   if (!config.spreadsheetId) return { written: 0, created: 0, cells: new Map() as SheetCells, more: false }
-  const register = await loadStockRegister(config, { fresh: true })
+  const register = await loadStockRegister(config, { fresh: false })
+  const priorModifiedTime = cachedModifiedTime(config.spreadsheetId)
   if (!register.rows.size) return { written: 0, created: 0, cells: cellsFromRegister(register), more: false }
   const requests: ReturnType<typeof chipRequest>[] = []
   let header: ReturnType<typeof headerRequest> | undefined
@@ -455,8 +565,10 @@ async function ensureCollateralFolders(config: FleetConfig) {
     await applyChipBatches(config.spreadsheetId, requests, header ? [header] : [])
     const markedAt = Date.now()
     for (const plate of touched) chippedCollateral.set(`${config.spreadsheetId}:${plate}`, markedAt)
-    register.nextColumn = Math.max(register.nextColumn, collateralCol + 1)
-    storeRegister(config.spreadsheetId, register, await sheetModifiedTime(config.spreadsheetId))
+    register.nextColumn = Math.max(register.nextColumn, (collateralCol || 0) + 1)
+    const nextModifiedTime = await sheetModifiedTime(config.spreadsheetId)
+    storeRegister(config.spreadsheetId, register, nextModifiedTime)
+    await publishRegisterLinks(config.spreadsheetId, register, touched, priorModifiedTime, nextModifiedTime)
   }
   const stillOpen = [...register.rows.values()].some((row) => needsChip(row))
   return { written: requests.length, created, cells: cellsFromRegister(register), more: stillOpen }
@@ -791,8 +903,8 @@ function buildRegister(files: TypedFile[], sync: Pick<ModuleSyncResult, 'keys' |
         }
         vehicle.files[type] = linked
           ? [{ ...linked, plate: vehicle.plate }]
-          : [{
-              id: `sheet:${type}:${vehicle.plate}`,
+            : [{
+              id: targetId || `sheet:${type}:${vehicle.plate}`,
               name: sheetDocumentName(cell.label),
               webViewLink: cell.uri,
               type,

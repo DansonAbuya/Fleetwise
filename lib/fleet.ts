@@ -182,16 +182,23 @@ async function insuranceCoverFile(config: FleetConfig) {
     || await findFileByName(INSURANCE_COVER_NAME)
 }
 
+const coverStore = globalThis as typeof globalThis & { __fleetwiseCovers?: { at: number; covers: Record<string, InsuranceCover> } }
+
 export async function loadInsuranceCovers(config: FleetConfig): Promise<Record<string, InsuranceCover>> {
+  const cached = coverStore.__fleetwiseCovers
+  if (cached && Date.now() - cached.at < 2 * 60 * 1000) return cached.covers
   const existing = await insuranceCoverFile(config)
-  if (!existing) return {}
+  if (!existing) return cached?.covers || {}
   const data = await readJsonFile<Record<string, InsuranceCover>>(existing.id)
-  return data && typeof data === 'object' && !Array.isArray(data) ? data : {}
+  const covers = data && typeof data === 'object' && !Array.isArray(data) ? data : {}
+  coverStore.__fleetwiseCovers = { at: Date.now(), covers }
+  return covers
 }
 
 export async function saveInsuranceCovers(config: FleetConfig, covers: Record<string, InsuranceCover>) {
   const existing = await insuranceCoverFile(config)
   await upsertJsonFile(config.certificatesId, INSURANCE_COVER_NAME, covers, existing?.id)
+  coverStore.__fleetwiseCovers = { at: Date.now(), covers }
 }
 
 export async function saveInsuranceCover(config: FleetConfig, plate: string, cover: InsuranceCover) {

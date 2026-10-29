@@ -313,8 +313,12 @@ function newestFile(files: DriveItem[]) {
 export async function readJsonFile<T>(fileId: string): Promise<T | null> {
   const res = await driveFetch(`${DRIVE}/files/${fileId}?${withDriveParams({ alt: 'media' })}`)
   const text = await res.text()
-  if (!text) return null
-  return JSON.parse(text) as T
+  if (!text.trim()) return null
+  try {
+    return JSON.parse(text) as T
+  } catch {
+    return null
+  }
 }
 
 export async function upsertJsonFile(folderId: string, name: string, data: unknown, existingId?: string) {

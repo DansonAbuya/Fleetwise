@@ -412,4 +412,5 @@ export const APP_FILE_NAMES = new Set([
   'fleetwise-gmail-state.json',
   'fleetwise-process.json',
   'fleetwise-insurance-cover.json',
+  'fleetwise-register-sync.json',
 ])

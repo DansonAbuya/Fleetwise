@@ -9,21 +9,26 @@ import { cleanInboxEmail, isInboxEmail, mailboxSearchQuery } from '@/lib/mailbox
 import { warmPlateReader } from '@/lib/read-plate-runner'
 import { SHEET_MODULES, stockDocumentsModule, syncSheetModules } from '@/lib/modules'
 import { hasRenamedName, sameDocumentName } from '@/lib/document-names'
-import { driveIdFromUri, linkUnlinkedDocuments, readStockRegisterSnapshot, syncCollateralChips } from '@/lib/modules/stock-documents'
+import { driveIdFromUri, linkUnlinkedDocuments, readStockRegisterSnapshot, syncCollateralChips, workbookModifiedTime, writeCoverDates } from '@/lib/modules/stock-documents'
 import { linkHirePurchaseAgreements } from '@/lib/hire-agreements'
 import { surplusCopies } from '@/lib/unmatched-files'
 import type { SheetCells, SheetSyncMode } from '@/lib/modules/types'
 import { compactPlate, extractKenyanPlate, listRegistrationNumbers, parseKenyanPlate, parsePhotoPlate, pickOcrPlate, plateFromCertificateText, plateFromLogbookText, plateFromText, printedRegistrationPlate } from '@/lib/plates'
-import { attachLastAction, beginProcessJob, endProcessJob, fileMatchesFocus, getProcessJob, isProcessCancelled, isProcessRunning, isRepairFocus, isStaleProcess, markProcessMatches, processGeneration, requestProcessStop, resetProcessJob, touchProcessItem } from '@/lib/processing'
+import { attachLastAction, beginProcessJob, clearProcessCancellation, endProcessJob, fileMatchesFocus, getProcessJob, isProcessCancelled, isProcessRunning, isRepairFocus, isStaleProcess, markProcessMatches, processGeneration, requestProcessStop, resetProcessJob, touchProcessItem } from '@/lib/processing'
 import { processFocusLabel, type ProcessFocus } from '@/lib/process-focus'
 import { agreementReadList, confirmedPlate, forgetFile, hydrateProcessCursor, isCursorHydrated, lastAction, markConfirmed, markTried, persistProcessCursor, recordLastAction, wasTriedRecently, canResumeProcessQueue, clearAgreementReads, clearTriedFiles, closeRunningProcesses, processQueueItems, replaceProcessQueue, takeProcessQueueItem, type ProcessQueueItem } from '@/lib/process-cursor'
 import { requireSession } from '@/lib/session'
 import { databaseConfigured, databaseStatus } from '@/lib/prisma'
-import { importVehiclesToDatabase, loadExportedRegister, loadRegisterFromDatabase, saveCoverDates } from '@/lib/register-db'
+import { importVehiclesToDatabase, loadExportedRegister, loadRegisterFromDatabase, rememberSheetRevision, storedSheetRevision } from '@/lib/register-db'
 import { attachInsurance, EMPTY_STATS, filterVehicles, fleetStats, insuranceAlertsFor, slimVehicle, type VehicleQuery } from '@/lib/vehicles'
 import type { DocType, FleetConfig, FleetSnapshot, InboxItem, TypedFile, VehicleRecord } from '@/lib/types'
 
 let rememberedPlates: string[] = []
+const agreementListStore = globalThis as typeof globalThis & { __fleetwiseAgreementFiles?: { folderId: string; files: TypedFile[] } | null }
+const FOLDER_INDEX_MS = 10 * 60 * 1000
+const folderIndexStore = globalThis as typeof globalThis & {
+  __fleetwiseFolderIndex?: { at: number; key: string; unmatched: TypedFile[]; duplicates: FleetSnapshot['duplicates'] }
+}
 
 const ON_VERCEL = Boolean(process.env.VERCEL)
 const OCR_BATCH = ON_VERCEL ? 1 : 10
@@ -112,6 +117,8 @@ export async function syncRegisterToDatabase() {
   const covers = await loadInsuranceCovers(config).catch(() => ({} as Record<string, InsuranceCover>))
   const vehicles = attachInsurance(sheet.vehicles, covers)
   const result = await importVehiclesToDatabase(vehicles)
+  const modifiedTime = await workbookModifiedTime(config.spreadsheetId)
+  await rememberSheetRevision(config.spreadsheetId, modifiedTime)
   const database = await databaseStatus()
   return emptySnapshot(session, config, {
     lastSync: new Date().toISOString(),
@@ -127,26 +134,52 @@ export async function syncRegisterToDatabase() {
   })
 }
 
-async function syncRegisterFromSheet(config: FleetConfig) {
-  const sheet = await readStockRegisterSnapshot(config)
-  if (!sheet.error && sheet.vehicles.length && databaseConfigured()) {
-    const database = await databaseStatus().catch(() => ({ connected: false, vehicles: 0 }))
-    if (database.connected && (sheet.refreshed || database.vehicles !== sheet.vehicles.length)) {
-      const covers = await loadInsuranceCovers(config).catch(() => ({} as Record<string, InsuranceCover>))
-      await importVehiclesToDatabase(attachInsurance(sheet.vehicles, covers))
-    }
+let registerSyncRunning = false
+
+async function ensureRegisterSynced(config: FleetConfig) {
+  if (registerSyncRunning || !databaseConfigured() || !config.spreadsheetId) return false
+  const status = await databaseStatus().catch(() => ({ connected: false, vehicles: 0 }))
+  if (!status.connected) return false
+  const modifiedTime = await workbookModifiedTime(config.spreadsheetId)
+  if (!modifiedTime) return status.vehicles > 0
+  const known = await storedSheetRevision(config.spreadsheetId)
+  if (modifiedTime === known && status.vehicles > 0) return true
+  if (registerSyncRunning) return false
+  registerSyncRunning = true
+  try {
+    const sheet = await readStockRegisterSnapshot(config)
+    if (sheet.error || !sheet.vehicles.length) return status.vehicles > 0
+    const covers = await loadInsuranceCovers(config).catch(() => ({} as Record<string, InsuranceCover>))
+    await importVehiclesToDatabase(attachInsurance(sheet.vehicles, covers))
+    await rememberSheetRevision(config.spreadsheetId, modifiedTime)
+    return true
+  } finally {
+    registerSyncRunning = false
   }
-  return sheet
+}
+
+export async function syncSheetRegister() {
+  await requireSession()
+  const config = await loadConfig()
+  if (!config?.spreadsheetId) return { updated: false }
+  const before = await storedSheetRevision(config.spreadsheetId)
+  const ready = await ensureRegisterSynced(config).catch(() => false)
+  const after = ready ? await storedSheetRevision(config.spreadsheetId) : before
+  return { updated: Boolean(after && after !== before) }
 }
 
 export async function loadVehiclePage(input: VehicleQuery = {}) {
   await requireSession()
   const config = await loadConfig()
-  if (databaseConfigured()) {
-    const database = await databaseStatus().catch(() => ({ connected: false, vehicles: 0 }))
+  if (config && databaseConfigured()) {
+    let database = await databaseStatus().catch(() => ({ connected: false, vehicles: 0 }))
+    if (database.connected && database.vehicles === 0) {
+      await ensureRegisterSynced(config).catch(() => false)
+      database = await databaseStatus().catch(() => database)
+    }
     if (database.connected && database.vehicles > 0) {
       try {
-        const covers = config ? await loadInsuranceCovers(config).catch(() => ({} as Record<string, InsuranceCover>)) : {}
+        const covers = await loadInsuranceCovers(config).catch(() => ({} as Record<string, InsuranceCover>))
         const fromDb = await loadRegisterFromDatabase(input, covers)
         return { ...fromDb, error: undefined as string | undefined }
       } catch (err) {
@@ -162,7 +195,7 @@ export async function loadVehiclePage(input: VehicleQuery = {}) {
       }
     }
   }
-  const sheet = config?.spreadsheetId ? await readStockRegisterSnapshot(config) : null
+  const sheet = config?.spreadsheetId ? await readStockRegisterSnapshot(config, { maxAgeMs: 20_000 }) : null
   if (!config?.spreadsheetId || !sheet) {
     return { vehicles: [] as VehicleRecord[], total: 0, page: 1, pageSize: input.pageSize || 25, stats: EMPTY_STATS, insuranceAlerts: [] as FleetSnapshot['insuranceAlerts'], error: undefined as string | undefined }
   }
@@ -173,7 +206,6 @@ export async function loadVehiclePage(input: VehicleQuery = {}) {
   const page = Math.min(Math.max(1, input.page || 1), totalPages)
   const start = (page - 1) * pageSize
   const pageVehicles = filtered.slice(start, start + pageSize)
-  covers = await fillMissingCertificateCovers(config, pageVehicles, covers)
   const withCover = attachInsurance(sheet.vehicles, covers)
   return {
     vehicles: attachInsurance(pageVehicles, covers).map(slimVehicle),
@@ -189,8 +221,11 @@ export async function loadVehiclePage(input: VehicleQuery = {}) {
 export async function exportVehicleRegister(input: VehicleQuery = {}) {
   await requireSession()
   const config = await loadConfig()
+  if (config) await ensureRegisterSynced(config).catch(() => false)
   const fromDb = databaseConfigured() ? await databaseStatus().catch(() => ({ connected: false, vehicles: 0 })) : { connected: false, vehicles: 0 }
-  const sheet = config?.spreadsheetId ? await syncRegisterFromSheet(config) : null
+  const sheet = config?.spreadsheetId && !(fromDb.connected && fromDb.vehicles)
+    ? await readStockRegisterSnapshot(config)
+    : null
   const vehicles = fromDb.connected && fromDb.vehicles
     ? await loadExportedRegister(input)
     : sheet ? filterVehicles(attachInsurance(sheet.vehicles, await loadInsuranceCovers(config!).catch(() => ({}))), input) : []
@@ -210,6 +245,131 @@ export async function exportVehicleRegister(input: VehicleQuery = {}) {
   return rows.map((row) => row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(',')).join('\n')
 }
 
+function folderIndexKey(config: FleetConfig) {
+  return [config.logbooksId, config.certificatesId, config.photosId].join('|')
+}
+
+function registerStampFor(vehicles: VehicleRecord[]) {
+  let complete = 0
+  for (const vehicle of vehicles) if (vehicle.status === 'Complete') complete += 1
+  return `${vehicles.length}:${complete}`
+}
+
+async function cachedFolderIndex(config: FleetConfig, plates: Set<string>, cells: SheetCells) {
+  const key = folderIndexKey(config)
+  const hit = folderIndexStore.__fleetwiseFolderIndex
+  if (hit && hit.key === key && Date.now() - hit.at < FOLDER_INDEX_MS) return hit
+  const listed = await scanFolders(config, plates, cells, undefined, { fresh: false, types: ['logbook', 'certificate', 'photo'] })
+  const next = { at: Date.now(), key, unmatched: listed.unmatched, duplicates: listed.duplicates }
+  folderIndexStore.__fleetwiseFolderIndex = next
+  return next
+}
+
+async function loadScreenSnapshot(session: { name: string; email: string; image?: string }, config: FleetConfig): Promise<FleetSnapshot> {
+  const emptyPreview = { vehicles: [] as VehicleRecord[], plates: new Set<string>(), cells: new Map() as SheetCells, error: undefined as string | undefined }
+  const [covers, database] = await Promise.all([
+    loadInsuranceCovers(config).catch(() => ({} as Record<string, InsuranceCover>)),
+    databaseStatus().catch(() => ({ configured: false, connected: false, vehicles: 0 })),
+  ])
+  if (database.connected && database.vehicles > 0) {
+    const page = await loadRegisterFromDatabase({ page: 1, pageSize: 10 }, covers).catch(() => null)
+    if (page) {
+      const indexed = folderIndexStore.__fleetwiseFolderIndex
+      const foldersReady = Boolean(indexed && indexed.key === folderIndexKey(config) && Date.now() - indexed.at < FOLDER_INDEX_MS)
+      return emptySnapshot(session, config, {
+        vehicles: page.vehicles,
+        unmatched: foldersReady && indexed ? indexed.unmatched : [],
+        duplicates: foldersReady && indexed ? indexed.duplicates : [],
+        insuranceAlerts: page.insuranceAlerts,
+        stats: page.stats,
+        lastSync: config.lastSync,
+        sheetsConnected: Boolean(config.spreadsheetId),
+        databaseConnected: true,
+        databaseVehicles: page.total,
+        ingest: {
+          watching: '',
+          attempted: 0,
+          renamed: 0,
+          remaining: lastAction().remaining || 0,
+          more: false,
+          renamedFiles: [],
+          started: false,
+          foldersReady,
+          registerStamp: `${page.stats.total}:${page.stats.complete}`,
+          lastAction: lastAction(),
+        },
+      })
+    }
+  }
+  const preview = config.spreadsheetId ? await readStockRegisterSnapshot(config, { maxAgeMs: 15_000 }) : emptyPreview
+  const indexed = folderIndexStore.__fleetwiseFolderIndex
+  const foldersReady = Boolean(indexed && indexed.key === folderIndexKey(config) && Date.now() - indexed.at < FOLDER_INDEX_MS)
+  const registerVehicles = attachInsurance(preview.vehicles, covers)
+  return emptySnapshot(session, config, {
+    vehicles: registerVehicles.slice(0, 10).map(slimVehicle),
+    unmatched: foldersReady && indexed ? indexed.unmatched : [],
+    duplicates: foldersReady && indexed ? indexed.duplicates : [],
+    insuranceAlerts: insuranceAlertsFor(covers),
+    stats: statsFor(registerVehicles),
+    lastSync: config.lastSync,
+    sheetsConnected: Boolean(config.spreadsheetId) && !preview.error,
+    databaseConnected: database.connected,
+    databaseVehicles: database.vehicles,
+    sheetsError: preview.error,
+    ingest: {
+      watching: '',
+      attempted: 0,
+      renamed: 0,
+      remaining: lastAction().remaining || 0,
+      more: false,
+      renamedFiles: [],
+      started: false,
+      foldersReady,
+      registerStamp: registerStampFor(registerVehicles),
+      lastAction: lastAction(),
+    },
+  })
+}
+
+export async function loadFolderIndex() {
+  await requireSession()
+  const config = await loadConfig()
+  if (!config) return { unmatched: [] as TypedFile[], duplicates: [] as FleetSnapshot['duplicates'] }
+  const preview = config.spreadsheetId
+    ? await readStockRegisterSnapshot(config, { maxAgeMs: 60_000 })
+    : { plates: new Set<string>(), cells: new Map() as SheetCells }
+  const index = await cachedFolderIndex(config, preview.plates, preview.cells)
+  return { unmatched: index.unmatched, duplicates: index.duplicates }
+}
+
+export async function fillCollateralGaps() {
+  await requireSession()
+  const config = await loadConfig()
+  if (!config?.spreadsheetId) return { more: false, written: 0, created: 0 }
+  try {
+    const collateral = await syncCollateralChips(config)
+    return { more: Boolean(collateral.more), written: collateral.written, created: collateral.created }
+  } catch {
+    return { more: false, written: 0, created: 0 }
+  }
+}
+
+export async function warmCertificateDates() {
+  await requireSession()
+  const config = await loadConfig()
+  if (!config?.spreadsheetId) return { updated: false }
+  try {
+    const sheet = await readStockRegisterSnapshot(config, { maxAgeMs: 60_000 })
+    const covers = await loadInsuranceCovers(config).catch(() => ({} as Record<string, InsuranceCover>))
+    const dated = (rows: Record<string, InsuranceCover>) => Object.values(rows).filter((cover) => cover?.commencement && cover?.expiry).length
+    const before = dated(covers)
+    const next = await fillMissingCertificateCovers(config, sheet.vehicles, covers)
+    return { updated: dated(next) !== before }
+  } catch {
+    return { updated: false }
+  }
+}
+
 export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = false, focus?: ProcessFocus | 'off'): Promise<FleetSnapshot> {
   const session = await requireSession()
   let config = await loadConfig()
@@ -222,25 +382,29 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
       config = await saveConfig({ ...config, spreadsheetId: workbook.id, spreadsheetName: workbook.name })
     }
   }
-  await hydrateProcessCursor(config).catch(() => lastAction())
-  attachLastAction(lastAction())
   const live = getProcessJob()
   const requested = focus && focus !== 'off' ? focus : undefined
   const jobFocus: ProcessFocus | undefined = requested || (!live.cancelled && (live.running || live.advancing) ? live.focus : undefined)
   const skipOcr = focus === 'off' || (!requested && (isProcessCancelled() || live.cancelled || !jobFocus))
   const watchPass = focus === 'off'
   const skipExtras = watchPass && mode === 'auto'
+  if (skipExtras) return loadScreenSnapshot(session, config)
+  await hydrateProcessCursor(config).catch(() => lastAction())
+  attachLastAction(lastAction())
   const freshFolders = mode === 'full' || (!ON_VERCEL && !skipOcr)
   const freshSheet = freshFolders && !requested
   const resumeQueue = requested !== 'agreements' && ON_VERCEL && !skipOcr && canResumeProcessQueue(jobFocus || 'all')
   if (requested === 'agreements') {
     const continuingReads = agreementReadList().length > 0
+    if (!continuingReads) agreementListStore.__fleetwiseAgreementFiles = null
     let ingest = { watching: config.agreementsName || 'agreements', attempted: 0, renamed: 0, remaining: 0, more: false, error: undefined as string | undefined, renamedFiles: [] as TypedFile[], started: true, focus: 'agreements' as const, notice: undefined as string | undefined }
     try {
-      const listed = config.agreementsId
-        ? await scanFolders(config, new Set<string>(), new Map() as SheetCells, undefined, { fresh: !continuingReads, types: ['agreement'] })
-        : { files: [] as TypedFile[] }
-      ingest = await linkHirePurchaseAgreements(config, listed.files)
+      const cachedList = agreementListStore.__fleetwiseAgreementFiles
+      if (config.agreementsId && (!cachedList || cachedList.folderId !== config.agreementsId)) {
+        const listed = await scanFolders(config, new Set<string>(), new Map() as SheetCells, undefined, { fresh: !continuingReads, types: ['agreement'] })
+        agreementListStore.__fleetwiseAgreementFiles = { folderId: config.agreementsId, files: listed.files }
+      }
+      ingest = await linkHirePurchaseAgreements(config, agreementListStore.__fleetwiseAgreementFiles?.files || [])
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Loan agreements could not be read.'
       ingest = { ...ingest, error: message, notice: message }
@@ -350,7 +514,7 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
   ])
   const covers = await loadInsuranceCovers(config).catch(() => ({} as Awaited<ReturnType<typeof loadInsuranceCovers>>))
   const registerVehicles = attachInsurance(vehicles.length ? vehicles : preview.vehicles, covers)
-  if (!skipOcr && Object.keys(covers).length) await saveCoverDates(covers).catch(() => {})
+  if (!skipOcr && Object.keys(covers).length) await writeCoverDates(config, covers).catch(() => {})
   const database = await databaseStatus().catch(() => ({ configured: false, connected: false, vehicles: 0 }))
   return {
     user: { name: session.name, email: session.email, image: session.image },
@@ -377,6 +541,7 @@ export async function loadFleet(mode: 'auto' | 'full' = 'auto', closeLive = fals
       collateralStamp: ingest.collateralStamp,
       remaining: ingest.remaining || lastAction().remaining || 0,
       focus: ingest.focus || jobFocus,
+      registerStamp: registerStampFor(registerVehicles),
       lastAction: lastAction(),
       notice: ingest.notice || sheetMatchNotice(sheet.matched, ingest.renamedFiles),
       error: ingest.error || (sheet.missing.length
@@ -738,6 +903,7 @@ export async function runProcessing(focus: ProcessFocus = 'all') {
     status: 'running',
     detail: `Continuing ${processFocusLabel(focus)} from the last file`,
   })
+  clearProcessCancellation()
   attachLastAction(lastAction())
   return loadFleet('full', false, focus)
 }
@@ -1053,6 +1219,7 @@ async function rememberInsuranceCover(config: FleetConfig, plate: string, text: 
   const cover = parseInsuranceCover(text)
   if (!cover.commencement && !cover.expiry) return
   await saveInsuranceCover(config, plate, cover)
+  await writeCoverDates(config, { [plate]: cover }).catch(() => {})
 }
 
 function certificateFileId(file?: { id?: string; webViewLink?: string }) {
@@ -1099,7 +1266,7 @@ async function fillMissingCertificateCovers(config: FleetConfig, vehicles: Vehic
   })
   if (changed) {
     await saveInsuranceCovers(config, next).catch(() => {})
-    await saveCoverDates(next).catch(() => {})
+    await writeCoverDates(config, next).catch(() => {})
   }
   return next
 }
@@ -1112,6 +1279,7 @@ async function fillInsuranceCover(config: FleetConfig, file: TypedFile) {
   try {
     const cover = await readCoverFromDriveFile(file, true)
     await saveInsuranceCover(config, plate, cover)
+    await writeCoverDates(config, { [plate]: cover }).catch(() => {})
   } catch {
     // Keep the existing cover if this PDF cannot be opened on this pass.
   }

@@ -31,7 +31,7 @@ export const PROCESS_TASKS: { id: ProcessFocus; label: string; detail: string }[
   { id: 'photos', label: 'Photos only', detail: 'Rename photos that are not yet named Photos {plate}, then match each file onto the STOCK DOCUMENTS row. Files already named that way are left alone.' },
   { id: 'certificates', label: 'Insurance only', detail: 'Rename insurance files that are not yet named Insurance - {plate}, then match each file onto the STOCK DOCUMENTS row. Files already named that way are left alone.' },
   { id: 'logbooks', label: 'Logbooks only', detail: 'Rename logbooks that are not yet named {plate} - Logbook, then match each file onto the STOCK DOCUMENTS row. Files already named that way are left alone.' },
-  { id: 'agreements', label: 'Agreements only', detail: 'Read loan agreements in the agreements folder, including subfolders. Chip the latest signed PDF onto an empty Agreement Link cell. The file name stays as it is.' },
+  { id: 'agreements', label: 'Agreements only', detail: 'Read loan agreements in the agreements folder, including subfolders. Chip the latest signed PDF onto an empty Agreement Link cell. An agreement already on Agreement Link is skipped, and you are told which file was skipped. The file name stays as it is.' },
   { id: 'all', label: 'All waiting files', detail: 'Photos, insurance, logbooks, and other waiting documents. Agreement file names stay as they are.' },
   { id: 'repair-photos', label: 'Fix wrong photos', detail: 'Reopen unmatched photos only and rename them from the plate. Files already on STOCK DOCUMENTS are left alone.' },
   { id: 'repair-certificates', label: 'Fix wrong insurance', detail: 'Reopen unmatched insurance only and rename from REGISTRATION No. Files already on STOCK DOCUMENTS are left alone.' },
@@ -135,6 +135,7 @@ export function readSavedFolders() {
 }
 
 export function keepVehicles(current: FleetSnapshot | null, next: FleetSnapshot) {
+  const ingest = mergeIngest(current?.ingest, next.ingest)
   if (next.ingest?.preserve && current) {
     return {
       ...current,
@@ -142,18 +143,34 @@ export function keepVehicles(current: FleetSnapshot | null, next: FleetSnapshot)
       inbox: next.inbox.length ? next.inbox : current.inbox,
       gmailConnected: next.gmailConnected || current.gmailConnected,
       lastSync: next.lastSync || current.lastSync,
-      ingest: next.ingest,
+      ingest,
       sheetsError: next.sheetsError || current.sheetsError,
     }
   }
+  const foldersReady = next.ingest?.foldersReady !== false
   return {
     ...next,
     config: next.config || current?.config || null,
     vehicles: next.vehicles.length ? next.vehicles : current?.vehicles || [],
+    unmatched: foldersReady ? next.unmatched : current?.unmatched || [],
+    duplicates: foldersReady ? next.duplicates : current?.duplicates || [],
     stats: next.stats?.total ? next.stats : current?.stats || next.stats,
     sheetsError: next.sheetsError || current?.sheetsError,
     inbox: next.inbox.length ? next.inbox : current?.inbox || next.inbox,
     audit: next.audit.length ? next.audit : current?.audit || next.audit,
+    ingest,
+  }
+}
+
+function mergeIngest(current: FleetSnapshot['ingest'], next: FleetSnapshot['ingest']) {
+  if (!next) return current
+  const hasCollateral = Object.prototype.hasOwnProperty.call(next, 'collateralMore')
+  const hasStamp = Object.prototype.hasOwnProperty.call(next, 'collateralStamp')
+  return {
+    ...current,
+    ...next,
+    collateralMore: hasCollateral ? next.collateralMore : current?.collateralMore,
+    collateralStamp: hasStamp ? next.collateralStamp : current?.collateralStamp,
   }
 }
 

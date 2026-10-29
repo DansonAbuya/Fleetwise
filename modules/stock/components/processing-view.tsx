@@ -9,11 +9,12 @@ import { labelFor, PROCESS_TASKS, unmatchedSplitLabel } from '@/modules/stock/mo
 
 export const PROCESS_STEPS = ['queued', 'opening', 'reading', 'renaming', 'matching', 'matched'] as const
 
-export function processStageLabel(stage: string, plate?: string | null, detail?: string) {
+export function processStageLabel(stage: string, plate?: string | null, detail?: string, type?: string) {
+  const agreement = type === 'agreement'
   if (stage === 'queued') return 'Queued'
   if (stage === 'opening') return 'Opening'
-  if (stage === 'reading') return 'Reading plate'
-  if (stage === 'renaming') return 'Renaming'
+  if (stage === 'reading') return agreement ? 'Reading agreement' : 'Reading plate'
+  if (stage === 'renaming') return agreement ? 'Name kept' : 'Renaming'
   if (stage === 'matching') return 'Matching sheet'
   if (stage === 'matched') return 'Matched'
   if (stage === 'unmatched') {
@@ -50,7 +51,7 @@ export function ProcessingView({ lastSync, vehicles, unmatched, busy, configured
     liveItems.push(item)
   }
   const waitingIds = new Set<string>()
-  const waiting = unmatched.filter((file) => {
+  const waiting = agreementJob ? [] : unmatched.filter((file) => {
     if (liveIds.has(file.id) || waitingIds.has(file.id)) return false
     waitingIds.add(file.id)
     return true
@@ -68,7 +69,7 @@ export function ProcessingView({ lastSync, vehicles, unmatched, busy, configured
       <div><span className="eyebrow">{agreementJob && (advancing || live) ? 'READING AGREEMENTS' : advancing ? 'NEXT BATCH' : job?.running ? `LIVE · ${focusLabel.toUpperCase()} · BATCH ${batch}` : last?.status === 'paused' ? 'PAUSED' : 'CHOOSE A JOB'}</span>
         <h2>{agreementJob && (advancing || live) ? `Reading loan agreements${readTotal ? ` · ${readDone} of ${readTotal}` : ''}` : advancing ? `Batch ${batch} of ${focusLabel} finished — starting the next files` : job?.running ? `Reading ${focusLabel.toLowerCase()} · batch ${batch}` : last?.fileName ? `Resume from ${last.fileName}` : 'Pick what to process first'}</h2>
         <p>{agreementJob && (advancing || live)
-          ? `Checked ${readDone} of ${readTotal || readDone} PDFs. Each registration number is written to Agreement Link as it is read. Leave this page open${readRemaining ? `. ${readRemaining} still to read` : ''}.`
+          ? `Checked ${readDone} of ${readTotal || readDone} PDFs. A registration number is written to Agreement Link as it is read. An agreement already on Agreement Link is skipped, and the next file is opened.${readRemaining ? ` ${readRemaining} still to read.` : ''} Leave this page open.`
           : advancing
           ? `${job?.lastRenamed ?? ingest?.renamed ?? 0} file(s) renamed in batch ${batch}. The next ${focusLabel.toLowerCase()} batch is starting now${remaining ? ` · ${remaining} still need a plate` : ''}.`
           : live
@@ -115,7 +116,7 @@ export function ProcessingView({ lastSync, vehicles, unmatched, busy, configured
       </div>
     </section>
     <section className="panel table-panel standalone">
-      <div className="panel-heading"><div><h2>{agreementJob && (advancing || live) ? 'Checking loan agreements' : advancing ? `Starting batch ${(job?.batch || 1) + 1}` : job?.running ? `Now processing · batch ${batch}` : 'Processing queue'} {(job?.items.length || waiting.length) ? <span className="count-pill">{(job?.items.length || 0) + waiting.length}</span> : null}</h2><p>{agreementJob && (advancing || live) ? 'Each PDF keeps its file name. The registration number inside the file is matched to that plate on STOCK DOCUMENTS after every agreement has been read.' : advancing ? 'This batch is complete. The next files are being opened, read, and matched.' : job?.running ? 'Each card updates as the file is opened, read, renamed, and matched. The next batch starts when this one finishes.' : 'Drop files in the photos, insurance, logbooks, or agreements folders, then watch them here until they match a Registration Number.'}</p></div>{job?.running ? <span className="live-pill"><LoaderCircle size={14} className="spin-icon" /> Live</span> : advancing ? <span className="live-pill"><LoaderCircle size={14} className="spin-icon" /> Next batch</span> : ingest?.more ? <span className="live-pill">Next batch</span> : null}</div>
+      <div className="panel-heading"><div><h2>{agreementJob && (advancing || live) ? 'Checking loan agreements' : advancing ? `Starting batch ${(job?.batch || 1) + 1}` : job?.running ? `Now processing · batch ${batch}` : 'Processing queue'} {(job?.items.length || waiting.length) ? <span className="count-pill">{(job?.items.length || 0) + waiting.length}</span> : null}</h2><p>{agreementJob && (advancing || live) ? 'Each card updates as the PDF is opened, the registration number is read, and the chip is written on Agreement Link. The file name stays as it is.' : advancing ? 'This batch is complete. The next files are being opened, read, and matched.' : job?.running ? 'Each card updates as the file is opened, read, renamed, and matched. The next batch starts when this one finishes.' : 'Drop files in the photos, insurance, logbooks, or agreements folders, then watch them here until they match a Registration Number.'}</p></div>{job?.running ? <span className="live-pill"><LoaderCircle size={14} className="spin-icon" /> Live</span> : advancing ? <span className="live-pill"><LoaderCircle size={14} className="spin-icon" /> Next batch</span> : ingest?.more ? <span className="live-pill">Next batch</span> : null}</div>
       <div className="process-board">
         {(!job?.items.length && waiting.length === 0) ? <div className="empty-row">No files in the live queue. New photos, certificates, logbooks, and agreements appear here as they are processed.</div> : null}
         {liveItems.map((item) => {
@@ -133,11 +134,11 @@ export function ProcessingView({ lastSync, vehicles, unmatched, busy, configured
                   const doneThrough = namedOffSheet ? PROCESS_STEPS.indexOf('matching') : stepIndex
                   const current = namedOffSheet ? step === 'matching' : stepIndex === index && item.stage !== 'matched'
                   const done = failed ? index === 0 : doneThrough >= index && !current
-                  return <li key={step} className={failed ? (index === 0 ? 'is-done' : '') : current ? 'is-current' : done ? 'is-done' : ''}>{processStageLabel(step === 'matched' ? 'matched' : step)}</li>
+                  return <li key={step} className={failed ? (index === 0 ? 'is-done' : '') : current ? 'is-current' : done ? 'is-done' : ''}>{processStageLabel(step === 'matched' ? 'matched' : step, item.plate, item.detail, item.type)}</li>
                 })}
               </ol>
             </div>
-            <span className={`process-flag stage-${item.stage}`}>{item.stage === 'opening' || item.stage === 'reading' || item.stage === 'renaming' || item.stage === 'matching' ? <LoaderCircle size={14} className="spin-icon" /> : null}{processStageLabel(item.stage, item.plate, item.detail)}</span>
+            <span className={`process-flag stage-${item.stage}`}>{item.stage === 'opening' || item.stage === 'reading' || item.stage === 'renaming' || item.stage === 'matching' ? <LoaderCircle size={14} className="spin-icon" /> : null}{processStageLabel(item.stage, item.plate, item.detail, item.type)}</span>
           </article>
         })}
         {waiting.map((file) => <article className="process-card stage-unmatched" key={file.id}>

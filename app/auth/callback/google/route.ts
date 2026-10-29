@@ -11,5 +11,6 @@ export async function GET(request: NextRequest) {
   if (error || !code || !state) {
     return NextResponse.redirect(new URL('/sign-in?error=Google did not return a sign-in code. Try again.', request.url))
   }
-  await completeOauthLogin(code, state)
+  const nextPath = await completeOauthLogin(code, state)
+  return NextResponse.redirect(new URL(nextPath, request.url))
 }

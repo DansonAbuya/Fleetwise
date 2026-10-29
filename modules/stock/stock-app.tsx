@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { signOut, useSession } from '@/lib/auth-client'
-import { assignUnmatched, assignUnmatchedBatch, continueProcessing, getProcessingJob, linkPerceivedMatches, listDriveFolders, listSpreadsheets, loadFleet, loadVehiclePage, loadWorkspace, loadWorkspacePanels, ocrUnmatchedPhotos, runProcessing, saveFolderConfig, stopProcessing, syncGmail, syncRegisterToDatabase, uploadDocument } from '@/modules/stock/actions'
+import { assignUnmatched, assignUnmatchedBatch, continueProcessing, fillCollateralGaps, getProcessingJob, linkPerceivedMatches, listDriveFolders, listSpreadsheets, loadFleet, loadFolderIndex, loadVehiclePage, loadWorkspace, loadWorkspacePanels, ocrUnmatchedPhotos, runProcessing, saveFolderConfig, stopProcessing, syncGmail, syncRegisterToDatabase, syncSheetRegister, uploadDocument, warmCertificateDates } from '@/modules/stock/actions'
 import { BrandMark } from '@/modules/shared/brand-mark'
 import { coverAlertLabel, formatCoverDate } from '@/lib/insurance'
 import { processFocusLabel, type ProcessFocus } from '@/lib/process-focus'
@@ -107,6 +107,7 @@ export function StockApp() {
   const [vehicleTotal, setVehicleTotal] = useState(0)
   const [tableBusy, setTableBusy] = useState(false)
   const [recordsReady, setRecordsReady] = useState(false)
+  const [folderList, setFolderList] = useState<'loading' | 'ready'>('loading')
   const [registerTick, setRegisterTick] = useState(0)
   const [unmatchedKind, setUnmatchedKind] = useState<UnmatchedKind>('all')
   const [processJob, setProcessJob] = useState<ProcessJob | null>(null)
@@ -115,7 +116,6 @@ export function StockApp() {
   const lastBatchKey = useRef('')
   const unmatchedLenRef = useRef(0)
   const panelsLoaded = useRef(false)
-  const resumeAttempts = useRef(0)
   const [resumeTick, setResumeTick] = useState(0)
   useEffect(() => {
     setMounted(true)
@@ -156,11 +156,33 @@ export function StockApp() {
   const autoScanLock = useRef(false)
   const activeRef = useRef(active)
   const moreWorkRef = useRef(false)
+  const fleetRef = useRef(fleet)
+  const registerStampRef = useRef('')
+  const processJobRef = useRef(processJob)
+  const continueAgreementsRef = useRef(() => {})
+  const chainGen = useRef(0)
+  const chainHeldAt = useRef(0)
+  const lastAgreementSnap = useRef(0)
   activeRef.current = active
+  fleetRef.current = fleet
+  processJobRef.current = processJob
+
+  function agreementStillOpen() {
+    const ingest = fleetRef.current?.ingest
+    const action = ingest?.lastAction
+    const job = processJobRef.current
+    const remaining = action?.remaining || ingest?.remaining || job?.remaining || 0
+    const agreement = action?.focus === 'agreements' || ingest?.focus === 'agreements' || job?.focus === 'agreements'
+    const paused = Boolean(job?.cancelled || action?.status === 'paused' || (action?.status === 'done' && remaining <= 0))
+    return Boolean(agreement && !paused && (ingest?.more || job?.advancing || job?.running || action?.status === 'running') && remaining > 0)
+  }
 
   function applySnapshot(next: FleetSnapshot, ok?: string) {
-    moreWorkRef.current = Boolean(next.ingest?.more)
-    if (next.ingest?.attempted) {
+    const incomingAgreement = next.ingest?.focus === 'agreements'
+    const keepAgreement = moreWorkRef.current && agreementStillOpen() && !incomingAgreement && !next.ingest?.more
+    if (!keepAgreement) moreWorkRef.current = Boolean(next.ingest?.more)
+    if (incomingAgreement) lastAgreementSnap.current = Date.now()
+    if (next.ingest?.attempted && !keepAgreement) {
       const marker = `${next.ingest.more ? 'more' : 'done'}:${next.ingest.remaining}:${next.ingest.attempted}:${next.ingest.renamed}`
       if (marker !== lastBatchKey.current) {
         lastBatchKey.current = marker
@@ -169,26 +191,37 @@ export function StockApp() {
           const finished = batchCountRef.current
           const waiting = next.ingest.remaining ? `${next.ingest.remaining} file${next.ingest.remaining === 1 ? '' : 's'} still waiting` : 'more files are queued'
           const agreementBatch = next.ingest.focus === 'agreements'
+          const skippedLine = agreementBatch ? ((next.ingest.notice || '').match(/Skipped \d+ agreements? already on Agreement Link: [^.]+\./)?.[0] || '') : ''
           setBatchNotice(agreementBatch
-            ? `Batch ${finished} finished — read ${next.ingest.attempted} agreements. Starting batch ${finished + 1}. ${next.ingest.remaining || 0} still being checked. File names stay as they are.`
+            ? `Batch ${finished} finished — read ${next.ingest.attempted} agreements. Batch ${finished + 1} is opening now. ${next.ingest.remaining || 0} still being checked. File names stay as they are.${skippedLine ? ` ${skippedLine}` : ''}`
             : `Batch ${finished} finished — ${next.ingest.renamed} renamed of ${next.ingest.attempted}. Starting batch ${finished + 1}. ${waiting}.`)
         } else if (batchCountRef.current > 0) {
           const agreementBatch = next.ingest.focus === 'agreements'
+          const skippedLine = agreementBatch ? ((next.ingest.notice || '').match(/Skipped \d+ agreements? already on Agreement Link: [^.]+\./)?.[0] || '') : ''
           setBatchNotice(agreementBatch
-            ? `Finished checking the loan agreements. ${next.ingest.renamed} Agreement Link chip${next.ingest.renamed === 1 ? '' : 's'} written. File names were left as they are.`
+            ? `Finished checking the loan agreements. ${next.ingest.renamed} Agreement Link chip${next.ingest.renamed === 1 ? '' : 's'} written. File names were left as they are.${skippedLine ? ` ${skippedLine}` : ''}`
             : `Batch ${batchCountRef.current} finished — ${next.ingest.renamed} renamed of ${next.ingest.attempted}. No more files waiting.`)
           batchCountRef.current = 0
         }
       }
     }
-    setFleet((current) => keepVehicles(current, next))
+    setFleet((current) => {
+      if (!keepAgreement || !current?.ingest) return keepVehicles(current, next)
+      return keepVehicles(current, { ...next, ingest: current.ingest })
+    })
+    const stamp = next.ingest?.registerStamp || ''
+    if (stamp) {
+      if (registerStampRef.current && registerStampRef.current !== stamp) setRegisterTick((tick) => tick + 1)
+      registerStampRef.current = stamp
+    }
+    if (next.ingest?.foldersReady) setFolderList('ready')
+    if (keepAgreement) return
     const unmatchedCount = next.unmatched?.length || 0
     if (unmatchedCount !== unmatchedLenRef.current || next.ingest?.renamed) {
       unmatchedLenRef.current = unmatchedCount
       setRegisterTick((tick) => tick + 1)
     }
     const notice = next.ingest?.notice || ''
-    if (next.ingest?.more && next.ingest.attempted) resumeAttempts.current = 0
     if (/collateral chip/i.test(notice)) setSuccess('')
     else if (notice && next.ingest?.focus === 'agreements') setSuccess(notice)
     else if (notice) setSuccess(ok && ok !== notice ? `${ok} ${notice}` : notice)
@@ -196,13 +229,16 @@ export function StockApp() {
     else setSuccess((current) => /collateral chip/i.test(current) ? '' : current)
   }
 
-  async function runSync(loader: Promise<FleetSnapshot>, ok?: string) {
+  async function runSync(loader: Promise<FleetSnapshot>, ok?: string, gen = chainGen.current) {
     autoScanLock.current = true
+    chainHeldAt.current = Date.now()
     setError('')
     try {
       let next = await loader
       let failures = 0
-      while (true) {
+      while (gen === chainGen.current) {
+        lastAgreementSnap.current = Date.now()
+        chainHeldAt.current = Date.now()
         applySnapshot(next, ok)
         ok = undefined
         if (!next.ingest?.more) break
@@ -211,17 +247,16 @@ export function StockApp() {
           failures = 0
         } catch (err) {
           failures += 1
-          if (failures > 2) throw err
+          if (failures > 2 || gen !== chainGen.current) throw err
           await new Promise((resolve) => setTimeout(resolve, 2000))
         }
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to load Drive')
+      if (gen === chainGen.current) setError(err instanceof Error ? err.message : 'Unable to load Drive')
     } finally {
-      autoScanLock.current = false
-      if (moreWorkRef.current && resumeAttempts.current < 4) {
-        resumeAttempts.current += 1
-        setResumeTick((tick) => tick + 1)
+      if (gen === chainGen.current) {
+        autoScanLock.current = false
+        if (moreWorkRef.current) setResumeTick((tick) => tick + 1)
       }
     }
   }
@@ -236,6 +271,17 @@ export function StockApp() {
     } finally {
       if (wait) setBusy('')
     }
+  }
+
+  continueAgreementsRef.current = () => {
+    if (!user || !agreementStillOpen()) return
+    const quietFor = Date.now() - Math.max(chainHeldAt.current, lastAgreementSnap.current)
+    const stale = autoScanLock.current && quietFor > 90000
+    if (autoScanLock.current && !stale) return
+    if (stale) chainGen.current += 1
+    autoScanLock.current = true
+    chainHeldAt.current = Date.now()
+    void refresh(continueProcessing(), undefined, false)
   }
 
   const restoredFolders = useRef(false)
@@ -305,33 +351,115 @@ export function StockApp() {
     return () => window.clearInterval(timer)
   }, [user])
   useEffect(() => {
-    if (!user || !fleet?.ingest?.collateralMore) return
+    if (!user || !recordsReady) return
     let cancelled = false
-    async function fillCollateral() {
-      const idle = String(fleet?.ingest?.collateralStamp || '').startsWith('0:0:')
-      await new Promise((resolve) => setTimeout(resolve, idle ? 20000 : 800))
-      if (cancelled || document.hidden || moreWorkRef.current) return
-      if (autoScanLock.current) return
-      autoScanLock.current = true
+    let warming = false
+    let peeked = false
+    async function warmRecords() {
+      if (warming || autoScanLock.current) return
+      warming = true
       try {
-        const next = await loadFleet('auto', false, 'off')
-        if (!cancelled) applySnapshot(next)
-      } catch {
-        // The next pass retries any registration numbers that are still missing a chip.
+        const listing = moreWorkRef.current || agreementStillOpen()
+          ? Promise.resolve()
+          : loadFolderIndex().then((data) => {
+            if (cancelled) return
+            setFolderList('ready')
+            setFleet((current) => current ? { ...current, unmatched: data.unmatched, duplicates: data.duplicates } : current)
+          }).catch(() => { if (!cancelled) setFolderList('ready') })
+        if (!peeked) {
+          peeked = true
+          try {
+            const job = await getProcessingJob()
+            if (!cancelled) {
+              const action = job.lastAction
+              if (action?.focus === 'agreements' && action.status === 'running' && (action.remaining || 0) > 0) {
+                moreWorkRef.current = true
+                setProcessJob(job)
+                setFleet((current) => current ? {
+                  ...current,
+                  ingest: {
+                    ...(current.ingest || { watching: '', attempted: 0, renamed: 0 }),
+                    more: true,
+                    remaining: action.remaining,
+                    focus: 'agreements',
+                    lastAction: action,
+                  },
+                } : current)
+              }
+            }
+          } catch {
+            // The register is already on screen. A later Processing visit hydrates the job.
+          }
+        }
+        await listing
+        if (cancelled || autoScanLock.current || moreWorkRef.current || agreementStillOpen()) return
+        try {
+          const dates = await warmCertificateDates()
+          if (!cancelled && dates.updated) setRegisterTick((tick) => tick + 1)
+        } catch {
+          // Stored commencement and expiry stay on the register.
+        }
+        if (cancelled || autoScanLock.current || moreWorkRef.current || agreementStillOpen()) return
+        try {
+          let more = true
+          while (more && !cancelled && !autoScanLock.current && !moreWorkRef.current && !agreementStillOpen()) {
+            const result = await fillCollateralGaps()
+            more = result.more
+          }
+        } catch {
+          // Empty collateral cells are retried on the next pass.
+        }
       } finally {
-        autoScanLock.current = false
+        warming = false
       }
     }
-    void fillCollateral()
-    return () => { cancelled = true }
-  }, [user, fleet?.ingest?.collateralMore, fleet?.ingest?.collateralStamp])
+    void warmRecords()
+    const timer = window.setInterval(() => { void warmRecords() }, 10 * 60 * 1000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [user, recordsReady])
   useEffect(() => {
-    const agreementOpen = fleet?.ingest?.lastAction?.focus === 'agreements' && fleet.ingest.lastAction.status === 'running' && (fleet.ingest.lastAction.remaining || 0) > 0
-    const more = Boolean(fleet?.ingest?.more || processJob?.advancing || agreementOpen)
-    const paused = processJob?.cancelled || fleet?.ingest?.lastAction?.status === 'paused' || (fleet?.ingest?.lastAction?.status === 'done' && !agreementOpen)
-    if (!user || !more || paused || autoScanLock.current) return
-    refresh(continueProcessing(), undefined, false)
-  }, [user, fleet?.ingest?.more, fleet?.ingest?.lastAction?.status, fleet?.ingest?.lastAction?.remaining, fleet?.ingest?.lastAction?.focus, processJob?.advancing, processJob?.focus, fleet?.ingest?.focus, resumeTick])
+    if (!user || !recordsReady) return
+    let cancelled = false
+    let running = false
+    const lastAt = { current: 0 }
+    const SHEET_DB_SYNC_MS = 5 * 60 * 1000
+    async function syncSheet() {
+      if (cancelled || running || document.hidden) return
+      if (moreWorkRef.current || agreementStillOpen()) return
+      running = true
+      try {
+        const result = await syncSheetRegister()
+        lastAt.current = Date.now()
+        if (!cancelled && result.updated) setRegisterTick((tick) => tick + 1)
+      } catch {
+        // The register stays on the last copy. The next interval tries again.
+      } finally {
+        running = false
+      }
+    }
+    void syncSheet()
+    const timer = window.setInterval(() => { void syncSheet() }, SHEET_DB_SYNC_MS)
+    function onVisible() {
+      if (!document.hidden && Date.now() - lastAt.current >= SHEET_DB_SYNC_MS) void syncSheet()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [user, recordsReady])
+  useEffect(() => {
+    continueAgreementsRef.current()
+  }, [user, fleet?.ingest?.more, fleet?.ingest?.lastAction?.status, fleet?.ingest?.lastAction?.remaining, fleet?.ingest?.lastAction?.focus, processJob?.advancing, processJob?.cancelled, resumeTick])
+  useEffect(() => {
+    if (!user) return
+    const timer = window.setInterval(() => continueAgreementsRef.current(), 2000)
+    return () => window.clearInterval(timer)
+  }, [user])
   useEffect(() => {
     if (fleet && !fleet.config && active !== 'Settings') go('Settings', true)
   }, [fleet, active])
@@ -390,7 +518,7 @@ export function StockApp() {
     setSuccess((current) => current && current !== growth ? `${growth} ${current}` : growth)
   }, [mounted, vehicleCount, newPlatesKey])
   useEffect(() => {
-    if (!spreadsheetId) return
+    if (!spreadsheetId || !recordsReady) return
     if (active !== 'Overview' && active !== 'Vehicles') return
     let cancelled = false
     const page = active === 'Overview' ? registerPage : vehiclePage
@@ -421,7 +549,7 @@ export function StockApp() {
       cancelled = true
       window.clearTimeout(timer)
     }
-  }, [active, query, statusFilter, brandFilter, missingKey, vehiclePage, registerPage, vehiclePageSize, spreadsheetId, registerTick])
+  }, [active, query, statusFilter, brandFilter, missingKey, vehiclePage, registerPage, vehiclePageSize, spreadsheetId, registerTick, recordsReady])
   useEffect(() => {
     if (!user) return
     const live = Boolean(processJob?.running || processJob?.advancing || fleet?.ingest?.more)
@@ -587,7 +715,9 @@ export function StockApp() {
         {active === 'Insurance inbox' && <InboxView kind="certificate" inbox={insuranceInbox} config={fleet?.config ?? null} gmailConnected={Boolean(fleet?.gmailConnected)} ocrConfigured={Boolean(fleet?.ocrConfigured)} busy={Boolean(busy)} onSync={() => refresh(syncGmail(), 'Insurance and logbook mailboxes checked.')} onAssign={(input) => refresh(assignUnmatched(input), `Assigned ${input.plate}.`)} />}
         {active === 'Logbook inbox' && <InboxView kind="logbook" inbox={logbookInbox} config={fleet?.config ?? null} gmailConnected={Boolean(fleet?.gmailConnected)} ocrConfigured={Boolean(fleet?.ocrConfigured)} busy={Boolean(busy)} onSync={() => refresh(syncGmail(), 'Insurance and logbook mailboxes checked.')} onAssign={(input) => refresh(assignUnmatched(input), `Assigned ${input.plate}.`)} />}
         {active === 'Processing' && <ProcessingView lastSync={fleet?.lastSync} vehicles={vehicleCount} unmatched={unmatched} busy={Boolean(busy)} configured={configured} ocrConfigured={Boolean(fleet?.ocrConfigured)} ingest={fleet?.ingest} job={processJob} photosFolder={fleet?.config?.photosName} certificatesFolder={fleet?.config?.certificatesName} logbooksFolder={fleet?.config?.logbooksName} agreementsFolder={fleet?.config?.agreementsName} onScan={() => refresh(loadFleet('full', false, 'off'), 'Folders scanned. No OCR ran — start photos, insurance, logbooks, agreements, or fix wrong plates below.')} onGmail={() => refresh(syncGmail(), 'Insurance and logbook mailboxes checked.')} onOcr={() => refresh(ocrUnmatchedPhotos(), 'Read plates from unmatched photos, insurance, logbook, and agreement files.', false)} onStart={async (focus) => { if ((processJob?.running || processJob?.advancing) && processJob.focus && processJob.focus !== focus) await stopProcessing(); const prior = processJob?.lastAction || fleet?.ingest?.lastAction; const resume = prior?.focus === focus && (prior.status === 'paused' || prior.status === 'running'); setProcessJob((current) => ({ running: true, watching: current?.watching || '', attempted: current?.attempted || 0, done: current?.done || 0, matched: current?.matched || 0, failed: current?.failed || 0, batch: current?.batch || 1, remaining: current?.remaining || 0, lastRenamed: current?.lastRenamed || 0, advancing: false, focus, items: current?.items || [], lastAction: current?.lastAction || prior })); return refresh(runProcessing(focus), resume ? `Continuing ${processFocusLabel(focus)} from ${prior?.fileName || 'the last file'}.` : `Started ${processFocusLabel(focus)}. Stop to pause; start the same job to continue from there.`, false) }} onStop={async () => { const next = await stopProcessing(); setProcessJob(next); moreWorkRef.current = false; setFleet((current) => current?.ingest ? { ...current, ingest: { ...current.ingest, more: false, remaining: next.lastAction?.remaining || current.ingest.remaining, lastAction: next.lastAction } } : current); setBusy(''); setBatchNotice(''); setSuccess(next.lastAction?.fileName ? `Paused after ${next.lastAction.fileName}. Start the same job to continue.` : 'Paused. Start the same job to continue from this point.') }} onLinkSheet={(type) => refresh(linkPerceivedMatches(type))} />}
+        {active === 'Unmatched' && folderList === 'loading' && !unmatched.length && <div className="busy-banner" role="status">Loading files from the photo, insurance, and logbook folders.</div>}
         {active === 'Unmatched' && <UnmatchedView files={unmatched} category={unmatchedKind} onCategory={setUnmatchedKind} busy={Boolean(busy)} ocrConfigured={Boolean(fleet?.ocrConfigured)} onAssign={(input) => refresh(assignUnmatched(input), `Assigned ${input.plate}.`)} onAssignMany={(inputs) => refresh(assignUnmatchedBatch(inputs), `Assigned ${inputs.length} registration number${inputs.length === 1 ? '' : 's'}.`)} onOcr={(fileId) => refresh(ocrUnmatchedPhotos(fileId), fileId ? 'Read plate from file.' : 'Read plates from unmatched photos, insurance, logbook, and agreement files.', false)} />}
+        {active === 'Duplicates' && folderList === 'loading' && !duplicates.length && <div className="busy-banner" role="status">Loading files from the photo, insurance, and logbook folders.</div>}
         {active === 'Duplicates' && <DuplicatesView files={duplicates} />}
         {active === 'Audit log' && <AuditView events={fleet?.audit || []} onExport={() => exportAudit(fleet?.audit || [])} />}
         {active === 'Settings' && <SettingsView fleet={fleet} firstRun={!configured} busy={Boolean(busy)} onSave={(input) => { writeSavedFolders(input); return refresh(saveFolderConfig(input), 'Folder and sheet configuration saved.') }} onImportDatabase={() => refresh(syncRegisterToDatabase(), 'STOCK DOCUMENTS tab on Fleet Assets - KE copied into Neon.')} onBrowse={listDriveFolders} onBrowseSheets={listSpreadsheets} />}

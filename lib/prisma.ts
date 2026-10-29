@@ -16,13 +16,23 @@ export function prisma() {
   return globalForPrisma.prisma
 }
 
+const statusStore = globalThis as typeof globalThis & { __fleetwiseDbStatus?: { at: number; status: { configured: boolean; connected: boolean; vehicles: number } } }
+
+export function clearDatabaseStatusCache() {
+  statusStore.__fleetwiseDbStatus = undefined
+}
+
 export async function databaseStatus() {
   if (!databaseConfigured()) {
     return { configured: false, connected: false, vehicles: 0 }
   }
+  const cached = statusStore.__fleetwiseDbStatus
+  if (cached && Date.now() - cached.at < 30_000) return cached.status
   try {
     const vehicles = await prisma().vehicle.count()
-    return { configured: true, connected: true, vehicles }
+    const status = { configured: true, connected: true, vehicles }
+    statusStore.__fleetwiseDbStatus = { at: Date.now(), status }
+    return status
   } catch {
     return { configured: true, connected: false, vehicles: 0 }
   }

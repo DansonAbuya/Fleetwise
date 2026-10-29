@@ -1,5 +1,4 @@
 import { cookies } from 'next/headers'
-import { redirect } from 'next/navigation'
 import { exchangeGoogleCode, fetchGoogleProfile, requestOrigin } from '@/lib/google'
 import { getSession, setSession } from '@/lib/session'
 
@@ -9,7 +8,7 @@ export type OauthState = { state: string; origin: string }
 
 export async function completeOauthLogin(code: string, state: string) {
   const existing = await getSession()
-  if (existing) redirect('/')
+  if (existing) return '/'
   const jar = await cookies()
   let expected: OauthState | null = null
   try {
@@ -18,7 +17,7 @@ export async function completeOauthLogin(code: string, state: string) {
     expected = null
   }
   if (!code || !state || !expected?.state || state !== expected.state) {
-    redirect('/sign-in?error=Sign-in expired. Click Continue with Google again.')
+    return '/sign-in?error=Sign-in expired. Click Continue with Google again.'
   }
   try {
     const origin = expected.origin || await requestOrigin()
@@ -34,8 +33,12 @@ export async function completeOauthLogin(code: string, state: string) {
       expiresAt: Math.floor(Date.now() / 1000) + (tokens.expires_in || 3600) - 60,
     })
     jar.delete(OAUTH_STATE_COOKIE)
+    return '/'
   } catch (err) {
-    redirect(`/sign-in?error=${encodeURIComponent(err instanceof Error ? err.message : 'Google sign-in failed.')}`)
+    const message = err instanceof Error ? err.message : 'Google sign-in failed.'
+    const readable = /fetch failed|empty response|unreadable response|network/i.test(message)
+      ? 'Could not reach Google. Check the network and click Continue with Google again.'
+      : message
+    return `/sign-in?error=${encodeURIComponent(readable)}`
   }
-  redirect('/')
 }

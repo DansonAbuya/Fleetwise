@@ -353,6 +353,359 @@ function agreementRegistration(text) {
   return parseKenyanPlate(glued?.[1] || '') || null
 }
 
+function repairHandPlate(raw) {
+  const compact = String(raw || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
+  const exact = exactPlate(compact, 16)
+  if (exact && exact.length === compact.length) return exact
+  if (compact.length !== 8 && compact.length !== 7) return ''
+  const prefix = compact.length === 8 ? 3 : 2
+  const toLetter = (ch) => (/[A-Z]/.test(ch) ? ch : ch === '0' ? 'O' : ch === '1' ? 'I' : ch === '5' ? 'S' : ch === '6' ? 'G' : ch === '8' ? 'B' : '')
+  const toDigit = (ch) => (/[0-9]/.test(ch) ? ch : ch === 'O' || ch === 'Q' || ch === 'D' ? '0' : ch === 'I' || ch === 'L' ? '1' : ch === 'Z' ? '2' : ch === 'S' ? '5' : ch === 'G' ? '6' : ch === 'B' ? '8' : '')
+  let cost = 0
+  const chars = compact.split('')
+  for (let i = 1; i <= prefix; i++) {
+    const next = toLetter(chars[i])
+    if (!next) return ''
+    if (next !== chars[i]) cost += 1
+    chars[i] = next
+  }
+  for (let i = prefix + 1; i <= prefix + 3; i++) {
+    const next = toDigit(chars[i])
+    if (!next) return ''
+    if (next !== chars[i]) cost += 1
+    chars[i] = next
+  }
+  const last = toLetter(chars[chars.length - 1])
+  if (!last) return ''
+  if (last !== chars[chars.length - 1]) cost += 1
+  chars[chars.length - 1] = last
+  if (cost > 1) return ''
+  return chars.join('')
+}
+
+function exactPlate(raw, max = 32) {
+  const compact = String(raw || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
+  if (!compact || compact.length > max) return ''
+  return compact.match(/K[A-Z]{3}\d{3}[A-Z]|K[A-Z]{2}\d{3}[A-Z]/)?.[0] || ''
+}
+
+function agreementPlate(text) {
+  return agreementRegistration(text) || plateFromRegistrationField(text, true) || labeledExactPlate(text) || ''
+}
+
+function labeledExactPlate(text) {
+  const flat = String(text || '').replace(/\s+/g, ' ')
+  const labels = [
+    /account\s*number\s*[:.]?\s*([A-Z0-9][A-Z0-9 .\-]{3,28})/i,
+    /(?:electric\s+)?motorbike\s*[:.]?\s*([A-Z0-9][A-Z0-9 .\-]{3,28})/i,
+  ]
+  for (const label of labels) {
+    const plate = exactPlate(label.exec(flat)?.[1] || '')
+    if (plate) return plate
+  }
+  return ''
+}
+
+function pageWords(data) {
+  const words = []
+  for (const block of data.blocks || []) {
+    for (const para of block.paragraphs || []) {
+      for (const line of para.lines || []) {
+        for (const word of line.words || []) {
+          if (word?.text && word.bbox) words.push(word)
+        }
+      }
+    }
+  }
+  return words
+}
+
+function sameInkLine(a, b) {
+  return Math.abs((a?.bbox?.y0 || 0) - (b?.bbox?.y0 || 0)) < 22
+}
+
+function plateAnchors(words) {
+  const anchors = []
+  for (let i = 0; i < words.length; i++) {
+    const text = String(words[i].text || '')
+    const next = words[i + 1]
+    if (/^reg(?:istration)?\.?$/i.test(text) && next && /^(?:no|number|num|mark)\.?$/i.test(next.text) && sameInkLine(words[i], next)) {
+      anchors.push({ kind: 'registration', word: next })
+    } else if (/^account$/i.test(text) && next && /^numbers?\.?$/i.test(next.text) && sameInkLine(words[i], next)) {
+      anchors.push({ kind: 'account', word: next })
+    } else if (/motorbike|motorcycle/i.test(text)) {
+      anchors.push({ kind: 'bike', word: words[i] })
+    }
+  }
+  const rank = { registration: 0, account: 1, bike: 2 }
+  anchors.sort((a, b) => rank[a.kind] - rank[b.kind])
+  let bikes = 0
+  return anchors.filter((anchor) => {
+    if (anchor.kind !== 'bike') return true
+    bikes += 1
+    return bikes <= 3
+  })
+}
+
+async function mostlyBlankPage(png) {
+  try {
+    const { data } = await sharp(png).resize(40, 40, { fit: 'fill' }).grayscale().raw().toBuffer({ resolveWithObject: true })
+    let dark = 0
+    for (const value of data) if (value < 245) dark += 1
+    return dark < data.length * 0.012
+  } catch {
+    return false
+  }
+}
+
+function blueInkPng(png) {
+  return sharp(png).ensureAlpha().raw().toBuffer({ resolveWithObject: true }).then(async ({ data, info }) => {
+    const out = Buffer.alloc(data.length)
+    let ink = 0
+    for (let i = 0; i < data.length; i += 4) {
+      const r = data[i]
+      const g = data[i + 1]
+      const b = data[i + 2]
+      const mark = b > 55 && b > r + 15 && b + 8 >= g
+      const v = mark ? 0 : 255
+      if (mark) ink += 1
+      out[i] = out[i + 1] = out[i + 2] = v
+      out[i + 3] = 255
+    }
+    if (ink < 25) return null
+    return sharp(out, { raw: { width: info.width, height: info.height, channels: 4 } }).png().toBuffer()
+  }).catch(() => null)
+}
+
+function inkSpans(data, width, height, channels) {
+  const spans = []
+  let start = -1
+  for (let x = 0; x <= width; x++) {
+    let dark = 0
+    if (x < width) {
+      for (let y = 0; y < height; y++) {
+        if (data[(y * width + x) * channels] < 140) dark += 1
+      }
+    }
+    const marked = dark > 1
+    if (marked && start < 0) start = x
+    if (!marked && start >= 0) {
+      if (x - start > 2) spans.push([start, x])
+      start = -1
+    }
+  }
+  return spans
+}
+
+async function tightInk(png) {
+  const raw = await sharp(png).ensureAlpha().raw().toBuffer({ resolveWithObject: true })
+  const { width, height, channels } = raw.info
+  let minX = width
+  let minY = height
+  let maxX = 0
+  let maxY = 0
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (raw.data[(y * width + x) * channels] < 140) {
+        if (x < minX) minX = x
+        if (y < minY) minY = y
+        if (x > maxX) maxX = x
+        if (y > maxY) maxY = y
+      }
+    }
+  }
+  if (maxX <= minX || maxY <= minY) return null
+  const pad = 10
+  const left = Math.max(0, minX - pad)
+  const top = Math.max(0, minY - pad)
+  const cropWidth = Math.min(width - left, maxX - minX + 1 + pad * 2)
+  const cropHeight = Math.min(height - top, maxY - minY + 1 + pad * 2)
+  if (cropWidth < 8 || cropHeight < 8) return null
+  return sharp(png).extract({ left, top, width: cropWidth, height: cropHeight }).png().toBuffer()
+}
+
+function slotClass(index, length) {
+  const digits = length >= 8 ? [4, 5, 6] : [3, 4, 5]
+  return digits.includes(index) ? 'digit' : 'letter'
+}
+
+function charClass(ch) {
+  if (/[0-9]/.test(ch)) return 'digit'
+  if (/[A-Z]/.test(ch)) return 'letter'
+  return ''
+}
+
+async function digitByShape(png) {
+  try {
+    const raw = await sharp(png).ensureAlpha().raw().toBuffer({ resolveWithObject: true })
+    const { width, height, channels } = raw.info
+    const rows = []
+    for (let y = 0; y < height; y++) {
+      let dark = 0
+      let left = width
+      let right = 0
+      for (let x = 0; x < width; x++) {
+        if (raw.data[(y * width + x) * channels] < 140) {
+          dark += 1
+          if (x < left) left = x
+          if (x > right) right = x
+        }
+      }
+      if (dark >= 3) rows.push(right - left)
+    }
+    if (rows.length < 8) return ''
+    const glyph = Math.max(...rows)
+    const third = Math.floor(rows.length / 3)
+    const mean = (part) => part.reduce((sum, span) => sum + span, 0) / part.length
+    const top = mean(rows.slice(0, third))
+    const mid = mean(rows.slice(third, third * 2))
+    const bottom = rows.slice(third * 2)
+    const bot = mean(bottom)
+    const full = bottom.filter((span) => span > glyph * 0.72).length / bottom.length
+    const waist = mid < top * 0.6 && mid < bot * 0.75
+    if (waist && full < 0.45) return '3'
+    if (full >= 0.45) return '2'
+    return ''
+  } catch {
+    return ''
+  }
+}
+
+async function ocrGlyph(worker, png) {
+  const image = await sharp(png)
+    .resize({ height: 140, kernel: 'lanczos3' })
+    .threshold(160)
+    .extend({ top: 14, bottom: 14, left: 14, right: 14, background: '#ffffff' })
+    .withMetadata({ density: 300 })
+    .png()
+    .toBuffer()
+  await worker.setParameters({
+    tessedit_pageseg_mode: '10',
+    tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+  })
+  const { data } = await worker.recognize(image)
+  const text = String(data.text || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
+  return text.length === 1 ? text : ''
+}
+
+async function splitTouchingPlate(worker, png, lineText) {
+  const compact = String(lineText || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
+  const raw = await sharp(png).ensureAlpha().raw().toBuffer({ resolveWithObject: true })
+  const spans = inkSpans(raw.data, raw.info.width, raw.info.height, raw.info.channels)
+  if (spans.length < 2 || compact.length !== spans.length + 1) return compact
+  const widths = spans.map(([start, end]) => end - start)
+  const median = widths.slice().sort((a, b) => a - b)[Math.floor(widths.length / 2)] || 1
+  const wideAt = widths.findIndex((width) => width > median * 1.55)
+  if (wideAt < 0) return compact
+  const [start, end] = spans[wideAt]
+  let valley = start + Math.floor((end - start) / 2)
+  let least = Number.POSITIVE_INFINITY
+  const from = start + Math.floor((end - start) * 0.35)
+  const to = start + Math.floor((end - start) * 0.65)
+  for (let x = from; x <= to; x++) {
+    let dark = 0
+    for (let y = 0; y < raw.info.height; y++) {
+      if (raw.data[(y * raw.info.width + x) * raw.info.channels] < 140) dark += 1
+    }
+    if (dark < least) {
+      least = dark
+      valley = x
+    }
+  }
+  if (valley <= start + 2 || valley >= end - 2) return compact
+  const left = await sharp(png).extract({ left: start, top: 0, width: valley - start, height: raw.info.height }).png().toBuffer()
+  const right = await sharp(png).extract({ left: valley, top: 0, width: end - valley, height: raw.info.height }).png().toBuffer()
+  const chars = compact.split('')
+  const images = [left, right]
+  const halves = []
+  for (let offset = 0; offset < images.length; offset++) {
+    const index = wideAt + offset
+    const shaped = slotClass(index, compact.length) === 'digit' ? await digitByShape(images[offset]) : ''
+    halves.push(shaped || await ocrGlyph(worker, images[offset]))
+  }
+  halves.forEach((glyph, offset) => {
+    const index = wideAt + offset
+    if (!glyph || index >= chars.length) return
+    if (charClass(glyph) !== slotClass(index, chars.length)) return
+    chars[index] = glyph
+  })
+  return chars.join('')
+}
+
+async function readPlateCrop(worker, png) {
+  const tight = await tightInk(png)
+  if (!tight) return ''
+  const lineImage = await sharp(tight).resize({ height: 180, kernel: 'lanczos3' }).threshold(180).withMetadata({ density: 300 }).png().toBuffer()
+  await worker.setParameters({
+    tessedit_pageseg_mode: '7',
+    tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+  })
+  const { data } = await worker.recognize(lineImage)
+  const line = String(data.text || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
+  if (!line) return ''
+  const corrected = await splitTouchingPlate(worker, tight, line).catch(() => line)
+  return repairHandPlate(corrected) || repairHandPlate(line)
+}
+
+async function plateBesideLabels(worker, png, words) {
+  const meta = await sharp(png).metadata()
+  const width = meta.width || 0
+  const height = meta.height || 0
+  if (!width || !height) return ''
+  for (const anchor of plateAnchors(words)) {
+    const box = anchor.word.bbox
+    const band = Math.max(24, box.y1 - box.y0)
+    const top = Math.max(0, box.y0 - Math.round(band * 1.6))
+    const bottom = Math.min(height, box.y1 + Math.round(band * 2))
+    const left = Math.min(width - 12, box.x1 + 2)
+    const cropWidth = Math.min(width - left, Math.round(band * 16))
+    const cropHeight = bottom - top
+    if (cropWidth < 24 || cropHeight < 16) continue
+    const crop = await sharp(png).extract({ left, top, width: cropWidth, height: cropHeight }).png().toBuffer()
+    const ink = await blueInkPng(crop)
+    const fromInk = ink ? await readPlateCrop(worker, ink) : ''
+    if (fromInk) return fromInk
+    const printed = await readPlateCrop(worker, crop)
+    if (printed) return printed
+  }
+  return ''
+}
+
+async function ocrScannedAgreement(pdf, canvasFactory) {
+  const started = Date.now()
+  const pageCount = Math.min(pdf.numPages || 0, 8)
+  let worker = null
+  let foundDate = ''
+  try {
+    for (let n = 1; n <= pageCount; n += 1) {
+      if (Date.now() - started > 30000) break
+      try {
+        const page = await pdf.getPage(n)
+        const base = page.getViewport({ scale: 1 })
+        const longest = Math.max(base.width, base.height) || 1
+        const png = await rasterPage(page, canvasFactory, Math.min(2, 1700 / longest))
+        if (!png || await mostlyBlankPage(png)) continue
+        const prepared = await sharp(png).withMetadata({ density: 180 }).png().toBuffer()
+        if (!worker) worker = await acquireWorker()
+        await worker.setParameters({
+          tessedit_pageseg_mode: '6',
+          tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 -./:()#',
+        })
+        const { data } = await worker.recognize(prepared, {}, { text: true, blocks: true })
+        const plate = await plateBesideLabels(worker, prepared, pageWords(data))
+        const date = latestAgreementDate(data.text || '')
+        if (date && !foundDate) foundDate = date
+        if (plate) return { plate, date: date || foundDate }
+      } catch {
+        // Keep going. A later schedule page can still carry the registration number.
+      }
+    }
+  } finally {
+    if (worker) releaseWorker(worker)
+  }
+  return { plate: '', date: foundDate }
+}
+
 export async function inspectHirePurchase(bytes) {
   const getDocument = await loadPdfjs()
   const data = Uint8Array.from(bytes)
@@ -369,6 +722,9 @@ export async function inspectHirePurchase(bytes) {
   }).promise
   const texts = []
   let signed = false
+  let plate = ''
+  let date = ''
+  const canvasFactory = new NodeCanvasFactory()
   try {
     for (let n = 1; n <= pdf.numPages; n += 1) {
       const page = await pdf.getPage(n)
@@ -378,6 +734,14 @@ export async function inspectHirePurchase(bytes) {
       const annotations = await page.getAnnotations().catch(() => [])
       if (annotations.some((item) => /ink|sig|stamp/i.test(`${item.subtype || ''} ${item.fieldType || ''}`))) signed = true
     }
+    const text = texts.filter(Boolean).join('\n')
+    plate = agreementPlate(text)
+    date = latestAgreementDate(text)
+    if (!plate) {
+      const scanned = await ocrScannedAgreement(pdf, canvasFactory)
+      if (scanned.plate) plate = scanned.plate
+      if (!date && scanned.date) date = scanned.date
+    }
   } finally {
     try {
       pdf.cleanup?.()
@@ -386,11 +750,10 @@ export async function inspectHirePurchase(bytes) {
     }
   }
   const text = texts.filter(Boolean).join('\n')
-  const plate = agreementRegistration(text)
   return JSON.stringify({
-    plate,
+    plate: plate || null,
     signed,
-    date: latestAgreementDate(text),
+    date,
     ...(plate ? {} : { text: text.slice(0, 20000) }),
   })
 }

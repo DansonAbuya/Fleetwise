@@ -84,6 +84,13 @@ export function resetProcessJob() {
   job = emptyJob()
 }
 
+export function clearProcessCancellation() {
+  cancelRequested = false
+  if (job.cancelled) {
+    job = { ...job, cancelled: false, error: undefined, advancing: false }
+  }
+}
+
 export function requestProcessStop(message = 'Stopped. Choose photos, insurance, logbooks, or a fix-wrong-plates job to start next.') {
   cancelRequested = true
   generation += 1

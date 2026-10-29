@@ -148,6 +148,8 @@ export type FleetSnapshot = {
     notice?: string
     follow?: 'gmail' | 'files'
     preserve?: boolean
+    foldersReady?: boolean
+    registerStamp?: string
     lastAction?: {
       focus?: 'all' | 'photos' | 'certificates' | 'logbooks' | 'agreements' | 'repair' | 'repair-photos' | 'repair-certificates' | 'repair-logbooks' | 'repair-agreements'
       status?: string

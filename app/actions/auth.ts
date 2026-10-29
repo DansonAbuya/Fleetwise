@@ -37,7 +37,7 @@ export async function startGoogleSignIn() {
 export async function completeGoogleSignIn(formData: FormData) {
   const session = await getSession()
   if (session) redirect('/')
-  await completeOauthLogin(String(formData.get('code') || ''), String(formData.get('state') || ''))
+  redirect(await completeOauthLogin(String(formData.get('code') || ''), String(formData.get('state') || '')))
 }
 
 export async function signOutUser() {

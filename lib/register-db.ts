@@ -1,7 +1,7 @@
 import type { DocKind, Document, Vehicle } from '@prisma/client'
 import { insuranceAlerts, insuranceState, type InsuranceCover } from '@/lib/insurance'
 import { compactPlate } from '@/lib/plates'
-import { databaseConfigured, prisma } from '@/lib/prisma'
+import { databaseConfigured, clearDatabaseStatusCache, prisma } from '@/lib/prisma'
 import type { DocType, TypedFile, VehicleRecord } from '@/lib/types'
 import { attachInsurance, fleetStats, slimVehicle, type VehicleQuery } from '@/lib/vehicles'
 
@@ -9,7 +9,72 @@ type VehicleWithDocs = Vehicle & { documents: Document[] }
 
 const DOC_TYPES: DocType[] = ['logbook', 'certificate', 'photo', 'agreement']
 
-export async function importVehiclesToDatabase(vehicles: VehicleRecord[]) {
+const registerStatsStore = globalThis as typeof globalThis & {
+  __fleetwiseRegisterStats?: {
+    at: number
+    stats: ReturnType<typeof fleetStats>
+    insuranceAlerts: ReturnType<typeof insuranceAlerts>
+  }
+}
+
+const sheetSyncStore = globalThis as typeof globalThis & {
+  __fleetwiseSheetSync?: { spreadsheetId: string; modifiedTime: string }
+}
+
+export function knownSheetRevision(spreadsheetId: string) {
+  const cursor = sheetSyncStore.__fleetwiseSheetSync
+  return cursor?.spreadsheetId === spreadsheetId ? cursor.modifiedTime : ''
+}
+
+export function noteSheetRevision(spreadsheetId: string, modifiedTime: string) {
+  if (!spreadsheetId || !modifiedTime) return
+  sheetSyncStore.__fleetwiseSheetSync = { spreadsheetId, modifiedTime }
+}
+
+const SHEET_SYNC_NAME = 'fleetwise-register-sync.json'
+
+export async function storedSheetRevision(spreadsheetId: string) {
+  const memory = knownSheetRevision(spreadsheetId)
+  if (memory) return memory
+  try {
+    const { findFileByName, readJsonFile } = await import('@/lib/drive')
+    const file = await findFileByName(SHEET_SYNC_NAME)
+    if (!file) return ''
+    const data = await readJsonFile<{ spreadsheetId?: string; modifiedTime?: string }>(file.id)
+    const modifiedTime = data?.spreadsheetId === spreadsheetId ? data.modifiedTime || '' : ''
+    if (modifiedTime) noteSheetRevision(spreadsheetId, modifiedTime)
+    return modifiedTime
+  } catch {
+    return ''
+  }
+}
+
+export async function rememberSheetRevision(spreadsheetId: string, modifiedTime: string) {
+  noteSheetRevision(spreadsheetId, modifiedTime)
+  try {
+    const { findFileByName, upsertJsonFile } = await import('@/lib/drive')
+    const existing = await findFileByName(SHEET_SYNC_NAME)
+    await upsertJsonFile('root', SHEET_SYNC_NAME, { spreadsheetId, modifiedTime }, existing?.id)
+  } catch {
+    // This process still has the revision, so the next page does not copy the sheet again.
+  }
+}
+
+let registerWrite: Promise<void> = Promise.resolve()
+
+function enqueueRegisterWrite<T>(work: () => Promise<T>) {
+  const run = registerWrite.then(work, work)
+  registerWrite = run.then(() => undefined, () => undefined)
+  return run
+}
+
+export function importVehiclesToDatabase(vehicles: VehicleRecord[]) {
+  return enqueueRegisterWrite(() => importVehiclesNow(vehicles))
+}
+
+async function importVehiclesNow(vehicles: VehicleRecord[]) {
+  registerStatsStore.__fleetwiseRegisterStats = undefined
+  clearDatabaseStatusCache()
   const db = prisma()
   const unique: { plate: string; vehicle: VehicleRecord; docs: ReturnType<typeof documentsFromVehicle>; flags: ReturnType<typeof coverageFlags> }[] = []
   const seen = new Set<string>()
@@ -30,14 +95,12 @@ export async function importVehiclesToDatabase(vehicles: VehicleRecord[]) {
       create: {
         plate: item.plate,
         brand: item.vehicle.brand || '',
-        commencement: item.vehicle.insurance?.commencement || null,
-        expiry: item.vehicle.insurance?.expiry || null,
+        ...coverDates(item.vehicle, true),
         ...item.flags,
       },
       update: {
         brand: item.vehicle.brand || '',
-        commencement: item.vehicle.insurance?.commencement || null,
-        expiry: item.vehicle.insurance?.expiry || null,
+        ...coverDates(item.vehicle, false),
         ...item.flags,
       },
     })))
@@ -49,11 +112,12 @@ export async function importVehiclesToDatabase(vehicles: VehicleRecord[]) {
     })
   }
 
+  const documents = dedupeDocuments(documentRows)
   for (let index = 0; index < vehicleIds.length; index += 200) {
     await db.document.deleteMany({ where: { vehicleId: { in: vehicleIds.slice(index, index + 200) } } })
   }
-  for (let index = 0; index < documentRows.length; index += 300) {
-    await db.document.createMany({ data: documentRows.slice(index, index + 300) })
+  for (let index = 0; index < documents.length; index += 300) {
+    await db.document.createMany({ data: documents.slice(index, index + 300) })
   }
   if (unique.length) {
     await db.vehicle.deleteMany({ where: { plate: { notIn: unique.map((item) => item.plate) } } })
@@ -61,7 +125,62 @@ export async function importVehiclesToDatabase(vehicles: VehicleRecord[]) {
   return { imported: unique.length }
 }
 
-/** Write commencement and expiry onto existing vehicle rows. Does not touch Fleet Assets. */
+/** Update the plates whose sheet chips just changed. Other plates stay as they are. */
+export function rememberRegisterLinks(vehicles: VehicleRecord[]) {
+  return enqueueRegisterWrite(() => rememberRegisterLinksNow(vehicles))
+}
+
+async function rememberRegisterLinksNow(vehicles: VehicleRecord[]) {
+  if (!databaseConfigured() || !vehicles.length) return { updated: 0 }
+  registerStatsStore.__fleetwiseRegisterStats = undefined
+  const db = prisma()
+  const unique: { plate: string; vehicle: VehicleRecord; docs: ReturnType<typeof documentsFromVehicle>; flags: ReturnType<typeof coverageFlags> }[] = []
+  const seen = new Set<string>()
+  for (const vehicle of vehicles) {
+    const plate = compactPlate(vehicle.plate)
+    if (!plate || seen.has(plate)) continue
+    seen.add(plate)
+    const docs = documentsFromVehicle(vehicle)
+    unique.push({ plate, vehicle, docs, flags: coverageFlags(docs) })
+  }
+  const vehicleIds: string[] = []
+  const documentRows: { vehicleId: string; type: DocKind; driveFileId: string; name: string; webViewLink?: string }[] = []
+  for (let index = 0; index < unique.length; index += 20) {
+    const batch = unique.slice(index, index + 20)
+    const rows = await Promise.all(batch.map((item) => db.vehicle.upsert({
+      where: { plate: item.plate },
+      create: {
+        plate: item.plate,
+        brand: item.vehicle.brand || '',
+        ...coverDates(item.vehicle, true),
+        ...item.flags,
+      },
+      update: {
+        brand: item.vehicle.brand || '',
+        ...coverDates(item.vehicle, false),
+        ...item.flags,
+      },
+    })))
+    rows.forEach((row, offset) => {
+      vehicleIds.push(row.id)
+      for (const doc of batch[offset].docs) documentRows.push({ ...doc, vehicleId: row.id })
+    })
+  }
+  const documents = dedupeDocuments(documentRows)
+  if (vehicleIds.length) {
+    await db.document.deleteMany({ where: { vehicleId: { in: vehicleIds } } })
+  }
+  if (documents.length) await db.document.createMany({ data: documents })
+  return { updated: unique.length }
+}
+
+function dedupeDocuments<T extends { vehicleId: string; type: DocKind }>(rows: T[]) {
+  const byKey = new Map<string, T>()
+  for (const row of rows) byKey.set(`${row.vehicleId}:${row.type}`, row)
+  return [...byKey.values()]
+}
+
+/** Write commencement and expiry onto existing vehicle rows. Sheet cells are updated by writeCoverDates. */
 export async function saveCoverDates(covers: Record<string, InsuranceCover>) {
   if (!databaseConfigured()) return { updated: 0 }
   const entries = Object.entries(covers).flatMap(([plate, cover]) => {
@@ -90,16 +209,23 @@ export async function loadRegisterFromDatabase(input: VehicleQuery = {}, covers:
   const db = prisma()
   const pageSize = Math.min(100, Math.max(10, input.pageSize || 25))
   const where = registerWhere(input)
-  const [total, rows, all] = await Promise.all([
+  const requested = Math.max(1, input.page || 1)
+  const [total, rows] = await Promise.all([
     db.vehicle.count({ where }),
     db.vehicle.findMany({
       where,
       include: { documents: true },
       orderBy: { plate: 'asc' },
-      skip: (Math.max(1, input.page || 1) - 1) * pageSize,
+      skip: (requested - 1) * pageSize,
       take: pageSize,
     }),
-    db.vehicle.findMany({
+  ])
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+  const page = Math.min(requested, totalPages)
+  const vehicles = attachInsurance(rows.map(toVehicleRecord), covers).map(slimVehicle)
+  let cached = registerStatsStore.__fleetwiseRegisterStats
+  if (!cached || Date.now() - cached.at > 20_000) {
+    const all = await db.vehicle.findMany({
       select: {
         plate: true,
         brand: true,
@@ -113,39 +239,38 @@ export async function loadRegisterFromDatabase(input: VehicleQuery = {}, covers:
         commencement: true,
         expiry: true,
       },
-    }),
-  ])
-  const totalPages = Math.max(1, Math.ceil(total / pageSize))
-  const page = Math.min(Math.max(1, input.page || 1), totalPages)
-  const vehicles = attachInsurance(rows.map(toVehicleRecord), covers).map(slimVehicle)
-  const statsSource = attachInsurance(all.map((row) => ({
-    plate: row.plate,
-    brand: row.brand,
-    files: {
-      logbook: row.hasLogbook ? [{ id: 'flag', name: '', type: 'logbook' as const, plate: row.plate }] : [],
-      certificate: row.hasCertificate ? [{ id: 'flag', name: '', type: 'certificate' as const, plate: row.plate }] : [],
-      photo: row.hasPhoto ? [{ id: 'flag', name: '', type: 'photo' as const, plate: row.plate }] : [],
-      agreement: row.hasAgreement ? [{ id: 'flag', name: '', type: 'agreement' as const, plate: row.plate }] : [],
-    },
-    collateral: row.hasCollateral ? { id: 'flag', name: '' } : undefined,
-    agreement: row.hasAgreement ? { id: 'flag', name: '' } : undefined,
-    present: row.present,
-    total: 5 as const,
-    status: row.status === 'Complete' ? 'Complete' as const : 'Needs attention' as const,
-    updated: '',
-    insurance: insuranceState({ commencement: row.commencement, expiry: row.expiry }),
-  })), covers)
-  const merged = Object.fromEntries(statsSource.map((vehicle) => [vehicle.plate, {
-    commencement: vehicle.insurance?.commencement || null,
-    expiry: vehicle.insurance?.expiry || null,
-  }]))
+    })
+    const statsSource = attachInsurance(all.map((row) => ({
+      plate: row.plate,
+      brand: row.brand,
+      files: {
+        logbook: row.hasLogbook ? [{ id: 'flag', name: '', type: 'logbook' as const, plate: row.plate }] : [],
+        certificate: row.hasCertificate ? [{ id: 'flag', name: '', type: 'certificate' as const, plate: row.plate }] : [],
+        photo: row.hasPhoto ? [{ id: 'flag', name: '', type: 'photo' as const, plate: row.plate }] : [],
+        agreement: row.hasAgreement ? [{ id: 'flag', name: '', type: 'agreement' as const, plate: row.plate }] : [],
+      },
+      collateral: row.hasCollateral ? { id: 'flag', name: '' } : undefined,
+      agreement: row.hasAgreement ? { id: 'flag', name: '' } : undefined,
+      present: row.present,
+      total: 5 as const,
+      status: row.status === 'Complete' ? 'Complete' as const : 'Needs attention' as const,
+      updated: '',
+      insurance: insuranceState({ commencement: row.commencement, expiry: row.expiry }),
+    })), covers)
+    const merged = Object.fromEntries(statsSource.map((vehicle) => [vehicle.plate, {
+      commencement: vehicle.insurance?.commencement || null,
+      expiry: vehicle.insurance?.expiry || null,
+    }]))
+    cached = { at: Date.now(), stats: fleetStats(statsSource), insuranceAlerts: insuranceAlerts(merged) }
+    registerStatsStore.__fleetwiseRegisterStats = cached
+  }
   return {
     vehicles,
     total,
     page,
     pageSize,
-    stats: fleetStats(statsSource),
-    insuranceAlerts: insuranceAlerts(merged),
+    stats: cached.stats,
+    insuranceAlerts: cached.insuranceAlerts,
   }
 }
 
@@ -181,6 +306,16 @@ function registerWhere(input: VehicleQuery) {
     ...(missing.includes('certificate') ? { hasCertificate: false } : {}),
     ...(missing.includes('photo') ? { hasPhoto: false } : {}),
     ...(missing.includes('collateral') ? { hasCollateral: false } : {}),
+  }
+}
+
+function coverDates(vehicle: VehicleRecord, creating: boolean) {
+  const commencement = vehicle.insurance?.commencement || ''
+  const expiry = vehicle.insurance?.expiry || ''
+  if (creating) return { commencement: commencement || null, expiry: expiry || null }
+  return {
+    ...(commencement ? { commencement } : {}),
+    ...(expiry ? { expiry } : {}),
   }
 }
 

@@ -15,6 +15,12 @@ function GoogleButton() {
   )
 }
 
+function signInError(error: string) {
+  if (error === 'oauth' || /redirect uri/i.test(error)) return 'Google sign-in failed. Add http://localhost:3000/auth/callback/google as an authorized redirect URI, then try again.'
+  if (/fetch failed|could not reach google|empty response|unreadable response|network/i.test(error)) return 'Could not reach Google. Check the network and click Continue with Google again.'
+  return error
+}
+
 function SignInForm() {
   const params = useSearchParams()
   const error = params.get('error')
@@ -49,7 +55,7 @@ function SignInForm() {
         <span className="eyebrow">SECURE OPERATIONS ACCESS</span>
         <h1>Sign in with Google</h1>
         <p>Fleetwise asks for Drive, Sheets, and Gmail. Only accounts that can open the document folders and the workbook can operate.</p>
-        {error && <div className="auth-error" role="alert">{error === 'oauth' ? 'Google sign-in failed. Add http://localhost:3000/auth/callback/google as an authorized redirect URI, then try again.' : error}</div>}
+        {error && <div className="auth-error" role="alert">{signInError(error)}</div>}
         <form action={startGoogleSignIn}>
           <GoogleButton />
         </form>

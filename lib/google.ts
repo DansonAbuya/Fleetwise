@@ -49,20 +49,38 @@ export function googleAuthUrl(origin: string, state: string) {
   return `https://accounts.google.com/o/oauth2/v2/auth?${params}`
 }
 
+async function readGoogleJson<T>(res: Response): Promise<T> {
+  const text = await res.text()
+  if (!text.trim()) throw new Error('Google returned an empty response. Check the network and click Continue with Google again.')
+  try {
+    return JSON.parse(text) as T
+  } catch {
+    throw new Error('Google returned an unreadable response. Click Continue with Google again.')
+  }
+}
+
+async function googleTokenRequest(body: URLSearchParams) {
+  try {
+    return await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body,
+    })
+  } catch {
+    throw new Error('Could not reach Google. Check the network and click Continue with Google again.')
+  }
+}
+
 export async function exchangeGoogleCode(origin: string, code: string) {
   const { clientId, clientSecret } = googleClient()
-  const res = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      client_id: clientId,
-      client_secret: clientSecret,
-      code,
-      grant_type: 'authorization_code',
-      redirect_uri: googleRedirectUri(origin),
-    }),
-  })
-  const data = await res.json() as { access_token?: string; refresh_token?: string; expires_in?: number; id_token?: string; error?: string; error_description?: string }
+  const res = await googleTokenRequest(new URLSearchParams({
+    client_id: clientId,
+    client_secret: clientSecret,
+    code,
+    grant_type: 'authorization_code',
+    redirect_uri: googleRedirectUri(origin),
+  }))
+  const data = await readGoogleJson<{ access_token?: string; refresh_token?: string; expires_in?: number; id_token?: string; error?: string; error_description?: string }>(res)
   if (!res.ok || !data.access_token) {
     const reason = data.error_description || data.error || 'token_exchange_failed'
     if (data.error === 'redirect_uri_mismatch' || /redirect_uri/i.test(reason)) {
@@ -80,27 +98,28 @@ export async function exchangeGoogleCode(origin: string, code: string) {
 }
 
 export async function fetchGoogleProfile(accessToken: string) {
-  const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  })
+  let res: Response
+  try {
+    res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    })
+  } catch {
+    throw new Error('Could not reach Google. Check the network and click Continue with Google again.')
+  }
   if (!res.ok) throw new Error('Unable to load Google profile')
-  return res.json() as Promise<{ sub: string; email: string; name?: string; picture?: string }>
+  return readGoogleJson<{ sub: string; email: string; name?: string; picture?: string }>(res)
 }
 
 export async function refreshGoogleToken(session: AppSession): Promise<AppSession> {
   if (!session.refreshToken) throw new Error('Google reconnect required')
   const { clientId, clientSecret } = googleClient()
-  const res = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      client_id: clientId,
-      client_secret: clientSecret,
-      grant_type: 'refresh_token',
-      refresh_token: session.refreshToken,
-    }),
-  })
-  const data = await res.json() as { access_token?: string; expires_in?: number; refresh_token?: string }
+  const res = await googleTokenRequest(new URLSearchParams({
+    client_id: clientId,
+    client_secret: clientSecret,
+    grant_type: 'refresh_token',
+    refresh_token: session.refreshToken,
+  }))
+  const data = await readGoogleJson<{ access_token?: string; expires_in?: number; refresh_token?: string }>(res)
   if (!res.ok || !data.access_token) throw new Error('Google session expired. Sign in again.')
   return {
     ...session,

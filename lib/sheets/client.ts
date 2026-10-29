@@ -189,6 +189,22 @@ export function chipRequest(sheetId: number, row: number, column: number, uri: s
   }
 }
 
+export function textCellRequest(sheetId: number, row: number, column: number, value: string) {
+  return {
+    updateCells: {
+      rows: [{ values: [{ userEnteredValue: { stringValue: value } }] }],
+      fields: 'userEnteredValue',
+      range: {
+        sheetId,
+        startRowIndex: row - 1,
+        endRowIndex: row,
+        startColumnIndex: column - 1,
+        endColumnIndex: column,
+      },
+    },
+  }
+}
+
 export function headerRequest(sheetId: number, headerRow: number, column: number, title: string) {
   return {
     updateCells: {

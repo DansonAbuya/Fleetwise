@@ -39,6 +39,7 @@ export type AgreementRead = {
   date: string
   attempts?: number
   linked?: boolean
+  skipped?: boolean
 }
 
 type CursorFile = ProcessLastAction & {
